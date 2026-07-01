@@ -69,6 +69,8 @@ A pure Rust tiling Wayland compositor with a Vulkan rendering pipeline. Carrot a
 
 Carrot uses [KDL](https://kdl.dev) for configuration, with full NixOS and Home Manager module integration.
 
+Lua configuration is also officially supported as an opt-in alternative - KDL stays the default. It's a runtime switch (no rebuild needed), and on NixOS / Home Manager you declare it through the module.
+
 ```kdl
 general {
     layout "dwindle"
@@ -121,6 +123,7 @@ programs.carrot.enable = true;
 # Home Manager module
 wayland.windowManager.carrot = {
   enable = true;
+  configFormat = "lua"; # optional, defaults to "kdl"
   settings = {
     general = {
       layout = "dwindle";
