@@ -1,6 +1,5 @@
-// tracing that costs nothing unless you ask for it. build with
-// `--features trace` to compile the probes in; without it the macro
-// expands to nothing.
+// zero-cost tracing: `--features trace` compiles the probes in, else the
+// macro expands to nothing.
 
 #[cfg(feature = "trace")]
 #[macro_export]

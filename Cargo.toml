@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rustix = { version = "1.1.4", features = ["net", "fs", "event"] }
+rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "time"] }
 kbvm = "0.1.6"
 
 [features]
 # compiles tracing probes in (see src/trace.rs); off = zero cost
 trace = []
+
+# the task state machine is not unwind safe - a panicking poll aborts
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -1,2 +1,1 @@
-// wlr-layer-shell - anchors, exclusive zones, the four layers, keyboard
-// interactivity modes.
+// wlr-layer-shell: anchors, exclusive zones, layers, keyboard interactivity.
