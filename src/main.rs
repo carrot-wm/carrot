@@ -19,6 +19,7 @@ mod surface;
 // display side
 mod allocator;
 mod drm;
+mod format;
 mod render;
 
 // the rest
