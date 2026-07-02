@@ -36,8 +36,26 @@ fn main() {
         return;
     }
 
-    let sock = socket::WaylandSocket::new().unwrap();
-    println!("listening on {}", sock.name);
+    if let Err(e) = run() {
+        eprintln!("carrot: fatal: {e}");
+        std::process::exit(1);
+    }
+}
 
-    // TODO: bring up the ring + engine, then accept clients as tasks
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = engine::Engine::new();
+    let ring = uring::Ring::new(&engine, 32)?;
+    let wheel = engine::Wheel::new(&engine, &ring)?;
+    let sock = socket::WaylandSocket::new()?;
+    println!("listening on {}", sock.name);
+    let state = state::State::new(&engine, &ring, wheel);
+
+    // the ring owns the loop; this blocks until something calls stop().
+    // clients get accepted here once the client module lands.
+    let res = ring.run();
+
+    state.clear();
+    engine.clear();
+    res?;
+    Ok(())
 }
