@@ -3,6 +3,7 @@
 
 // core runtime
 mod engine;
+mod rect;
 mod state;
 mod trace;
 mod uring;
