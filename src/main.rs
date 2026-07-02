@@ -6,6 +6,7 @@ mod engine;
 mod state;
 mod trace;
 mod uring;
+mod util;
 
 // wayland side
 mod client;
