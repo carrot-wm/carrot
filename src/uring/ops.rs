@@ -1,7 +1,7 @@
-// one type per op - accept, read/write, recvmsg/sendmsg, timeout, poll,
-// cancel. buffers stay owned by the op until its cqe lands, then the
-// pending future wakes with them.
+// one type per op - accept, read/write, recvmsg/sendmsg, timeout, poll, cancel.
+// buffers stay owned by the op until its cqe lands, then wake the future.
 
+pub(super) mod msg;
 
 use super::{CqeFuture, Oneshot, Op, OpId, Ring, RingError};
 use crate::util::Time;
@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 // -- timeout --
 
-// matches the kernel's __kernel_timespec
+/// matches the kernel's __kernel_timespec
 #[repr(C)]
 #[derive(Default)]
 struct KernelTimespec {
@@ -35,7 +35,7 @@ impl From<Time> for KernelTimespec {
 #[derive(Default)]
 pub(super) struct TimeoutOp {
     id: OpId,
-    // lives inside the box so its address stays valid for the kernel
+    /// in the box so its address stays valid for the kernel
     ts: KernelTimespec,
     data: Option<Rc<Oneshot>>,
 }
@@ -63,9 +63,8 @@ unsafe impl Op for TimeoutOp {
 }
 
 impl Ring {
-    // resolves at `deadline` (absolute CLOCK_MONOTONIC). expiry and
-    // cancellation both come back Ok - callers that need to tell them
-    // apart race a version counter instead.
+    /// resolves at `deadline` (absolute CLOCK_MONOTONIC). expiry and cancel both
+    /// return Ok - callers that must distinguish race a version counter instead.
     pub async fn timeout(&self, deadline: Time) -> Result<(), RingError> {
         self.check_destroyed()?;
         let guard = self.guard();
@@ -95,7 +94,7 @@ pub(super) struct RwOp {
 }
 
 struct RwData {
-    // keeps the fd open until the cqe even if the caller lost interest
+    /// keeps the fd open until the cqe even if the caller lost interest
     _fd: Rc<OwnedFd>,
     ret: Rc<Cell<Option<Vec<u8>>>>,
     slot: Rc<Oneshot>,
@@ -122,7 +121,7 @@ unsafe impl Op for RwOp {
     fn encode(&self, sqe: &mut io_uring_sqe) {
         sqe.opcode = self.opcode;
         sqe.fd = self.fd;
-        // stream position - a real offset here would pread/pwrite
+        // stream position; a real offset would pread/pwrite
         sqe.off_or_addr2.off = !0u64;
         sqe.addr_or_splice_off_in.addr =
             io_uring_ptr::new(self.buf.as_ptr() as *mut std::ffi::c_void);
@@ -139,9 +138,8 @@ unsafe impl Op for RwOp {
 }
 
 impl Ring {
-    // the buffer moves into the op for the op's lifetime and comes back
-    // with the byte count. dropping the future mid-flight cancels; the op
-    // keeps the buffer alive until the kernel really lets go.
+    /// buffer moves into the op and comes back with the byte count. dropping the
+    /// future cancels; the op holds the buffer until the kernel lets go.
     pub async fn read(
         &self,
         fd: &Rc<OwnedFd>,
@@ -172,8 +170,8 @@ impl Ring {
         op.id = guard.id;
         op.opcode = opcode;
         op.fd = fd.as_raw_fd();
-        // sqe lengths are 32 bit; a giant buffer clamps and surfaces as a
-        // normal short read/write instead of silently truncating to 0
+        // sqe len is 32 bit; clamp so a giant buffer surfaces as a short
+        // read/write, not a silent truncation to 0
         op.len = buf.len().min(u32::MAX as usize) as u32;
         op.buf = buf;
         op.data = Some(RwData {
@@ -232,8 +230,7 @@ unsafe impl Op for PollOp {
 }
 
 impl Ring {
-    // one-shot readiness. resolves with revents once the fd reports any
-    // of the requested events.
+    /// one-shot readiness; resolves with revents once the fd reports any requested event
     pub async fn readable(&self, fd: &Rc<OwnedFd>) -> Result<u16, RingError> {
         self.poll_fd(fd, PollFlags::IN.bits() as u16).await
     }
@@ -285,7 +282,7 @@ unsafe impl Op for CancelOp {
     }
 
     fn complete(self: Box<Self>, ring: &Ring, res: i32) {
-        // ENOENT just means the target completed first
+        // ENOENT = target completed first
         if res < 0 && res != -Errno::NOENT.raw_os_error() {
             crate::trace!("async cancel of {:?} failed: {}", self.target, res);
         }
@@ -293,8 +290,8 @@ unsafe impl Op for CancelOp {
     }
 }
 
-// the target's own cqe (usually -ECANCELED) resolves its future; this
-// op's completion carries no caller-visible result
+/// the target's own cqe (usually -ECANCELED) resolves its future; this op's
+/// completion carries no caller-visible result
 pub(super) fn schedule_cancel(ring: &Ring, target: OpId) {
     let mut op = ring.cached_cancels.pop().unwrap_or_default();
     op.id = ring.id_raw();
