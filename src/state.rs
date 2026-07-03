@@ -2,6 +2,7 @@
 
 use crate::client::{Client, Clients};
 use crate::engine::{Engine, SpawnedFuture, Wheel};
+use std::cell::RefCell;
 use crate::protocol::globals::Globals;
 use crate::uring::Ring;
 use crate::util::{AsyncEvent, AsyncQueue, NumCell};
@@ -19,6 +20,10 @@ pub struct State {
     pub slow_clients: AsyncQueue<Rc<Client>>,
     // something visible changed; the present loop wakes on this
     pub damage: AsyncEvent,
+    // active output dimensions; pointer clamping reads this
+    pub output_size: std::cell::Cell<(u32, u32)>,
+    pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
+    pub active_ws: std::cell::Cell<usize>,
     serial: NumCell<u64>,
 }
 
@@ -33,6 +38,9 @@ impl State {
             run_toplevel: RunToplevel::install(eng),
             slow_clients: AsyncQueue::default(),
             damage: AsyncEvent::default(),
+            output_size: std::cell::Cell::new((0, 0)),
+            workspaces: RefCell::new(Vec::new()),
+            active_ws: std::cell::Cell::new(0),
             serial: NumCell::new(0),
         })
     }
@@ -48,6 +56,7 @@ impl State {
     pub fn clear(&self) {
         self.clients.clear();
         self.slow_clients.clear();
+        self.workspaces.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
     }
