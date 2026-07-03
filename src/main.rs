@@ -11,6 +11,7 @@ mod util;
 
 // wayland side
 mod client;
+mod clientmem;
 mod protocol;
 mod shell;
 mod socket;
