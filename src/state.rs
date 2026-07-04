@@ -24,6 +24,9 @@ pub struct State {
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
     pub active_ws: std::cell::Cell<usize>,
+    // xdg surfaces with a scheduled configure; drained by an engine task
+    pub configures: RefCell<Vec<Rc<crate::shell::xdg::XdgSurface>>>,
+    pub configure_event: AsyncEvent,
     serial: NumCell<u64>,
 }
 
@@ -41,6 +44,8 @@ impl State {
             output_size: std::cell::Cell::new((0, 0)),
             workspaces: RefCell::new(Vec::new()),
             active_ws: std::cell::Cell::new(0),
+            configures: RefCell::new(Vec::new()),
+            configure_event: AsyncEvent::default(),
             serial: NumCell::new(0),
         })
     }
@@ -57,6 +62,7 @@ impl State {
         self.clients.clear();
         self.slow_clients.clear();
         self.workspaces.borrow_mut().clear();
+        self.configures.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
     }

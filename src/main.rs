@@ -51,6 +51,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sock = socket::WaylandSocket::new()?;
     println!("listening on {}", sock.name);
     let state = state::State::new(&engine, &ring, wheel);
+    state.globals.add(std::rc::Rc::new(surface::WlCompositorGlobal));
+    state.globals.add(std::rc::Rc::new(surface::WlSubcompositorGlobal));
+    state.globals.add(std::rc::Rc::new(protocol::shm::WlShmGlobal));
+    state.globals.add(std::rc::Rc::new(shell::xdg::XdgWmBaseGlobal));
+    let st = state.clone();
+    let configure_pump = engine.spawn("configure pump", async move {
+        shell::xdg::configure_loop(st).await;
+    });
 
     let listen_fd = std::rc::Rc::new(sock.fd.try_clone()?);
     let st = state.clone();
@@ -73,6 +81,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let res = ring.run();
 
     drop(acceptor);
+    drop(configure_pump);
     state.clear();
     engine.clear();
     res?;
