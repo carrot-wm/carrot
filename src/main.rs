@@ -1,7 +1,7 @@
-// module layout is carved up front - the empty mods are intentional, they
-// keep any one file from growing into a god module later.
+// module layout carved up front; empty mods are intentional.
 
 // core runtime
+mod cpu_worker;
 mod engine;
 mod rect;
 mod state;
@@ -65,8 +65,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let engine = engine::Engine::new();
     let ring = uring::Ring::new(&engine, 32)?;
     let wheel = engine::Wheel::new(&engine, &ring)?;
+    // bind before CpuWorker spawns its thread: the socket's set_var of
+    // WAYLAND_DISPLAY is only sound single-threaded
     let sock = socket::WaylandSocket::new()?;
     println!("listening on {}", sock.name);
+    let cpu = cpu_worker::CpuWorker::new(&engine, &ring)?;
     let state = state::State::new(&engine, &ring, wheel);
     state.globals.add(std::rc::Rc::new(surface::WlCompositorGlobal));
     state.globals.add(std::rc::Rc::new(surface::WlSubcompositorGlobal));
@@ -84,9 +87,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // a compositor without keyboard maps still serves pixels
         Err(e) => eprintln!("carrot: wl_seat unavailable: {e}"),
     }
-
-    // headless is a supported mode; the display comes up when logind
-    // hands over a card (or, without a session, a direct open works)
+    // headless is supported; the display comes up when logind hands over a
+    // card (or, without a session, via direct open)
     let st = state.clone();
     let bring_up = engine.spawn("bring-up", async move {
         let session = match dbus::LogindSession::take_control(&st.eng, &st.ring).await {
@@ -120,14 +122,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    let st = state.clone();
+    let police = engine.spawn("slow clients", async move {
+        loop {
+            let c = st.slow_clients.pop().await;
+            c.check_queue_size().await;
+        }
+    });
 
-    // the ring owns the loop; this blocks until something calls stop()
+    // blocks until something calls stop()
     let res = ring.run();
 
     drop(acceptor);
+    drop(police);
     drop(bring_up);
     drop(configure_pump);
     state.clear();
+    drop(cpu);
     engine.clear();
     res?;
     Ok(())

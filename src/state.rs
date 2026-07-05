@@ -15,21 +15,21 @@ pub struct State {
     pub clients: Clients,
     pub globals: Globals,
     pub run_toplevel: RunToplevel,
-    // clients whose event queue grew past the limit; a policing task
-    // double-checks after a yield and kills the ones still behind
+    /// clients over the queue limit; a policing task rechecks after a yield
+    /// and kills the ones still behind
     pub slow_clients: AsyncQueue<Rc<Client>>,
-    // something visible changed; the present loop wakes on this
+    /// something visible changed; the present loop wakes on this
     pub damage: AsyncEvent,
-    // populated by the bring-up task once logind/display are up
+    /// populated by the bring-up task once logind/display are up
     pub session: RefCell<Option<Rc<crate::dbus::LogindSession>>>,
     pub display: RefCell<Option<crate::output::Display>>,
     pub input: RefCell<Option<crate::input::InputStack>>,
     pub seat: RefCell<Option<Rc<crate::input::seat::SeatGlobal>>>,
-    // active output dimensions; pointer clamping reads this
+    /// active output dimensions; pointer clamping reads this
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
     pub active_ws: std::cell::Cell<usize>,
-    // xdg surfaces with a scheduled configure; drained by an engine task
+    /// xdg surfaces with a scheduled configure; drained by an engine task
     pub configures: RefCell<Vec<Rc<crate::shell::xdg::XdgSurface>>>,
     pub configure_event: AsyncEvent,
     serial: NumCell<u64>,
@@ -67,6 +67,7 @@ impl State {
         s
     }
 
+    /// break the Rc cycles so everything frees. called once, after ring stop.
     pub fn clear(&self) {
         self.clients.clear();
         self.slow_clients.clear();
@@ -85,9 +86,9 @@ impl State {
 
 // -- deferred closures --
 
-// destructive operations (killing a client from its own send task, tree
-// mutation from a late phase) bounce through here so they run from a
-// fresh EventHandling task instead of whatever phase noticed the problem
+/// destructive ops (killing a client from its own send task, tree mutation
+/// from a late phase) bounce through here to run from a fresh EventHandling
+/// task instead of whatever phase noticed the problem
 pub struct RunToplevel {
     queue: Rc<AsyncQueue<Box<dyn FnOnce()>>>,
     _task: SpawnedFuture<()>,
@@ -113,8 +114,7 @@ impl RunToplevel {
         self.queue.push(Box::new(f));
     }
 
-    // queued closures capture Rc<State>; drop them or clear() leaves the
-    // root cycle intact
+    /// queued closures capture Rc<State>; must drop them or the root cycle leaks
     pub fn clear(&self) {
         self.queue.clear();
     }
