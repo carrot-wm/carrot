@@ -21,6 +21,7 @@ mod surface;
 mod allocator;
 mod drm;
 mod format;
+mod output;
 mod render;
 mod spike;
 
@@ -70,6 +71,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         shell::xdg::configure_loop(st).await;
     });
 
+    // headless is a supported mode; the display comes up when a card is
+    // available, otherwise carrot still serves the socket
+    let st = state.clone();
+    let bring_up = engine.spawn("bring-up", async move {
+        let display = output::start(&st, None).await;
+        *st.display.borrow_mut() = display;
+    });
+
     let listen_fd = std::rc::Rc::new(sock.fd.try_clone()?);
     let st = state.clone();
     let acceptor = engine.spawn("acceptor", async move {
@@ -91,6 +100,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let res = ring.run();
 
     drop(acceptor);
+    drop(bring_up);
     drop(configure_pump);
     state.clear();
     engine.clear();

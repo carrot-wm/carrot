@@ -20,6 +20,8 @@ pub struct State {
     pub slow_clients: AsyncQueue<Rc<Client>>,
     // something visible changed; the present loop wakes on this
     pub damage: AsyncEvent,
+    // populated by the bring-up task once the display is up
+    pub display: RefCell<Option<crate::output::Display>>,
     // active output dimensions; pointer clamping reads this
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
@@ -41,6 +43,7 @@ impl State {
             run_toplevel: RunToplevel::install(eng),
             slow_clients: AsyncQueue::default(),
             damage: AsyncEvent::default(),
+            display: RefCell::new(None),
             output_size: std::cell::Cell::new((0, 0)),
             workspaces: RefCell::new(Vec::new()),
             active_ws: std::cell::Cell::new(0),
@@ -65,6 +68,7 @@ impl State {
         self.configures.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
+        self.display.borrow_mut().take();
     }
 }
 
