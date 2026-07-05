@@ -22,6 +22,7 @@ pub struct State {
     pub damage: AsyncEvent,
     // populated by the bring-up task once the display is up
     pub display: RefCell<Option<crate::output::Display>>,
+    pub seat: RefCell<Option<Rc<crate::input::seat::SeatGlobal>>>,
     // active output dimensions; pointer clamping reads this
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
@@ -44,6 +45,7 @@ impl State {
             slow_clients: AsyncQueue::default(),
             damage: AsyncEvent::default(),
             display: RefCell::new(None),
+            seat: RefCell::new(None),
             output_size: std::cell::Cell::new((0, 0)),
             workspaces: RefCell::new(Vec::new()),
             active_ws: std::cell::Cell::new(0),
@@ -69,6 +71,7 @@ impl State {
         self.wheel.clear();
         self.run_toplevel.clear();
         self.display.borrow_mut().take();
+        self.seat.borrow_mut().take();
     }
 }
 

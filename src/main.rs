@@ -73,6 +73,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let configure_pump = engine.spawn("configure pump", async move {
         shell::xdg::configure_loop(st).await;
     });
+    match input::seat::SeatGlobal::new() {
+        Ok(seat) => {
+            state.globals.add(seat.clone());
+            *state.seat.borrow_mut() = Some(seat);
+        }
+        // a compositor without keyboard maps still serves pixels
+        Err(e) => eprintln!("carrot: wl_seat unavailable: {e}"),
+    }
 
     // headless is a supported mode; the display comes up when a card is
     // available, otherwise carrot still serves the socket
