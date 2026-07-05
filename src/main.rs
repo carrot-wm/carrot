@@ -22,6 +22,7 @@ mod allocator;
 mod drm;
 mod format;
 mod render;
+mod spike;
 
 // the rest
 mod carrotconx;
@@ -37,8 +38,14 @@ fn main() {
         println!("carrot {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if std::env::args().any(|a| a == "spike-scanout") {
+        std::process::exit(spike::run());
+    }
     if std::env::args().any(|a| a == "drm-probe") {
         std::process::exit(drm::device::probe_dump());
+    }
+    if std::env::args().any(|a| a == "render-probe") {
+        std::process::exit(render::renderer::probe());
     }
 
     if let Err(e) = run() {
