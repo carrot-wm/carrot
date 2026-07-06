@@ -1,5 +1,5 @@
 {
-  description = "Carrot - A pure Rust tiling Wayland compositor with a Vulkan rendering pipeline.";
+  description = "Carrot - A pure Rust tiling Wayland compositor with zero linked C, all the way down to the kernel.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -40,9 +40,8 @@
             filter = craneLib.filterCargoSources;
           };
 
-          # Pure Rust, zero linked C: nothing to build against. The Vulkan
-          # loader is dlopened at runtime and xkb data is read at runtime,
-          # so both are wrapper concerns, not build inputs.
+          # Pure Rust, zero linked C - no dependencies to build against.
+
           commonArgs = {
             inherit src;
             pname = "carrot";
@@ -76,7 +75,7 @@
             '';
 
             meta = {
-              description = "A pure Rust tiling Wayland compositor with Vulkan rendering";
+              description = "A pure Rust tiling Wayland compositor with zero linked C, all the way down to the kernel";
               license = lib.licenses.gpl3;
               platforms = [ "x86_64-linux" "aarch64-linux" ];
               mainProgram = "carrot";

@@ -1,9 +1,9 @@
 # Carrot
 
-A pure Rust tiling Wayland compositor with a Vulkan rendering pipeline. Carrot aims to be a feature-complete, all-in-one compositor with native support for blur, animations, multi-GPU, tearing, and more - no scripting or external tools needed.
+A pure Rust tiling Wayland compositor with zero linked C, all the way down to the kernel. Carrot aims to be a feature-complete, all-in-one compositor with native support for blur, animations, multi-GPU, tearing, and more - no scripting or external tools needed.
 
 > [!WARNING]
-> Carrot is in extremely early development and is not yet usable. Any contributions, suggestions, or feedback are welcome.
+> Carrot is in early development and is in its first beta. Any contributions, suggestions, or feedback are encouraged!
 
 > [!NOTE]
 > This README is a draft, and is not in any way final. Anything described in this document is subject to change. 
@@ -57,7 +57,7 @@ A pure Rust tiling Wayland compositor with a Vulkan rendering pipeline. Carrot a
 - **Launch-to-workspace** - spawn windows on any workspace without the need of switching to it first
 
 ### Integration
-- **XWayland** support via [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
+- **XWayland** support via an in-house X window manager - no external tools
 - `ext-idle-notify-v1` for idle/lock management
 - `wlr-layer-shell` for panels, overlays, and lock screens
 - `wlr-foreign-toplevel-management` for taskbars and window switchers
@@ -68,6 +68,8 @@ A pure Rust tiling Wayland compositor with a Vulkan rendering pipeline. Carrot a
 ## Configuration
 
 Carrot uses [KDL](https://kdl.dev) for configuration, with full NixOS and Home Manager module integration.
+
+Lua configuration is also officially supported as an opt-in alternative - KDL stays the default. It's a runtime switch (no rebuild needed), and on NixOS / Home Manager you declare it through the module.
 
 ```kdl
 general {
@@ -121,6 +123,7 @@ programs.carrot.enable = true;
 # Home Manager module
 wayland.windowManager.carrot = {
   enable = true;
+  configFormat = "lua"; # optional, defaults to "kdl"
   settings = {
     general = {
       layout = "dwindle";
@@ -150,7 +153,7 @@ nix build github:flammablebunny/carrot
 cargo build --release
 ```
 
-System dependencies: `vulkan-loader`, `libdrm`, `libinput`, `libseat`, `libxkbcommon`, `wayland-protocols`
+System dependencies: just `vulkan-loader` (dlopened at runtime, never linked) and a Vulkan driver (ICD) for your GPU. Carrot links **zero C** - no `libdrm`, `libinput`, `libseat`, `libxkbcommon`, or `libwayland`; the DRM, input, and session stacks are all hand-rolled over raw syscalls. `kbvm` reads XKB keymap data from `xkeyboard-config`, wired up automatically by the Nix build.
 
 ## Acknowledgments
 
