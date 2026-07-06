@@ -48,9 +48,33 @@
             pname = "carrot";
             version = "0.1.0";
 
-            # only here so ash can dlopen it at runtime - nothing links it.
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              wayland-scanner
+            ];
+
             buildInputs = with pkgs; [
+              # Vulkan
               vulkan-loader
+              vulkan-headers
+
+              # Wayland
+              wayland
+              wayland-protocols
+
+              # DRM/KMS
+              libdrm
+
+              # Input
+              libinput
+              seatd
+
+              # Keymap
+              libxkbcommon
+
+              # Misc
+              pixman
+              udev
             ];
 
             # Vulkan needs to be able to find the ICD at runtime
