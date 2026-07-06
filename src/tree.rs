@@ -131,6 +131,10 @@ pub(crate) fn cursor_pos(state: &Rc<State>) -> (i32, i32) {
 }
 
 fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {
+    // an exclusive layer surface owns the keyboard; windows wait
+    if crate::shell::layer::kb_lock(state).is_some() {
+        return;
+    }
     let seat = state.seat.borrow().clone();
     if let Some(seat) = seat {
         crate::input::focus::set_keyboard_focus(state, &seat, win.map(|w| w.surface()));
@@ -230,11 +234,20 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
 
 /// screen-flush edges get the outer gap, inner edges the inner gap, then the
 /// border insets all four sides; nothing shrinks below 1px
-fn apply_gaps(r: Rect, sw: i32, sh: i32) -> Rect {
-    let left = if r.x1 <= 0 { GAPS_OUT } else { GAPS_IN };
-    let top = if r.y1 <= 0 { GAPS_OUT } else { GAPS_IN };
-    let right = if r.x2 >= sw { GAPS_OUT } else { GAPS_IN };
-    let bottom = if r.y2 >= sh { GAPS_OUT } else { GAPS_IN };
+// the tiling area: whatever the layer-shell arranger left over, else the
+// whole output
+pub fn tiling_area(state: &Rc<State>) -> Rect {
+    let (sw, sh) = output_extent(state);
+    let full = Rect::new_sized_saturating(0, 0, sw.max(1), sh.max(1));
+    let usable = state.usable.get();
+    if usable.is_empty() { full } else { usable.intersect(full) }
+}
+
+fn apply_gaps(r: Rect, area: Rect) -> Rect {
+    let left = if r.x1 <= area.x1 { GAPS_OUT } else { GAPS_IN };
+    let top = if r.y1 <= area.y1 { GAPS_OUT } else { GAPS_IN };
+    let right = if r.x2 >= area.x2 { GAPS_OUT } else { GAPS_IN };
+    let bottom = if r.y2 >= area.y2 { GAPS_OUT } else { GAPS_IN };
     let x1 = r.x1 + left + BORDER;
     let y1 = r.y1 + top + BORDER;
     let x2 = (r.x2 - right - BORDER).max(x1 + 1);
@@ -247,7 +260,8 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
     if sw <= 0 || sh <= 0 {
         return;
     }
-    ws.tiling.recalculate(Rect::new_sized_saturating(0, 0, sw, sh));
+    let area = tiling_area(state);
+    ws.tiling.recalculate(area);
     ws.tiling.for_each(|win| {
         let raw = win
             .node
@@ -255,7 +269,7 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
             .upgrade()
             .map(|n| n.rect.get())
             .unwrap_or_default();
-        win.rect.set(apply_gaps(raw, sw, sh));
+        win.rect.set(apply_gaps(raw, area));
         if !win.fullscreen.get() {
             win.configure_rect();
         }
@@ -312,6 +326,26 @@ fn window_hit(
 }
 
 /// popups stack above parent, topmost last; positions relative to parent geometry
+fn popup_hit(
+    p: &Rc<crate::shell::xdg::XdgPopup>,
+    ox: i32,
+    oy: i32,
+    x: i32,
+    y: i32,
+) -> Option<(Rc<WlSurface>, i32, i32)> {
+    if !p.xdg.surface.mapped.get() {
+        return None;
+    }
+    let (rx, ry) = p.rel.get();
+    let (px, py) = (ox + rx, oy + ry);
+    if let Some(h) = popups_hit(&p.xdg, px, py, x, y) {
+        return Some(h);
+    }
+    let geo = p.xdg.geometry();
+    let (lx, ly) = (x - px + geo.x1, y - py + geo.y1);
+    p.xdg.surface.find_surface_at(lx, ly)
+}
+
 fn popups_hit(
     xdg: &Rc<crate::shell::xdg::XdgSurface>,
     ox: i32,
@@ -321,18 +355,62 @@ fn popups_hit(
 ) -> Option<(Rc<WlSurface>, i32, i32)> {
     let mut hit = None;
     xdg.for_each_popup(|p| {
-        if hit.is_some() || !p.xdg.surface.mapped.get() {
-            return;
+        if hit.is_none() {
+            hit = popup_hit(p, ox, oy, x, y);
         }
-        let (rx, ry) = p.rel.get();
-        let (px, py) = (ox + rx, oy + ry);
-        if let Some(h) = popups_hit(&p.xdg, px, py, x, y) {
-            hit = Some(h);
-            return;
-        }
-        let geo = p.xdg.geometry();
-        let (lx, ly) = (x - px + geo.x1, y - py + geo.y1);
-        hit = p.xdg.surface.find_surface_at(lx, ly);
     });
     hit
+}
+
+// -- the full-scene hit test --
+
+// layer surfaces join the z order: overlay, top, the windows, bottom,
+// background. fullscreen hides top and everything below the windows.
+pub fn surface_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<WlSurface>, i32, i32)> {
+    use crate::shell::layer;
+    let fs_active = active(state).fullscreen.borrow().is_some();
+    for l in [layer::OVERLAY, layer::TOP] {
+        if l == layer::TOP && fs_active {
+            continue;
+        }
+        if let Some(hit) = layer_hit(state, l, x, y) {
+            return Some(hit);
+        }
+    }
+    if let Some((_, s, sx, sy)) = window_at(state, x, y) {
+        return Some((s, sx, sy));
+    }
+    if fs_active {
+        return None;
+    }
+    for l in [layer::BOTTOM, layer::BACKGROUND] {
+        if let Some(hit) = layer_hit(state, l, x, y) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+// newest mapped surface within a layer sits on top
+fn layer_hit(state: &Rc<State>, layer: u32, x: i32, y: i32) -> Option<(Rc<WlSurface>, i32, i32)> {
+    let layers = state.layers.borrow().clone();
+    for ls in layers.iter().rev() {
+        if ls.current.get().layer != layer || !ls.mapped() {
+            continue;
+        }
+        let r = ls.rect.get();
+        let mut hit = None;
+        ls.for_each_popup(|p| {
+            if hit.is_none() {
+                hit = popup_hit(p, r.x1, r.y1, x, y);
+            }
+        });
+        if hit.is_some() {
+            return hit;
+        }
+        if let Some(h) = ls.surface.find_surface_at(x - r.x1, y - r.y1) {
+            return Some(h);
+        }
+    }
+    None
 }

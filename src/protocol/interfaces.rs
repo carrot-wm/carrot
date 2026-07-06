@@ -280,6 +280,44 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface zwlr_layer_shell_v1, version = 5;
+    request get_layer_surface(id: new_id, surface: object, output: object, layer: uint, namespace: string);
+    request destroy() since 3;
+}
+
+crate::wl_protocol! {
+    interface zwlr_layer_surface_v1, version = 5;
+    request set_size(width: uint, height: uint);
+    request set_anchor(anchor: uint);
+    request set_exclusive_zone(zone: int);
+    request set_margin(top: int, right: int, bottom: int, left: int);
+    request set_keyboard_interactivity(keyboard_interactivity: uint);
+    request get_popup(popup: object);
+    request ack_configure(serial: uint);
+    request destroy();
+    request set_layer(layer: uint) since 2;
+    request set_exclusive_edge(edge: uint) since 5;
+    event configure(serial: uint, width: uint, height: uint);
+    event closed();
+}
+
+crate::wl_protocol! {
+    interface zxdg_output_manager_v1, version = 3;
+    request destroy();
+    request get_xdg_output(id: new_id, output: object);
+}
+
+crate::wl_protocol! {
+    interface zxdg_output_v1, version = 3;
+    request destroy();
+    event logical_position(x: int, y: int);
+    event logical_size(width: int, height: int);
+    event done();
+    event name(name: string) since 2;
+    event description(description: string) since 2;
+}
+
+crate::wl_protocol! {
     interface wl_output, version = 4;
     request release() since 3;
     event geometry(x: int, y: int, physical_width: int, physical_height: int, subpixel: int, make: string, model: string, transform: int);
@@ -419,6 +457,29 @@ mod tests {
         assert_eq!(zwp_primary_selection_device_v1::selection::OPCODE, 1);
         assert_eq!(zwp_primary_selection_offer_v1::receive::OPCODE, 0);
         assert_eq!(zwp_primary_selection_offer_v1::offer::OPCODE, 0);
+        assert_eq!(zwlr_layer_shell_v1::get_layer_surface::OPCODE, 0);
+        assert_eq!(zwlr_layer_shell_v1::destroy::OPCODE, 1);
+        assert_eq!(zwlr_layer_shell_v1::destroy::SINCE, 3);
+        assert_eq!(zwlr_layer_surface_v1::set_size::OPCODE, 0);
+        assert_eq!(zwlr_layer_surface_v1::set_anchor::OPCODE, 1);
+        assert_eq!(zwlr_layer_surface_v1::set_exclusive_zone::OPCODE, 2);
+        assert_eq!(zwlr_layer_surface_v1::set_margin::OPCODE, 3);
+        assert_eq!(zwlr_layer_surface_v1::set_keyboard_interactivity::OPCODE, 4);
+        assert_eq!(zwlr_layer_surface_v1::get_popup::OPCODE, 5);
+        assert_eq!(zwlr_layer_surface_v1::ack_configure::OPCODE, 6);
+        assert_eq!(zwlr_layer_surface_v1::destroy::OPCODE, 7);
+        assert_eq!(zwlr_layer_surface_v1::set_layer::OPCODE, 8);
+        assert_eq!(zwlr_layer_surface_v1::set_layer::SINCE, 2);
+        assert_eq!(zwlr_layer_surface_v1::set_exclusive_edge::OPCODE, 9);
+        assert_eq!(zwlr_layer_surface_v1::set_exclusive_edge::SINCE, 5);
+        assert_eq!(zwlr_layer_surface_v1::configure::OPCODE, 0);
+        assert_eq!(zwlr_layer_surface_v1::closed::OPCODE, 1);
+        assert_eq!(zxdg_output_manager_v1::get_xdg_output::OPCODE, 1);
+        assert_eq!(zxdg_output_v1::logical_position::OPCODE, 0);
+        assert_eq!(zxdg_output_v1::logical_size::OPCODE, 1);
+        assert_eq!(zxdg_output_v1::done::OPCODE, 2);
+        assert_eq!(zxdg_output_v1::name::OPCODE, 3);
+        assert_eq!(zxdg_output_v1::name::SINCE, 2);
         assert_eq!(wl_output::release::OPCODE, 0);
         assert_eq!(wl_output::geometry::OPCODE, 0);
         assert_eq!(wl_output::mode::OPCODE, 1);

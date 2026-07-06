@@ -34,6 +34,8 @@ pub struct Objects {
     regions: RefCell<HashMap<ObjectId, Rc<crate::surface::WlRegion>>>,
     buffers: RefCell<HashMap<ObjectId, Rc<crate::protocol::shm::WlBuffer>>>,
     toplevels: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgToplevel>>>,
+    popups: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPopup>>>,
+    outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::WlOutput>>>,
 }
 
 impl Objects {
@@ -102,6 +104,8 @@ impl Objects {
         self.regions.borrow_mut().clear();
         self.buffers.borrow_mut().clear();
         self.toplevels.borrow_mut().clear();
+        self.popups.borrow_mut().clear();
+        self.outputs.borrow_mut().clear();
         let objs: Vec<_> = self.map.borrow_mut().drain().map(|(_, o)| o).collect();
         for obj in &objs {
             obj.break_loops();
@@ -132,6 +136,30 @@ impl Objects {
 
     pub fn forget_toplevel(&self, id: ObjectId) {
         self.toplevels.borrow_mut().remove(&id);
+    }
+
+    pub fn track_popup(&self, p: Rc<crate::shell::xdg::XdgPopup>) {
+        self.popups.borrow_mut().insert(p.id, p);
+    }
+
+    pub fn popup(&self, id: ObjectId) -> Option<Rc<crate::shell::xdg::XdgPopup>> {
+        self.popups.borrow().get(&id).cloned()
+    }
+
+    pub fn forget_popup(&self, id: ObjectId) {
+        self.popups.borrow_mut().remove(&id);
+    }
+
+    pub fn track_output(&self, o: Rc<crate::protocol::output::WlOutput>) {
+        self.outputs.borrow_mut().insert(o.id, o);
+    }
+
+    pub fn output(&self, id: ObjectId) -> Option<Rc<crate::protocol::output::WlOutput>> {
+        self.outputs.borrow().get(&id).cloned()
+    }
+
+    pub fn forget_output(&self, id: ObjectId) {
+        self.outputs.borrow_mut().remove(&id);
     }
 
     pub fn for_each_surface(&self, mut f: impl FnMut(&Rc<crate::surface::WlSurface>)) {

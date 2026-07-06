@@ -661,13 +661,14 @@ impl xdg_surface::Handler for XdgSurface {
             client: c.clone(),
             version: self.version,
             xdg: self.rc(),
-            parent: RefCell::new(parent.clone()),
+            parent: RefCell::new(parent.clone().map(PopupParent::Xdg)),
             positioned: Cell::new(pos),
             rel: Cell::new(pos.place()),
             size: Cell::new(pos.size),
             done: Cell::new(false),
         });
         c.add_client_obj(popup.clone())?;
+        c.objects.track_popup(popup.clone());
         if let Some(p) = &parent {
             p.popups.borrow_mut().push(popup.clone());
         }
@@ -1067,13 +1068,33 @@ impl Object for XdgToplevel {
 
 // -- xdg_popup --
 
+// a popup's parent is another xdg surface, or - via layer get_popup - a
+// layer surface; quickshell reparents null-parent popups that way
+#[derive(Clone)]
+pub enum PopupParent {
+    Xdg(Rc<XdgSurface>),
+    Layer(Rc<crate::shell::layer::LayerSurface>),
+}
+
+impl PopupParent {
+    fn abs_origin(&self) -> Option<(i32, i32)> {
+        match self {
+            PopupParent::Xdg(x) => x.abs_origin(),
+            PopupParent::Layer(l) => {
+                let r = l.rect.get();
+                Some((r.x1, r.y1))
+            }
+        }
+    }
+}
+
 /// popups render above their parent at the positioner's spot; grabs and constraint solving TODO.
 pub struct XdgPopup {
     pub id: ObjectId,
     pub client: Rc<Client>,
     pub version: u32,
     pub xdg: Rc<XdgSurface>,
-    parent: RefCell<Option<Rc<XdgSurface>>>,
+    parent: RefCell<Option<PopupParent>>,
     positioned: Cell<Positioned>,
     /// relative to the parent's window geometry origin
     pub rel: Cell<(i32, i32)>,
@@ -1095,8 +1116,12 @@ impl XdgPopup {
         }
     }
 
+    pub fn set_layer_parent(&self, ls: &Rc<crate::shell::layer::LayerSurface>) {
+        *self.parent.borrow_mut() = Some(PopupParent::Layer(ls.clone()));
+    }
+
     /// absolute origin of the parent's geometry, walking nested popups
-    /// down to the toplevel's window rect
+    /// down to the toplevel's window rect or the layer surface's slot
     fn parent_origin(&self) -> Option<(i32, i32)> {
         let parent = self.parent.borrow().clone()?;
         parent.abs_origin()
@@ -1119,11 +1144,14 @@ impl xdg_popup::Handler for XdgPopup {
         if let Some(me) = self.me() {
             popup_closed(&self.client.state, &me);
         }
-        if let Some(parent) = self.parent.borrow_mut().take() {
-            parent.unlink_popup(self);
+        match self.parent.borrow_mut().take() {
+            Some(PopupParent::Xdg(p)) => p.unlink_popup(self),
+            Some(PopupParent::Layer(l)) => l.unlink_popup(self.id),
+            None => {}
         }
         *self.xdg.ext.borrow_mut() = XdgExt::None;
         self.xdg.configured.set(false);
+        self.client.objects.forget_popup(self.id);
         self.client.state.damage.trigger();
         self.client.remove_obj(self.id)?;
         Ok(())
@@ -1142,11 +1170,10 @@ impl xdg_popup::Handler for XdgPopup {
             // only the topmost grabbing popup may parent another grab
             let ok = match stack.last() {
                 None => true,
-                Some(top) => self
-                    .parent
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|p| Rc::ptr_eq(p, &top.xdg)),
+                Some(top) => matches!(
+                    &*self.parent.borrow(),
+                    Some(PopupParent::Xdg(p)) if Rc::ptr_eq(p, &top.xdg)
+                ),
             };
             if !ok {
                 drop(stack);
@@ -1385,6 +1412,15 @@ impl Object for XdgDecoration {
 
 // -- the flush task --
 
+impl crate::shell::Configurable for XdgSurface {
+    fn flush_configure(&self) {
+        self.scheduled.set(false);
+        if !self.surface.destroyed.get() {
+            self.send_configure_now();
+        }
+    }
+}
+
 pub fn flush_configures(state: &Rc<State>) {
     loop {
         let batch: Vec<_> = state.configures.borrow_mut().drain(..).collect();
@@ -1392,11 +1428,7 @@ pub fn flush_configures(state: &Rc<State>) {
             return;
         }
         for s in batch {
-            s.scheduled.set(false);
-            if s.surface.destroyed.get() {
-                continue;
-            }
-            s.send_configure_now();
+            s.flush_configure();
         }
     }
 }

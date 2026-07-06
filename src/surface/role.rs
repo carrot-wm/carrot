@@ -12,6 +12,7 @@ pub enum SurfaceRole {
     Subsurface,
     Toplevel,
     Popup,
+    LayerSurface,
 }
 
 impl SurfaceRole {
@@ -21,6 +22,7 @@ impl SurfaceRole {
             SurfaceRole::Subsurface => "wl_subsurface",
             SurfaceRole::Toplevel => "xdg_toplevel",
             SurfaceRole::Popup => "xdg_popup",
+            SurfaceRole::LayerSurface => "zwlr_layer_surface_v1",
         }
     }
 }
@@ -53,6 +55,11 @@ pub trait SurfaceExt {
 
     /// keyboard focus landed on / left this surface's window
     fn set_active(&self, _active: bool) {}
+
+    /// the layer surface behind this ext, when the role is LayerSurface
+    fn layer_surface(&self) -> Option<std::rc::Rc<crate::shell::layer::LayerSurface>> {
+        None
+    }
 }
 
 pub struct NoneExt;

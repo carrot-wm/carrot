@@ -556,7 +556,7 @@ impl SeatGlobal {
 
     /// deepest mapped surface under the global point, in z order
     fn surface_at(&self, state: &Rc<State>, x: f64, y: f64) -> Option<(Rc<WlSurface>, i32, i32)> {
-        crate::tree::window_at(state, x as i32, y as i32).map(|(_, s, sx, sy)| (s, sx, sy))
+        crate::tree::surface_at(state, x as i32, y as i32)
     }
 
     pub fn pointer_motion(self: &Rc<Self>, state: &Rc<State>, time_usec: u64, dx: f64, dy: f64) {
@@ -599,9 +599,14 @@ impl SeatGlobal {
                     // focus follows mouse, onto the window root never a
                     // subsurface; hovering a popup must not steal focus from its toplevel,
                     // and neither may hovering anything while a grab holds the keyboard
+                    // layer surfaces only take the keyboard by click or
+                    // exclusivity, never by hover
                     let root = new.get_root();
-                    if root.role.get() != crate::surface::SurfaceRole::Popup
+                    let role = root.role.get();
+                    if role != crate::surface::SurfaceRole::Popup
+                        && role != crate::surface::SurfaceRole::LayerSurface
                         && self.popup_grab.borrow().is_empty()
+                        && crate::shell::layer::kb_lock(state).is_none()
                     {
                         super::focus::set_keyboard_focus(state, self, Some(root));
                     }
@@ -645,6 +650,19 @@ impl SeatGlobal {
             });
             if !in_chain {
                 crate::shell::xdg::dismiss_popup_grabs(state, self);
+            }
+        }
+        // on-demand keyboard interactivity: clicking a layer surface
+        // hands it the keyboard, clicking a window takes it back
+        if pressed && crate::shell::layer::kb_lock(state).is_none() {
+            if let Some(s) = &focus {
+                let root = s.get_root();
+                if root.role.get() == crate::surface::SurfaceRole::LayerSurface {
+                    let ls = crate::shell::layer::from_surface(state, &root);
+                    if ls.is_some_and(|l| l.current.get().ki != crate::shell::layer::KI_NONE) {
+                        super::focus::set_keyboard_focus(state, self, Some(root));
+                    }
+                }
             }
         }
         let Some(surface) = focus.filter(|s| !s.destroyed.get()) else {
@@ -699,6 +717,10 @@ impl SeatGlobal {
     /// give the keyboard to the window under the cursor, else the first tile
     pub fn ensure_focus(self: &Rc<Self>, state: &Rc<State>) {
         if self.kb_focus.borrow().is_some() {
+            return;
+        }
+        if let Some(ls) = crate::shell::layer::kb_lock(state) {
+            super::focus::set_keyboard_focus(state, self, Some(ls.surface.clone()));
             return;
         }
         let ws = crate::tree::active(state);

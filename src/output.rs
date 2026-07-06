@@ -517,15 +517,25 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         draw_popups(state, out, &win.xdg().xdg, rect.x1, rect.y1, screen, ops, live);
     };
 
+    // paint order: background, bottom, tiled, fullscreen, floats, top,
+    // overlay; fullscreen hides everything below itself except overlay
     if fs.is_none() {
+        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
+        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
         ws.tiling.for_each(|win| draw(win, &mut ops, &mut live));
     }
     if let Some(fs) = &fs {
         draw(fs, &mut ops, &mut live);
     }
-    for win in ws.floats.borrow().iter() {
-        draw(win, &mut ops, &mut live);
+    if fs.is_none() || crate::tree::FLOAT_ABOVE_FULLSCREEN {
+        for win in ws.floats.borrow().iter() {
+            draw(win, &mut ops, &mut live);
+        }
     }
+    if fs.is_none() {
+        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live);
+    }
+    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
 
     // textures for gone buffers don't outlive the frame
     let mut textures = out.textures.borrow_mut();
@@ -581,6 +591,26 @@ fn draw_surface_tree(
     }
 }
 
+fn draw_popup(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    p: &Rc<crate::shell::xdg::XdgPopup>,
+    ox: i32,
+    oy: i32,
+    screen: Rect,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<(ClientId, ObjectId)>,
+) {
+    if !p.xdg.surface.mapped.get() {
+        return;
+    }
+    let (rx, ry) = p.rel.get();
+    let (px, py) = (ox + rx, oy + ry);
+    let geo = p.xdg.geometry();
+    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, ops, live);
+    draw_popups(state, out, &p.xdg, px, py, screen, ops, live);
+}
+
 fn draw_popups(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -591,16 +621,27 @@ fn draw_popups(
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, ObjectId)>,
 ) {
-    xdg.for_each_popup(|p| {
-        if !p.xdg.surface.mapped.get() {
-            return;
+    xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
+}
+
+// one shell layer, mapping order = z within it, popups on top of each
+fn draw_layer(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    layer: u32,
+    screen: Rect,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<(ClientId, ObjectId)>,
+) {
+    let layers = state.layers.borrow().clone();
+    for ls in layers.iter() {
+        if ls.current.get().layer != layer || !ls.mapped() {
+            continue;
         }
-        let (rx, ry) = p.rel.get();
-        let (px, py) = (ox + rx, oy + ry);
-        let geo = p.xdg.geometry();
-        draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, ops, live);
-        draw_popups(state, out, &p.xdg, px, py, screen, ops, live);
-    });
+        let r = ls.rect.get();
+        draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, ops, live);
+        ls.for_each_popup(|p| draw_popup(state, out, p, r.x1, r.y1, screen, ops, live));
+    }
 }
 
 /// upload the committed buffer, emit one quad intersected with the clip; uv

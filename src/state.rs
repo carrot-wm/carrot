@@ -29,9 +29,13 @@ pub struct State {
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
     pub active_ws: std::cell::Cell<usize>,
-    /// xdg surfaces with a scheduled configure; drained by an engine task
-    pub configures: RefCell<Vec<Rc<crate::shell::xdg::XdgSurface>>>,
+    /// shell surfaces with a scheduled configure; drained by an engine task
+    pub configures: RefCell<Vec<Rc<dyn crate::shell::Configurable>>>,
     pub configure_event: AsyncEvent,
+    /// layer surfaces in mapping order, all four layers together
+    pub layers: RefCell<Vec<Rc<crate::shell::layer::LayerSurface>>>,
+    /// the output rect minus exclusive zones; the tiling root box
+    pub usable: std::cell::Cell<crate::rect::Rect>,
     serial: NumCell<u64>,
 }
 
@@ -55,6 +59,8 @@ impl State {
             active_ws: std::cell::Cell::new(0),
             configures: RefCell::new(Vec::new()),
             configure_event: AsyncEvent::default(),
+            layers: RefCell::new(Vec::new()),
+            usable: std::cell::Cell::new(crate::rect::Rect::default()),
             serial: NumCell::new(0),
         })
     }
@@ -73,6 +79,7 @@ impl State {
         self.slow_clients.clear();
         self.workspaces.borrow_mut().clear();
         self.configures.borrow_mut().clear();
+        self.layers.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
         self.display.borrow_mut().take();

@@ -84,6 +84,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(shell::xdg::XdgDecorationManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(shell::layer::LayerShellGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::output::XdgOutputManagerGlobal));
     let st = state.clone();
     let configure_pump = engine.spawn("configure pump", async move {
         shell::xdg::configure_loop(st).await;
