@@ -19,8 +19,6 @@ const CAP_KEYBOARD: u32 = 2;
 const MISSING_CAPABILITY: u32 = 0;
 
 const XKB_V1: u32 = 1;
-pub const REPEAT_RATE: i32 = 25;
-pub const REPEAT_DELAY_MS: i32 = 600;
 /// server-side repeat starts at wl_keyboard v10
 const REPEATED_SINCE: u32 = 10;
 
@@ -101,10 +99,14 @@ impl SeatGlobal {
                 let Some(key) = self.repeat_key.get() else {
                     break;
                 };
+                let (rate, delay) = {
+                    let c = state.config.borrow();
+                    (c.repeat_rate.max(1) as u64, c.repeat_delay.max(1) as u64)
+                };
                 let wait_ns = if first {
-                    REPEAT_DELAY_MS as u64 * 1_000_000
+                    delay * 1_000_000
                 } else {
-                    1_000_000_000 / REPEAT_RATE as u64
+                    1_000_000_000 / rate
                 };
                 first = false;
                 let deadline = Time::from_nsec(Time::now().nsec() + wait_ns);
@@ -264,7 +266,8 @@ impl wl_seat::Handler for WlSeat {
             let (rate, delay) = if self.version >= REPEATED_SINCE {
                 (0, 0)
             } else {
-                (REPEAT_RATE, REPEAT_DELAY_MS)
+                let c = self.client.state.config.borrow();
+                (c.repeat_rate, c.repeat_delay)
             };
             self.client
                 .event(|o| wl_keyboard::repeat_info::send(o, kb.id, rate, delay));
@@ -462,9 +465,7 @@ impl SeatGlobal {
         // binds exact-match the depressed set masked to shift|ctrl|alt|super
         if pressed {
             const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
-            const SHIFT: u32 = 1 << 0;
             const CTRL_ALT: u32 = (1 << 2) | (1 << 3);
-            const SUPER: u32 = 1 << 6;
             let held_mods = self.mods.get().depressed & MASK;
             if held_mods == CTRL_ALT {
                 let vt = match key {
@@ -478,23 +479,19 @@ impl SeatGlobal {
                     return KeyAction::SwitchVt(vt);
                 }
             }
-            // hardcoded until the config layer lands
-            if held_mods == SUPER {
-                let action = match key {
-                    // KEY_1..KEY_9
-                    2..=10 => Some(KeyAction::Workspace(key as usize - 2)),
-                    33 => Some(KeyAction::ToggleFullscreen),
-                    47 => Some(KeyAction::ToggleFloating),
-                    _ => None,
-                };
-                if let Some(action) = action {
+            // configured binds, exact-set match; vt switching stays
+            // hardcoded above so a broken config can't strand the seat
+            let cfg = state.config.borrow().clone();
+            use crate::config::BindKind;
+            for b in cfg.binds.iter() {
+                if held_mods == b.mods && key == b.key {
+                    // release and mouse binds wait for their own dispatch paths
+                    if matches!(b.kind, BindKind::Release | BindKind::Mouse) {
+                        continue;
+                    }
                     self.cancel_repeat();
-                    return action;
+                    return KeyAction::Act(b.action.clone());
                 }
-            }
-            if held_mods == (SUPER | SHIFT) && key == 16 {
-                self.cancel_repeat();
-                return KeyAction::CloseWindow;
             }
         }
 
@@ -737,8 +734,5 @@ impl SeatGlobal {
 pub enum KeyAction {
     Handled,
     SwitchVt(u32),
-    Workspace(usize),
-    ToggleFullscreen,
-    ToggleFloating,
-    CloseWindow,
+    Act(crate::config::Action),
 }

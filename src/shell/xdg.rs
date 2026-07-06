@@ -1563,7 +1563,10 @@ mod tests {
         map(&state, &client, &s, &xdg, 20);
         assert!(tl.window.borrow().is_some());
         let win = tl.window.borrow().clone().unwrap();
-        let g = crate::tree::GAPS_OUT + crate::tree::BORDER;
+        let g = {
+            let c = state.config.borrow();
+            c.gaps_out + c.border
+        };
         assert_eq!(win.rect.get(), Rect { x1: g, y1: g, x2: 800 - g, y2: 600 - g });
         // the relayout configure carries the tile size
         flush_configures(&state);
@@ -1631,7 +1634,10 @@ mod tests {
         commit(&s2);
         assert!(t2.window.borrow().is_none());
         let win = t1.window.borrow().clone().unwrap();
-        let g = crate::tree::GAPS_OUT + crate::tree::BORDER;
+        let g = {
+            let c = state.config.borrow();
+            c.gaps_out + c.border
+        };
         assert_eq!(win.rect.get(), Rect { x1: g, y1: g, x2: 800 - g, y2: 600 - g });
         assert!(win.rect.get().width() > w1_rect.width());
     }

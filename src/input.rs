@@ -143,25 +143,8 @@ async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<Log
                         }
                         session.switch_vt(vt);
                     }
-                    seat::KeyAction::Workspace(n) => {
-                        crate::tree::switch_workspace(&state, n);
-                    }
-                    seat::KeyAction::ToggleFullscreen => {
-                        if let Some(win) = focused_window(&state, &seat) {
-                            let on = !win.fullscreen.get();
-                            crate::tree::set_fullscreen(&state, &win, on);
-                            win.xdg().set_fullscreen_state(on);
-                        }
-                    }
-                    seat::KeyAction::ToggleFloating => {
-                        if let Some(win) = focused_window(&state, &seat) {
-                            crate::tree::float::toggle_floating(&state, &win);
-                        }
-                    }
-                    seat::KeyAction::CloseWindow => {
-                        if let Some(win) = focused_window(&state, &seat) {
-                            win.send_close();
-                        }
+                    seat::KeyAction::Act(action) => {
+                        crate::ipc::dispatch_action(&state, &action);
                     }
                     seat::KeyAction::Handled => {}
                 }
@@ -185,14 +168,6 @@ async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<Log
             InputEvent::Frame { .. } => seat.pointer_frame(),
         }
     }
-}
-
-fn focused_window(
-    state: &Rc<State>,
-    seat: &Rc<seat::SeatGlobal>,
-) -> Option<Rc<crate::tree::Window>> {
-    let focus = seat.kb_focus.borrow().clone()?;
-    crate::tree::window_for_surface(state, &focus)
 }
 
 /// seam between device layer and seat: decoded, batched, deduped. usec until the wire.

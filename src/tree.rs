@@ -16,10 +16,7 @@ use std::rc::{Rc, Weak};
 use workspace::Workspace;
 
 /// gaps/borders; config keys later
-pub const GAPS_IN: i32 = 6;
-pub const GAPS_OUT: i32 = 12;
-pub const BORDER: i32 = 2;
-pub const FLOAT_ABOVE_FULLSCREEN: bool = false;
+// gaps, borders, colors and binds all live in state.config now
 
 pub fn output_extent(state: &State) -> (i32, i32) {
     let (w, h) = state.output_size.get();
@@ -62,6 +59,22 @@ impl Window {
 
     pub fn geometry(&self) -> Rect {
         self.xdg().xdg.geometry()
+    }
+
+    pub fn title(&self) -> String {
+        self.xdg().title.borrow().clone()
+    }
+
+    pub fn app_id(&self) -> String {
+        self.xdg().app_id.borrow().clone()
+    }
+
+    pub fn set_fullscreen_state(&self, on: bool) {
+        self.xdg().set_fullscreen_state(on);
+    }
+
+    pub fn wants_fullscreen(&self) -> bool {
+        self.xdg().wants_fullscreen()
     }
 
     /// where this window paints
@@ -117,6 +130,7 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
             .or_else(|| ws.top_float())
     };
     focus_window(state, target.as_ref());
+    crate::ipc::emit(state, &serde_json::json!({ "workspace": idx + 1 }));
     state.damage.trigger();
 }
 
@@ -130,6 +144,66 @@ pub(crate) fn cursor_pos(state: &Rc<State>) -> (i32, i32) {
     }
 }
 
+pub fn focused_window(state: &Rc<State>) -> Option<Rc<Window>> {
+    let seat = state.seat.borrow().clone()?;
+    let focus = seat.kb_focus.borrow().clone()?;
+    window_for_surface(state, &focus)
+}
+
+// move the focused window to workspace n and follow it there; the moved
+// window keeps the keyboard
+pub fn send_to_workspace(state: &Rc<State>, n: usize) {
+    if n == state.active_ws.get() {
+        return;
+    }
+    let Some(win) = focused_window(state) else {
+        return;
+    };
+    let ws = active(state);
+    if win.fullscreen.get() {
+        set_fullscreen(state, &win, false);
+        win.set_fullscreen_state(false);
+    }
+    if win.floating.get() {
+        ws.remove_float(&win);
+        win.floating.set(false);
+    } else {
+        ws.tiling.remove(&win);
+    }
+    relayout(state, &ws);
+    {
+        let mut list = state.workspaces.borrow_mut();
+        while list.len() <= n {
+            list.push(Rc::new(Workspace::default()));
+        }
+    }
+    let target = state.workspaces.borrow()[n].clone();
+    let area = tiling_area(state);
+    target
+        .tiling
+        .insert(&win, (area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2);
+    switch_workspace(state, n);
+    focus_window(state, Some(&win));
+}
+
+// step focus through the workspace in tree order; wraps around
+pub fn focus_cycle(state: &Rc<State>, dir: i32) {
+    let ws = active(state);
+    let mut wins = Vec::new();
+    ws.for_each(|w| wins.push(w.clone()));
+    if wins.is_empty() {
+        return;
+    }
+    let cur = focused_window(state);
+    let idx = cur.and_then(|c| wins.iter().position(|w| Rc::ptr_eq(w, &c)));
+    let next = match idx {
+        Some(i) => (i as i32 + dir).rem_euclid(wins.len() as i32) as usize,
+        None => 0,
+    };
+    focus_window(state, Some(&wins[next]));
+    state.damage.trigger();
+}
+
 fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {
     // an exclusive layer surface owns the keyboard; windows wait
     if crate::shell::layer::kb_lock(state).is_some() {
@@ -137,6 +211,8 @@ fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {
     }
     let seat = state.seat.borrow().clone();
     if let Some(seat) = seat {
+        // picking a window is selecting outside any popup grab chain
+        crate::shell::xdg::dismiss_popup_grabs(state, &seat);
         crate::input::focus::set_keyboard_focus(state, &seat, win.map(|w| w.surface()));
     }
 }
@@ -161,15 +237,22 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     let fs = ws.fullscreen.borrow().clone();
     if let Some(fs) = fs {
         set_fullscreen(state, &fs, false);
-        fs.xdg().set_fullscreen_state(false);
+        fs.set_fullscreen_state(false);
     }
     let (cx, cy) = cursor_pos(state);
     ws.tiling.insert(win, cx, cy);
     relayout(state, &ws);
-    if win.xdg().wants_fullscreen() {
+    if win.wants_fullscreen() {
         set_fullscreen(state, win, true);
     }
     focus_window(state, Some(win));
+    crate::ipc::emit(
+        state,
+        &serde_json::json!({ "window-opened": {
+            "title": win.title(),
+            "app-id": win.app_id(),
+        }}),
+    );
     state.damage.trigger();
 }
 
@@ -205,6 +288,12 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
             .or_else(|| ws.top_float());
         focus_window(state, next.as_ref());
     }
+    crate::ipc::emit(
+        state,
+        &serde_json::json!({ "window-closed": {
+            "title": win.title(),
+        }}),
+    );
     state.damage.trigger();
 }
 
@@ -227,6 +316,7 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
         win.fullscreen.set(false);
         win.configure_rect();
     }
+    crate::ipc::emit(state, &serde_json::json!({ "fullscreen": on }));
     state.damage.trigger();
 }
 
@@ -243,15 +333,15 @@ pub fn tiling_area(state: &Rc<State>) -> Rect {
     if usable.is_empty() { full } else { usable.intersect(full) }
 }
 
-fn apply_gaps(r: Rect, area: Rect) -> Rect {
-    let left = if r.x1 <= area.x1 { GAPS_OUT } else { GAPS_IN };
-    let top = if r.y1 <= area.y1 { GAPS_OUT } else { GAPS_IN };
-    let right = if r.x2 >= area.x2 { GAPS_OUT } else { GAPS_IN };
-    let bottom = if r.y2 >= area.y2 { GAPS_OUT } else { GAPS_IN };
-    let x1 = r.x1 + left + BORDER;
-    let y1 = r.y1 + top + BORDER;
-    let x2 = (r.x2 - right - BORDER).max(x1 + 1);
-    let y2 = (r.y2 - bottom - BORDER).max(y1 + 1);
+fn apply_gaps(r: Rect, area: Rect, cfg: &crate::config::Config) -> Rect {
+    let left = if r.x1 <= area.x1 { cfg.gaps_out } else { cfg.gaps_in };
+    let top = if r.y1 <= area.y1 { cfg.gaps_out } else { cfg.gaps_in };
+    let right = if r.x2 >= area.x2 { cfg.gaps_out } else { cfg.gaps_in };
+    let bottom = if r.y2 >= area.y2 { cfg.gaps_out } else { cfg.gaps_in };
+    let x1 = r.x1 + left + cfg.border;
+    let y1 = r.y1 + top + cfg.border;
+    let x2 = (r.x2 - right - cfg.border).max(x1 + 1);
+    let y2 = (r.y2 - bottom - cfg.border).max(y1 + 1);
     Rect { x1, y1, x2, y2 }
 }
 
@@ -261,6 +351,7 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
         return;
     }
     let area = tiling_area(state);
+    let cfg = state.config.borrow().clone();
     ws.tiling.recalculate(area);
     ws.tiling.for_each(|win| {
         let raw = win
@@ -269,7 +360,7 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
             .upgrade()
             .map(|n| n.rect.get())
             .unwrap_or_default();
-        win.rect.set(apply_gaps(raw, area));
+        win.rect.set(apply_gaps(raw, area, &cfg));
         if !win.fullscreen.get() {
             win.configure_rect();
         }
@@ -291,7 +382,7 @@ pub fn window_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<Window>, Rc<Wl
         None
     };
     if let Some(fs) = &fs {
-        if FLOAT_ABOVE_FULLSCREEN {
+        if state.config.borrow().float_above_fullscreen {
             if let Some(hit) = check_floats(&ws) {
                 return Some(hit);
             }

@@ -36,6 +36,10 @@ pub struct State {
     pub layers: RefCell<Vec<Rc<crate::shell::layer::LayerSurface>>>,
     /// the output rect minus exclusive zones; the tiling root box
     pub usable: std::cell::Cell<crate::rect::Rect>,
+    /// swapped whole on reload; readers grab an Rc and never hold it
+    pub config: RefCell<Rc<crate::config::Config>>,
+    /// ipc connections that asked for the event stream
+    pub ipc_subs: RefCell<Vec<Rc<crate::ipc::Subscriber>>>,
     serial: NumCell<u64>,
 }
 
@@ -61,6 +65,8 @@ impl State {
             configure_event: AsyncEvent::default(),
             layers: RefCell::new(Vec::new()),
             usable: std::cell::Cell::new(crate::rect::Rect::default()),
+            config: RefCell::new(Rc::new(crate::config::Config::default())),
+            ipc_subs: RefCell::new(Vec::new()),
             serial: NumCell::new(0),
         })
     }
@@ -80,6 +86,7 @@ impl State {
         self.workspaces.borrow_mut().clear();
         self.configures.borrow_mut().clear();
         self.layers.borrow_mut().clear();
+        self.ipc_subs.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
         self.display.borrow_mut().take();

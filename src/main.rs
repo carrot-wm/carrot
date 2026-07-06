@@ -109,6 +109,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     }
+    // config before anything can consume it; a broken file is fatal here
+    // and only here - reloads reject instead
+    match config::load() {
+        Ok(c) => *state.config.borrow_mut() = std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("carrot: config: {e}");
+            state.clear();
+            engine.clear();
+            return Err(e.into());
+        }
+    }
+    let ipc = match ipc::start(&state, &sock.name) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("carrot: {e}");
+            state.clear();
+            engine.clear();
+            return Err(e.into());
+        }
+    };
     // headless is supported; the display comes up when logind hands over a
     // card (or, without a session, via direct open)
     let st = state.clone();
@@ -162,6 +182,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(police);
     drop(bring_up);
     drop(configure_pump);
+    drop(ipc);
     state.clear();
     drop(cpu);
     engine.clear();

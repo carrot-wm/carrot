@@ -38,5 +38,14 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
         // the keyboard owner learns what both clipboards hold
         seat.data.offer_to(&new.client);
         seat.primary.offer_to(&new.client);
+        if let Some(win) = crate::tree::window_for_surface(state, new) {
+            crate::ipc::emit(
+                state,
+                &serde_json::json!({ "window-focused": {
+                    "title": win.title(),
+                    "app-id": win.app_id(),
+                }}),
+            );
+        }
     }
 }

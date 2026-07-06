@@ -475,9 +475,6 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
 }
 
 /// border colors; config keys once the config layer exists
-const BORDER_FOCUSED: [f32; 4] = [0.95, 0.55, 0.25, 1.0];
-const BORDER_UNFOCUSED: [f32; 4] = [0.22, 0.22, 0.26, 1.0];
-
 /// paint order tiled, fullscreen, floats; each window drawn as its surface
 /// stack, clipped to the window box so CSD can't leak past the tile. popups
 /// sit above their window.
@@ -492,6 +489,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         .and_then(|s| s.kb_focus.borrow().clone());
     let fs = ws.fullscreen.borrow().clone();
     let screen = Rect::new_sized_saturating(0, 0, out.width as i32, out.height as i32);
+    let cfg = state.config.borrow().clone();
 
     let draw = |win: &Rc<crate::tree::Window>, ops: &mut Vec<RenderOp>, live: &mut Vec<(ClientId, ObjectId)>| {
         let surface = win.surface();
@@ -503,14 +501,14 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
             let color = match &focused {
                 Some(f) => {
                     if Rc::ptr_eq(f, &surface) {
-                        BORDER_FOCUSED
+                        cfg.border_focused
                     } else {
-                        BORDER_UNFOCUSED
+                        cfg.border_unfocused
                     }
                 }
-                None => BORDER_UNFOCUSED,
+                None => cfg.border_unfocused,
             };
-            push_borders(out, rect, color, ops);
+            push_borders(out, rect, cfg.border, color, ops);
         }
         let geo = win.geometry();
         draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, ops, live);
@@ -527,7 +525,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     if let Some(fs) = &fs {
         draw(fs, &mut ops, &mut live);
     }
-    if fs.is_none() || crate::tree::FLOAT_ABOVE_FULLSCREEN {
+    if fs.is_none() || cfg.float_above_fullscreen {
         for win in ws.floats.borrow().iter() {
             draw(win, &mut ops, &mut live);
         }
@@ -746,8 +744,7 @@ fn draw_buffer(
 }
 
 /// four fills just outside the window box
-fn push_borders(out: &Rc<Output>, r: Rect, color: [f32; 4], ops: &mut Vec<RenderOp>) {
-    let b = crate::tree::BORDER;
+fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Vec<RenderOp>) {
     let sides = [
         Rect { x1: r.x1 - b, y1: r.y1 - b, x2: r.x2 + b, y2: r.y1 },
         Rect { x1: r.x1 - b, y1: r.y2, x2: r.x2 + b, y2: r.y2 + b },
