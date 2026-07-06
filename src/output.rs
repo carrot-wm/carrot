@@ -32,6 +32,25 @@ pub struct Display {
 }
 
 impl Display {
+    pub fn output_global(&self) -> crate::protocol::output::WlOutputGlobal {
+        let refresh = self
+            .out
+            .conn
+            .pipe
+            .borrow()
+            .as_ref()
+            .map(|p| p.mode.vrefresh)
+            .unwrap_or(60) as i32
+            * 1000;
+        crate::protocol::output::WlOutputGlobal {
+            width: self.out.width as i32,
+            height: self.out.height as i32,
+            refresh_mhz: refresh,
+        }
+    }
+}
+
+impl Display {
     /// pre-SwitchTo teardown: the only moment we know a switch is coming and
     /// still hold master. logind drops master before signaling PauseDevice,
     /// so the pause path is too late.
@@ -474,7 +493,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     let fs = ws.fullscreen.borrow().clone();
     let screen = Rect::new_sized_saturating(0, 0, out.width as i32, out.height as i32);
 
-    let mut draw = |win: &Rc<crate::tree::Window>, ops: &mut Vec<RenderOp>, live: &mut Vec<(ClientId, ObjectId)>| {
+    let draw = |win: &Rc<crate::tree::Window>, ops: &mut Vec<RenderOp>, live: &mut Vec<(ClientId, ObjectId)>| {
         let surface = win.surface();
         if !surface.mapped.get() {
             return;

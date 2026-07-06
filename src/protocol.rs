@@ -6,6 +6,7 @@ pub mod data_device;
 pub mod display;
 pub mod globals;
 pub mod interfaces;
+pub mod output;
 pub mod primary_selection;
 pub mod shm;
 pub mod wire;

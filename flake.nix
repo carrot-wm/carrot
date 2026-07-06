@@ -132,6 +132,8 @@
             env = {
               LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.vulkan-loader ];
               VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
+              # kbvm needs the xkb data root; nothing ships it system-wide on NixOS
+              XKB_CONFIG_ROOT = "${pkgs.xkeyboard-config}/share/X11/xkb";
             };
 
             shellHook = ''

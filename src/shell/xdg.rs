@@ -9,6 +9,7 @@ use crate::client::{Client, ClientError, Object};
 use crate::protocol::globals::Global;
 use crate::protocol::interfaces::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use crate::protocol::wire::MsgReader;
 use crate::protocol::{DispatchError, ObjectId};
@@ -187,6 +188,32 @@ struct Positioned {
     anchor: u32,
     gravity: u32,
     offset: (i32, i32),
+    ca: u32,
+}
+
+// edge values: 1 top, 2 bottom, 3 left, 4 right, then the corners
+fn mirror_x(v: u32) -> u32 {
+    match v {
+        3 => 4,
+        4 => 3,
+        5 => 7,
+        7 => 5,
+        6 => 8,
+        8 => 6,
+        other => other,
+    }
+}
+
+fn mirror_y(v: u32) -> u32 {
+    match v {
+        1 => 2,
+        2 => 1,
+        5 => 6,
+        6 => 5,
+        7 => 8,
+        8 => 7,
+        other => other,
+    }
 }
 
 impl Positioned {
@@ -215,6 +242,64 @@ impl Positioned {
             _ => ay - h / 2,
         };
         (x + self.offset.0, y + self.offset.1)
+    }
+
+    /// constraint solving, spec order per axis: flip, slide, resize.
+    /// parent_org is the absolute origin of the parent's geometry; the
+    /// result is parent-relative again
+    fn solve(&self, parent_org: (i32, i32), bounds: Rect) -> ((i32, i32), (i32, i32)) {
+        const SLIDE_X: u32 = 1;
+        const SLIDE_Y: u32 = 2;
+        const FLIP_X: u32 = 4;
+        const FLIP_Y: u32 = 8;
+        const RESIZE_X: u32 = 16;
+        const RESIZE_Y: u32 = 32;
+        let (mut w, mut h) = self.size;
+        let abs = |p: &Positioned| {
+            let (x, y) = p.place();
+            (parent_org.0 + x, parent_org.1 + y)
+        };
+        let (mut x, mut y) = abs(self);
+        // a flip only sticks when it actually unconstrains the axis
+        if self.ca & FLIP_X != 0 && (x < bounds.x1 || x + w > bounds.x2) {
+            let mut f = *self;
+            f.anchor = mirror_x(f.anchor);
+            f.gravity = mirror_x(f.gravity);
+            let (fx, _) = abs(&f);
+            if fx >= bounds.x1 && fx + w <= bounds.x2 {
+                x = fx;
+            }
+        }
+        if self.ca & FLIP_Y != 0 && (y < bounds.y1 || y + h > bounds.y2) {
+            let mut f = *self;
+            f.anchor = mirror_y(f.anchor);
+            f.gravity = mirror_y(f.gravity);
+            let (_, fy) = abs(&f);
+            if fy >= bounds.y1 && fy + h <= bounds.y2 {
+                y = fy;
+            }
+        }
+        if self.ca & SLIDE_X != 0 {
+            x = x.min(bounds.x2 - w).max(bounds.x1);
+        }
+        if self.ca & SLIDE_Y != 0 {
+            y = y.min(bounds.y2 - h).max(bounds.y1);
+        }
+        if self.ca & RESIZE_X != 0 {
+            if x < bounds.x1 {
+                w -= bounds.x1 - x;
+                x = bounds.x1;
+            }
+            w = w.min(bounds.x2 - x).max(1);
+        }
+        if self.ca & RESIZE_Y != 0 {
+            if y < bounds.y1 {
+                h -= bounds.y1 - y;
+                y = bounds.y1;
+            }
+            h = h.min(bounds.y2 - y).max(1);
+        }
+        ((x - parent_org.0, y - parent_org.1), (w, h))
     }
 }
 
@@ -295,9 +380,14 @@ impl xdg_positioner::Handler for XdgPositioner {
 
     fn set_constraint_adjustment(
         &self,
-        _req: xdg_positioner::set_constraint_adjustment::Request,
+        req: xdg_positioner::set_constraint_adjustment::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // stored nowhere yet: constraint solving lands with real popups
+        if req.constraint_adjustment > 63 {
+            self.client
+                .protocol_error(self.id, 0, "invalid constraint adjustment");
+            return Ok(());
+        }
+        self.edit(|v| v.ca = req.constraint_adjustment);
         Ok(())
     }
 
@@ -399,6 +489,30 @@ impl XdgSurface {
         }
     }
 
+    pub fn popup(&self) -> Option<Rc<XdgPopup>> {
+        match &*self.ext.borrow() {
+            XdgExt::Popup(p) => Some(p.clone()),
+            _ => None,
+        }
+    }
+
+    // absolute origin of this xdg surface's geometry on screen
+    fn abs_origin(&self) -> Option<(i32, i32)> {
+        match &*self.ext.borrow() {
+            XdgExt::Toplevel(tl) => {
+                let win = tl.window.borrow().clone()?;
+                let r = win.draw_rect(&self.client.state);
+                Some((r.x1, r.y1))
+            }
+            XdgExt::Popup(p) => {
+                let (px, py) = p.parent_origin()?;
+                let (rx, ry) = p.rel.get();
+                Some((px + rx, py + ry))
+            }
+            XdgExt::None => None,
+        }
+    }
+
     pub fn schedule_configure(&self) {
         if !self.scheduled.replace(true) {
             let state = &self.client.state;
@@ -493,6 +607,7 @@ impl xdg_surface::Handler for XdgSurface {
             desired: Cell::new((0, 0)),
         });
         c.add_client_obj(tl.clone())?;
+        c.objects.track_toplevel(tl.clone());
         if self.version >= 5 {
             c.event(|o| {
                 xdg_toplevel::wm_capabilities::send(o, tl.id, &CAP_FULLSCREEN.to_ne_bytes())
@@ -547,6 +662,7 @@ impl xdg_surface::Handler for XdgSurface {
             version: self.version,
             xdg: self.rc(),
             parent: RefCell::new(parent.clone()),
+            positioned: Cell::new(pos),
             rel: Cell::new(pos.place()),
             size: Cell::new(pos.size),
             done: Cell::new(false),
@@ -676,11 +792,20 @@ impl SurfaceExt for XdgSurfaceExt {
                     tl.reset_after_unmap();
                 }
             }
-            XdgExt::Popup(_) => {
+            XdgExt::Popup(p) => {
+                let p = p.clone();
                 drop(ext);
                 if !x.configured.get() {
+                    // the parent is on screen by now, so this is where the
+                    // positioner constraints can actually be solved
+                    p.solve_position();
                     x.configured.set(true);
                     x.schedule_configure();
+                    return;
+                }
+                if !x.surface.mapped.get() {
+                    // an unmapped grabbing popup can't hold the keyboard
+                    popup_closed(&x.client.state, &p);
                 }
             }
             XdgExt::None => {}
@@ -797,6 +922,7 @@ impl xdg_toplevel::Handler for XdgToplevel {
         self.detach_from_tree();
         self.reset_after_unmap();
         *self.xdg.ext.borrow_mut() = XdgExt::None;
+        self.client.objects.forget_toplevel(self.id);
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -948,6 +1074,7 @@ pub struct XdgPopup {
     pub version: u32,
     pub xdg: Rc<XdgSurface>,
     parent: RefCell<Option<Rc<XdgSurface>>>,
+    positioned: Cell<Positioned>,
     /// relative to the parent's window geometry origin
     pub rel: Cell<(i32, i32)>,
     pub size: Cell<(i32, i32)>,
@@ -960,10 +1087,38 @@ impl XdgPopup {
             self.client.event(|o| xdg_popup::popup_done::send(o, self.id));
         }
     }
+
+    fn me(&self) -> Option<Rc<XdgPopup>> {
+        match &*self.xdg.ext.borrow() {
+            XdgExt::Popup(p) => Some(p.clone()),
+            _ => None,
+        }
+    }
+
+    /// absolute origin of the parent's geometry, walking nested popups
+    /// down to the toplevel's window rect
+    fn parent_origin(&self) -> Option<(i32, i32)> {
+        let parent = self.parent.borrow().clone()?;
+        parent.abs_origin()
+    }
+
+    fn solve_position(&self) {
+        let Some(org) = self.parent_origin() else {
+            return;
+        };
+        let (w, h) = crate::tree::output_extent(&self.client.state);
+        let bounds = Rect::new_sized_saturating(0, 0, w.max(1), h.max(1));
+        let (rel, size) = self.positioned.get().solve(org, bounds);
+        self.rel.set(rel);
+        self.size.set(size);
+    }
 }
 
 impl xdg_popup::Handler for XdgPopup {
     fn destroy(&self, _req: xdg_popup::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(me) = self.me() {
+            popup_closed(&self.client.state, &me);
+        }
         if let Some(parent) = self.parent.borrow_mut().take() {
             parent.unlink_popup(self);
         }
@@ -975,6 +1130,36 @@ impl xdg_popup::Handler for XdgPopup {
     }
 
     fn grab(&self, _req: xdg_popup::grab::Request) -> Result<(), Box<dyn std::error::Error>> {
+        let state = &self.client.state;
+        let Some(seat) = state.seat.borrow().clone() else {
+            return Ok(());
+        };
+        let Some(me) = self.me() else {
+            return Ok(());
+        };
+        {
+            let mut stack = seat.popup_grab.borrow_mut();
+            // only the topmost grabbing popup may parent another grab
+            let ok = match stack.last() {
+                None => true,
+                Some(top) => self
+                    .parent
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| Rc::ptr_eq(p, &top.xdg)),
+            };
+            if !ok {
+                drop(stack);
+                self.client
+                    .protocol_error(self.id, 0, "grab on a popup that is not the topmost");
+                return Ok(());
+            }
+            if stack.is_empty() {
+                *seat.grab_prev_focus.borrow_mut() = seat.kb_focus.borrow().clone();
+            }
+            stack.push(me);
+        }
+        crate::input::focus::set_keyboard_focus(state, &seat, Some(self.xdg.surface.clone()));
         Ok(())
     }
 
@@ -987,16 +1172,52 @@ impl xdg_popup::Handler for XdgPopup {
             self.client.invalid_object(req.positioner);
             return Ok(());
         };
-        let pos = positioner.v.get();
-        self.rel.set(pos.place());
-        if pos.size != (0, 0) {
-            self.size.set(pos.size);
-        }
+        self.positioned.set(positioner.v.get());
+        self.solve_position();
         self.client
             .event(|o| xdg_popup::repositioned::send(o, self.id, req.token));
         self.xdg.schedule_configure();
         Ok(())
     }
+}
+
+// a popup left the screen (destroy or unmap): drop it from the grab
+// chain and put the keyboard back where it belongs
+pub fn popup_closed(state: &Rc<State>, popup: &Rc<XdgPopup>) {
+    let Some(seat) = state.seat.borrow().clone() else {
+        return;
+    };
+    let next = {
+        let mut stack = seat.popup_grab.borrow_mut();
+        let before = stack.len();
+        stack.retain(|p| !Rc::ptr_eq(p, popup));
+        if stack.len() == before {
+            return;
+        }
+        stack.last().cloned()
+    };
+    let target = match next {
+        Some(p) => Some(p.xdg.surface.clone()),
+        None => seat.grab_prev_focus.borrow_mut().take(),
+    };
+    let target = target.filter(|s| !s.destroyed.get());
+    crate::input::focus::set_keyboard_focus(state, &seat, target);
+}
+
+// click outside the grab chain: every grabbing popup gets popup_done,
+// topmost first, and the keyboard returns to the pre-grab owner
+pub fn dismiss_popup_grabs(state: &Rc<State>, seat: &Rc<crate::input::seat::SeatGlobal>) {
+    let stack: Vec<_> = seat.popup_grab.borrow_mut().drain(..).collect();
+    if stack.is_empty() {
+        return;
+    }
+    for p in stack.iter().rev() {
+        p.send_done();
+    }
+    let prev = seat.grab_prev_focus.borrow_mut().take();
+    let prev = prev.filter(|s| !s.destroyed.get());
+    crate::input::focus::set_keyboard_focus(state, seat, prev);
+    state.damage.trigger();
 }
 
 impl Object for XdgPopup {
@@ -1018,6 +1239,147 @@ impl Object for XdgPopup {
 
     fn break_loops(&self) {
         *self.parent.borrow_mut() = None;
+    }
+}
+
+// -- xdg-decoration --
+
+// the answer is always server_side: carrot draws the borders, clients
+// keep their pixels to themselves
+const DECO_SERVER_SIDE: u32 = 2;
+
+pub struct XdgDecorationManagerGlobal;
+
+impl Global for XdgDecorationManagerGlobal {
+    fn interface(&self) -> &'static str {
+        zxdg_decoration_manager_v1::NAME
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn bind(&self, client: &Rc<Client>, id: ObjectId, version: u32) -> Result<(), ClientError> {
+        client.add_client_obj(Rc::new(XdgDecorationManager {
+            id,
+            client: client.clone(),
+            version,
+        }))
+    }
+}
+
+pub struct XdgDecorationManager {
+    pub id: ObjectId,
+    pub client: Rc<Client>,
+    pub version: u32,
+}
+
+impl zxdg_decoration_manager_v1::Handler for XdgDecorationManager {
+    fn destroy(
+        &self,
+        _req: zxdg_decoration_manager_v1::destroy::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.client.remove_obj(self.id)?;
+        Ok(())
+    }
+
+    fn get_toplevel_decoration(
+        &self,
+        req: zxdg_decoration_manager_v1::get_toplevel_decoration::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(toplevel) = self.client.objects.toplevel(req.toplevel) else {
+            self.client.invalid_object(req.toplevel);
+            return Ok(());
+        };
+        let deco = Rc::new(XdgDecoration {
+            id: req.id,
+            client: self.client.clone(),
+            version: self.version,
+            toplevel,
+        });
+        self.client.add_client_obj(deco.clone())?;
+        deco.announce();
+        Ok(())
+    }
+}
+
+impl Object for XdgDecorationManager {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    fn interface(&self) -> &'static str {
+        zxdg_decoration_manager_v1::NAME
+    }
+
+    fn handle_request(
+        self: Rc<Self>,
+        opcode: u32,
+        r: &mut MsgReader<'_>,
+    ) -> Result<(), DispatchError> {
+        zxdg_decoration_manager_v1::dispatch(&*self, self.version, opcode, r)
+    }
+}
+
+pub struct XdgDecoration {
+    pub id: ObjectId,
+    pub client: Rc<Client>,
+    pub version: u32,
+    toplevel: Rc<XdgToplevel>,
+}
+
+impl XdgDecoration {
+    // decoration configure first, then the xdg_surface configure that
+    // makes it take effect
+    fn announce(&self) {
+        self.client.event(|o| {
+            zxdg_toplevel_decoration_v1::configure::send(o, self.id, DECO_SERVER_SIDE)
+        });
+        self.toplevel.xdg.schedule_configure();
+    }
+}
+
+impl zxdg_toplevel_decoration_v1::Handler for XdgDecoration {
+    fn destroy(
+        &self,
+        _req: zxdg_toplevel_decoration_v1::destroy::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.client.remove_obj(self.id)?;
+        Ok(())
+    }
+
+    fn set_mode(
+        &self,
+        _req: zxdg_toplevel_decoration_v1::set_mode::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.announce();
+        Ok(())
+    }
+
+    fn unset_mode(
+        &self,
+        _req: zxdg_toplevel_decoration_v1::unset_mode::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.announce();
+        Ok(())
+    }
+}
+
+impl Object for XdgDecoration {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    fn interface(&self) -> &'static str {
+        zxdg_toplevel_decoration_v1::NAME
+    }
+
+    fn handle_request(
+        self: Rc<Self>,
+        opcode: u32,
+        r: &mut MsgReader<'_>,
+    ) -> Result<(), DispatchError> {
+        zxdg_toplevel_decoration_v1::dispatch(&*self, self.version, opcode, r)
     }
 }
 
@@ -1274,6 +1636,86 @@ mod tests {
     }
 
     #[test]
+    fn constraints_flip_then_slide() {
+        // anchored to the parent's right edge, extending right - overflows
+        // an 800-wide screen when the parent sits at x=700
+        let p = Positioned {
+            size: (100, 50),
+            anchor_rect: Rect { x1: 0, y1: 0, x2: 10, y2: 10 },
+            anchor: 4,
+            gravity: 4,
+            offset: (0, 0),
+            ca: 4, // flip_x
+        };
+        let bounds = Rect { x1: 0, y1: 0, x2: 800, y2: 600 };
+        let ((rx, _), (w, _)) = p.solve((700, 0), bounds);
+        // flipped to the left edge, extending left
+        assert_eq!((rx, w), (-100, 100));
+        // same overflow with slide_x instead: clamped to the screen edge
+        let p = Positioned { ca: 1, ..p };
+        let ((rx, _), _) = p.solve((700, 0), bounds);
+        assert_eq!(rx + 700, 700);
+    }
+
+    #[test]
+    fn popup_grab_holds_and_returns_the_keyboard() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = mk_base(&client, 30);
+        let (s1, x1, _t1) = mk_toplevel(&client, &base, 10, 40, 50);
+        map(&state, &client, &s1, &x1, 20);
+        assert!(seat.kb_focus.borrow().as_ref().is_some_and(|s| Rc::ptr_eq(s, &s1)));
+
+        // a popup parented to the toplevel
+        let ps = WlSurface::new(ObjectId(11), &client, 6);
+        client.add_client_obj(ps.clone()).unwrap();
+        client.objects.track_surface(ps.clone());
+        base.get_xdg_surface(xdg_wm_base::get_xdg_surface::Request {
+            id: ObjectId(41),
+            surface: ObjectId(11),
+        })
+        .unwrap();
+        let px = base.surfaces.borrow().get(&ObjectId(41)).cloned().unwrap();
+        base.create_positioner(xdg_wm_base::create_positioner::Request { id: ObjectId(45) })
+            .unwrap();
+        {
+            let pos = base.positioners.borrow().get(&ObjectId(45)).cloned().unwrap();
+            use xdg_positioner::Handler as _;
+            pos.set_size(xdg_positioner::set_size::Request { width: 50, height: 30 })
+                .unwrap();
+            pos.set_anchor_rect(xdg_positioner::set_anchor_rect::Request {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            })
+            .unwrap();
+        }
+        px.get_popup(xdg_surface::get_popup::Request {
+            id: ObjectId(51),
+            parent: ObjectId(40),
+            positioner: ObjectId(45),
+        })
+        .unwrap();
+        let popup = px.popup().unwrap();
+        map(&state, &client, &ps, &px, 21);
+
+        use xdg_popup::Handler as _;
+        popup
+            .grab(xdg_popup::grab::Request { seat: ObjectId(9), serial: 1 })
+            .unwrap();
+        assert!(seat.kb_focus.borrow().as_ref().is_some_and(|s| Rc::ptr_eq(s, &ps)));
+
+        dismiss_popup_grabs(&state, &seat);
+        // popup_done went out and the toplevel got the keyboard back
+        assert_eq!(count_events(&client.queued_out_bytes(), popup.id, 1), 1);
+        assert!(seat.kb_focus.borrow().as_ref().is_some_and(|s| Rc::ptr_eq(s, &s1)));
+        assert!(seat.popup_grab.borrow().is_empty());
+    }
+
+    #[test]
     fn positioner_places_by_anchor_and_gravity() {
         // bottom edge midpoint, extending down
         let p = Positioned {
@@ -1282,6 +1724,7 @@ mod tests {
             anchor: 2,
             gravity: 2,
             offset: (3, 4),
+            ca: 0,
         };
         assert_eq!(p.place(), (25 + 3, 20 + 4));
         // top-left corner, extending up-left

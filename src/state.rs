@@ -80,6 +80,8 @@ impl State {
         if let Some(seat) = self.seat.borrow_mut().take() {
             seat.data.clear();
             seat.primary.clear();
+            seat.popup_grab.borrow_mut().clear();
+            seat.grab_prev_focus.borrow_mut().take();
         }
         if let Some(s) = self.session.borrow_mut().take() {
             s.clear();

@@ -33,6 +33,7 @@ pub struct Objects {
     surfaces: RefCell<HashMap<ObjectId, Rc<crate::surface::WlSurface>>>,
     regions: RefCell<HashMap<ObjectId, Rc<crate::surface::WlRegion>>>,
     buffers: RefCell<HashMap<ObjectId, Rc<crate::protocol::shm::WlBuffer>>>,
+    toplevels: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgToplevel>>>,
 }
 
 impl Objects {
@@ -100,6 +101,7 @@ impl Objects {
         self.surfaces.borrow_mut().clear();
         self.regions.borrow_mut().clear();
         self.buffers.borrow_mut().clear();
+        self.toplevels.borrow_mut().clear();
         let objs: Vec<_> = self.map.borrow_mut().drain().map(|(_, o)| o).collect();
         for obj in &objs {
             obj.break_loops();
@@ -118,6 +120,18 @@ impl Objects {
 
     pub fn forget_surface(&self, id: ObjectId) {
         self.surfaces.borrow_mut().remove(&id);
+    }
+
+    pub fn track_toplevel(&self, t: Rc<crate::shell::xdg::XdgToplevel>) {
+        self.toplevels.borrow_mut().insert(t.id, t);
+    }
+
+    pub fn toplevel(&self, id: ObjectId) -> Option<Rc<crate::shell::xdg::XdgToplevel>> {
+        self.toplevels.borrow().get(&id).cloned()
+    }
+
+    pub fn forget_toplevel(&self, id: ObjectId) {
+        self.toplevels.borrow_mut().remove(&id);
     }
 
     pub fn for_each_surface(&self, mut f: impl FnMut(&Rc<crate::surface::WlSurface>)) {

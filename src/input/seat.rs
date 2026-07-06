@@ -47,6 +47,10 @@ pub struct SeatGlobal {
     // clipboard state rides on the seat: devices, sources, selection
     pub data: crate::protocol::data_device::DataDevices,
     pub primary: crate::protocol::primary_selection::PrimaryDevices,
+    // the popup grab chain, bottom first; keyboard focus to restore on
+    // full dismissal
+    pub popup_grab: RefCell<Vec<Rc<crate::shell::xdg::XdgPopup>>>,
+    pub grab_prev_focus: RefCell<Option<Rc<WlSurface>>>,
 }
 
 impl SeatGlobal {
@@ -70,6 +74,8 @@ impl SeatGlobal {
             ptr_buttons: RefCell::new(Vec::new()),
             data: Default::default(),
             primary: Default::default(),
+            popup_grab: RefCell::new(Vec::new()),
+            grab_prev_focus: RefCell::new(None),
         }))
     }
 
@@ -135,6 +141,9 @@ impl SeatGlobal {
         self.bindings.borrow_mut().remove(&id);
         self.data.drop_client(id);
         self.primary.drop_client(id);
+        self.popup_grab
+            .borrow_mut()
+            .retain(|p| p.client.id != id);
         let focused = self
             .kb_focus
             .borrow()
@@ -588,9 +597,12 @@ impl SeatGlobal {
                     self.ptr_frame(new.client.id);
                     self.ptr_origin.set((x as i32 - lx, y as i32 - ly));
                     // focus follows mouse, onto the window root never a
-                    // subsurface; hovering a popup must not steal focus from its toplevel
+                    // subsurface; hovering a popup must not steal focus from its toplevel,
+                    // and neither may hovering anything while a grab holds the keyboard
                     let root = new.get_root();
-                    if root.role.get() != crate::surface::SurfaceRole::Popup {
+                    if root.role.get() != crate::surface::SurfaceRole::Popup
+                        && self.popup_grab.borrow().is_empty()
+                    {
                         super::focus::set_keyboard_focus(state, self, Some(root));
                     }
                 }
@@ -611,7 +623,7 @@ impl SeatGlobal {
         }
     }
 
-    pub fn pointer_button(&self, state: &Rc<State>, time_usec: u64, button: u32, pressed: bool) {
+    pub fn pointer_button(self: &Rc<Self>, state: &Rc<State>, time_usec: u64, button: u32, pressed: bool) {
         {
             let mut held = self.ptr_buttons.borrow_mut();
             if pressed {
@@ -621,6 +633,20 @@ impl SeatGlobal {
             }
         }
         let focus = self.ptr_focus.borrow().clone();
+        // a press outside the popup grab chain dismisses it; the click
+        // then continues to whoever it landed on
+        if pressed && !self.popup_grab.borrow().is_empty() {
+            let in_chain = focus.as_ref().is_some_and(|s| {
+                let root = s.get_root();
+                self.popup_grab
+                    .borrow()
+                    .iter()
+                    .any(|p| Rc::ptr_eq(&p.xdg.surface, &root))
+            });
+            if !in_chain {
+                crate::shell::xdg::dismiss_popup_grabs(state, self);
+            }
+        }
         let Some(surface) = focus.filter(|s| !s.destroyed.get()) else {
             return;
         };

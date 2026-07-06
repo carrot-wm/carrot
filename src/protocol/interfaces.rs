@@ -236,6 +236,20 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface zxdg_decoration_manager_v1, version = 1;
+    request destroy();
+    request get_toplevel_decoration(id: new_id, toplevel: object);
+}
+
+crate::wl_protocol! {
+    interface zxdg_toplevel_decoration_v1, version = 1;
+    request destroy();
+    request set_mode(mode: uint);
+    request unset_mode();
+    event configure(mode: uint);
+}
+
+crate::wl_protocol! {
     interface zwp_primary_selection_device_manager_v1, version = 1;
     request create_source(id: new_id);
     request get_device(id: new_id, seat: object);
@@ -265,7 +279,18 @@ crate::wl_protocol! {
     event offer(mime_type: string);
 }
 
-/// wl_display.error codes
+crate::wl_protocol! {
+    interface wl_output, version = 4;
+    request release() since 3;
+    event geometry(x: int, y: int, physical_width: int, physical_height: int, subpixel: int, make: string, model: string, transform: int);
+    event mode(flags: uint, width: int, height: int, refresh: int);
+    event done() since 2;
+    event scale(factor: int) since 2;
+    event name(name: string) since 4;
+    event description(description: string) since 4;
+}
+
+// wl_display.error codes
 pub const INVALID_OBJECT: u32 = 0;
 pub const INVALID_METHOD: u32 = 1;
 #[allow(dead_code)]
@@ -380,6 +405,10 @@ mod tests {
         assert_eq!(wl_data_offer::receive::OPCODE, 1);
         assert_eq!(wl_data_offer::finish::OPCODE, 3);
         assert_eq!(wl_data_offer::offer::OPCODE, 0);
+        assert_eq!(zxdg_decoration_manager_v1::get_toplevel_decoration::OPCODE, 1);
+        assert_eq!(zxdg_toplevel_decoration_v1::set_mode::OPCODE, 1);
+        assert_eq!(zxdg_toplevel_decoration_v1::unset_mode::OPCODE, 2);
+        assert_eq!(zxdg_toplevel_decoration_v1::configure::OPCODE, 0);
         assert_eq!(zwp_primary_selection_device_manager_v1::create_source::OPCODE, 0);
         assert_eq!(zwp_primary_selection_device_manager_v1::get_device::OPCODE, 1);
         assert_eq!(zwp_primary_selection_source_v1::offer::OPCODE, 0);
@@ -390,6 +419,13 @@ mod tests {
         assert_eq!(zwp_primary_selection_device_v1::selection::OPCODE, 1);
         assert_eq!(zwp_primary_selection_offer_v1::receive::OPCODE, 0);
         assert_eq!(zwp_primary_selection_offer_v1::offer::OPCODE, 0);
+        assert_eq!(wl_output::release::OPCODE, 0);
+        assert_eq!(wl_output::geometry::OPCODE, 0);
+        assert_eq!(wl_output::mode::OPCODE, 1);
+        assert_eq!(wl_output::done::OPCODE, 2);
+        assert_eq!(wl_output::scale::OPCODE, 3);
+        assert_eq!(wl_output::name::OPCODE, 4);
+        assert_eq!(wl_output::description::OPCODE, 5);
     }
 
     /// byte-exact fixtures pin arg offsets and padding, not just opcodes

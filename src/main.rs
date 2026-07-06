@@ -81,6 +81,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::primary_selection::PrimarySelectionGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(shell::xdg::XdgDecorationManagerGlobal));
     let st = state.clone();
     let configure_pump = engine.spawn("configure pump", async move {
         shell::xdg::configure_loop(st).await;
@@ -90,8 +93,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             state.globals.add(seat.clone());
             *state.seat.borrow_mut() = Some(seat);
         }
-        // a compositor without keyboard maps still serves pixels
-        Err(e) => eprintln!("carrot: wl_seat unavailable: {e}"),
+        // no seat means no keyboard, and no keyboard means no way to vt
+        // switch away once logind darkens the console - bail while the
+        // user can still read the error
+        Err(e) => {
+            eprintln!("carrot: cannot create the seat: {e}");
+            state.clear();
+            engine.clear();
+            return Err(e.into());
+        }
     }
     // headless is supported; the display comes up when logind hands over a
     // card (or, without a session, via direct open)
@@ -105,6 +115,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let display = output::start(&st, session.as_ref()).await;
+        if let Some(d) = &display {
+            st.globals.add(std::rc::Rc::new(d.output_global()));
+        }
         if let Some(s) = &session {
             *st.input.borrow_mut() = Some(input::start(&st, s).await);
         }
