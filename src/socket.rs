@@ -18,7 +18,6 @@ impl WaylandSocket {
 
         let xrd = std::env::var("XDG_RUNTIME_DIR")?;
 
-        // create the socket
         let fd = socket_with(
             AddressFamily::UNIX,
             SocketType::STREAM,
@@ -31,34 +30,34 @@ impl WaylandSocket {
         let mut final_lock_path = String::new();
         let mut final_lock_fd: Option<OwnedFd> = None;
 
-        // bind to a path
         for i in 1..1000 {
             let name = format!("wayland-{}", i);
             let path = format!("{}/{}", xrd, name);
             let addr = SocketAddrUnix::new(&path)?;
 
             let lock_path = format!("{}/{}.lock", xrd, name);
-            let lock_fd = match open(
+            // open failure is an environment problem (bad XDG_RUNTIME_DIR, no
+            // space), not name contention - retrying would hide the real errno
+            let lock_fd = open(
                 &*lock_path,
                 OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
                 Mode::from(0o644),
-            )   {
-                    Ok(fd) => fd,
-                    Err(_) => continue,
-                };
+            )
+            .map_err(|e| format!("open {lock_path}: {e}"))?;
 
+            // held lock = a live compositor owns this name, move on
             if flock(&lock_fd, FlockOperation::NonBlockingLockExclusive).is_err() {
                 continue;
             }
 
             let _ = unlink(&*path);
 
-            // try to listen - if it fails, then try the next number
-            if bind(&fd, &addr).is_err() {
-                continue;
+            match bind(&fd, &addr) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::ADDRINUSE) => continue,
+                Err(e) => return Err(format!("bind {path}: {e}").into()),
             }
 
-            // worked - listen & break
             listen(&fd, 4096)?;
             final_name = name;
             final_path = path;
@@ -72,7 +71,8 @@ impl WaylandSocket {
         if final_name.is_empty() {
             return Err("every wayland socket from 1 - 999 are already all in use".into());
         }
-    
+
+    // sound: run() binds the socket before any thread exists
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &final_name); }
     Ok(WaylandSocket { name: final_name, path: final_path, fd, lock_path: final_lock_path, _lock_fd: final_lock_fd.expect("no socket was bound") })
 
