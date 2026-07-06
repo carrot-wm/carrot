@@ -191,6 +191,80 @@ crate::wl_protocol! {
     event repositioned(token: uint) since 3;
 }
 
+crate::wl_protocol! {
+    interface wl_data_device_manager, version = 3;
+    request create_data_source(id: new_id);
+    request get_data_device(id: new_id, seat: object);
+}
+
+crate::wl_protocol! {
+    interface wl_data_source, version = 3;
+    request offer(mime_type: string);
+    request destroy();
+    request set_actions(dnd_actions: uint) since 3;
+    event target(mime_type: optstring);
+    event send(mime_type: string, fd: fd);
+    event cancelled();
+    event dnd_drop_performed() since 3;
+    event dnd_finished() since 3;
+    event action(dnd_action: uint) since 3;
+}
+
+crate::wl_protocol! {
+    interface wl_data_device, version = 3;
+    request start_drag(source: object, origin: object, icon: object, serial: uint);
+    request set_selection(source: object, serial: uint);
+    request release() since 2;
+    event data_offer(id: object);
+    event enter(serial: uint, surface: object, x: fixed, y: fixed, id: object);
+    event leave();
+    event motion(time: uint, x: fixed, y: fixed);
+    event drop();
+    event selection(id: object);
+}
+
+crate::wl_protocol! {
+    interface wl_data_offer, version = 3;
+    request accept(serial: uint, mime_type: optstring);
+    request receive(mime_type: string, fd: fd);
+    request destroy();
+    request finish() since 3;
+    request set_actions(dnd_actions: uint, preferred_action: uint) since 3;
+    event offer(mime_type: string);
+    event source_actions(source_actions: uint) since 3;
+    event action(dnd_action: uint) since 3;
+}
+
+crate::wl_protocol! {
+    interface zwp_primary_selection_device_manager_v1, version = 1;
+    request create_source(id: new_id);
+    request get_device(id: new_id, seat: object);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface zwp_primary_selection_source_v1, version = 1;
+    request offer(mime_type: string);
+    request destroy();
+    event send(mime_type: string, fd: fd);
+    event cancelled();
+}
+
+crate::wl_protocol! {
+    interface zwp_primary_selection_device_v1, version = 1;
+    request set_selection(source: object, serial: uint);
+    request destroy();
+    event data_offer(offer: object);
+    event selection(id: object);
+}
+
+crate::wl_protocol! {
+    interface zwp_primary_selection_offer_v1, version = 1;
+    request receive(mime_type: string, fd: fd);
+    request destroy();
+    event offer(mime_type: string);
+}
+
 /// wl_display.error codes
 pub const INVALID_OBJECT: u32 = 0;
 pub const INVALID_METHOD: u32 = 1;
@@ -290,6 +364,32 @@ mod tests {
         assert_eq!(xdg_popup::reposition::OPCODE, 2);
         assert_eq!(xdg_popup::configure::OPCODE, 0);
         assert_eq!(xdg_popup::popup_done::OPCODE, 1);
+        assert_eq!(wl_data_device_manager::create_data_source::OPCODE, 0);
+        assert_eq!(wl_data_device_manager::get_data_device::OPCODE, 1);
+        assert_eq!(wl_data_source::offer::OPCODE, 0);
+        assert_eq!(wl_data_source::set_actions::OPCODE, 2);
+        assert_eq!(wl_data_source::target::OPCODE, 0);
+        assert_eq!(wl_data_source::send::OPCODE, 1);
+        assert_eq!(wl_data_source::cancelled::OPCODE, 2);
+        assert_eq!(wl_data_device::start_drag::OPCODE, 0);
+        assert_eq!(wl_data_device::set_selection::OPCODE, 1);
+        assert_eq!(wl_data_device::release::OPCODE, 2);
+        assert_eq!(wl_data_device::data_offer::OPCODE, 0);
+        assert_eq!(wl_data_device::selection::OPCODE, 5);
+        assert_eq!(wl_data_offer::accept::OPCODE, 0);
+        assert_eq!(wl_data_offer::receive::OPCODE, 1);
+        assert_eq!(wl_data_offer::finish::OPCODE, 3);
+        assert_eq!(wl_data_offer::offer::OPCODE, 0);
+        assert_eq!(zwp_primary_selection_device_manager_v1::create_source::OPCODE, 0);
+        assert_eq!(zwp_primary_selection_device_manager_v1::get_device::OPCODE, 1);
+        assert_eq!(zwp_primary_selection_source_v1::offer::OPCODE, 0);
+        assert_eq!(zwp_primary_selection_source_v1::send::OPCODE, 0);
+        assert_eq!(zwp_primary_selection_source_v1::cancelled::OPCODE, 1);
+        assert_eq!(zwp_primary_selection_device_v1::set_selection::OPCODE, 0);
+        assert_eq!(zwp_primary_selection_device_v1::data_offer::OPCODE, 0);
+        assert_eq!(zwp_primary_selection_device_v1::selection::OPCODE, 1);
+        assert_eq!(zwp_primary_selection_offer_v1::receive::OPCODE, 0);
+        assert_eq!(zwp_primary_selection_offer_v1::offer::OPCODE, 0);
     }
 
     /// byte-exact fixtures pin arg offsets and padding, not just opcodes

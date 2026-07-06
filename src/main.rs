@@ -75,6 +75,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.globals.add(std::rc::Rc::new(surface::WlSubcompositorGlobal));
     state.globals.add(std::rc::Rc::new(protocol::shm::WlShmGlobal));
     state.globals.add(std::rc::Rc::new(shell::xdg::XdgWmBaseGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::data_device::WlDataDeviceManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::primary_selection::PrimarySelectionGlobal));
     let st = state.clone();
     let configure_pump = engine.spawn("configure pump", async move {
         shell::xdg::configure_loop(st).await;

@@ -44,6 +44,9 @@ pub struct SeatGlobal {
     ptr_focus: RefCell<Option<Rc<WlSurface>>>,
     ptr_origin: Cell<(i32, i32)>,
     ptr_buttons: RefCell<Vec<u32>>,
+    // clipboard state rides on the seat: devices, sources, selection
+    pub data: crate::protocol::data_device::DataDevices,
+    pub primary: crate::protocol::primary_selection::PrimaryDevices,
 }
 
 impl SeatGlobal {
@@ -65,6 +68,8 @@ impl SeatGlobal {
             ptr_focus: RefCell::new(None),
             ptr_origin: Cell::new((0, 0)),
             ptr_buttons: RefCell::new(Vec::new()),
+            data: Default::default(),
+            primary: Default::default(),
         }))
     }
 
@@ -128,6 +133,8 @@ impl SeatGlobal {
 
     pub fn drop_client(&self, id: ClientId) {
         self.bindings.borrow_mut().remove(&id);
+        self.data.drop_client(id);
+        self.primary.drop_client(id);
         let focused = self
             .kb_focus
             .borrow()

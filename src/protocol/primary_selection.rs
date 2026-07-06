@@ -1,0 +1,362 @@
+// zwp_primary_selection_v1 - the middle-click clipboard. same shape as
+// wl_data_device: sources carry mimes, the keyboard-focus holder gets a
+// fresh offer, receive() forwards the pipe fd to the source owner.
+
+use crate::client::{Client, ClientError, ClientId, Object};
+use crate::protocol::globals::Global;
+use crate::protocol::interfaces::{
+    zwp_primary_selection_device_manager_v1 as manager, zwp_primary_selection_device_v1 as device,
+    zwp_primary_selection_offer_v1 as offer, zwp_primary_selection_source_v1 as source,
+};
+use crate::protocol::wire::MsgReader;
+use crate::protocol::{DispatchError, ObjectId};
+use crate::state::State;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
+
+// -- the seat-side state --
+
+#[derive(Default)]
+pub struct PrimaryDevices {
+    devices: RefCell<HashMap<ClientId, Vec<Rc<PrimaryDevice>>>>,
+    sources: RefCell<HashMap<(ClientId, u32), Rc<PrimarySource>>>,
+    selection: RefCell<Option<Rc<PrimarySource>>>,
+}
+
+impl PrimaryDevices {
+    pub fn drop_client(&self, id: ClientId) {
+        self.devices.borrow_mut().remove(&id);
+        self.sources.borrow_mut().retain(|k, _| k.0 != id);
+        let owned = self
+            .selection
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.client.id == id);
+        if owned {
+            *self.selection.borrow_mut() = None;
+        }
+    }
+
+    pub fn clear(&self) {
+        self.devices.borrow_mut().clear();
+        self.sources.borrow_mut().clear();
+        *self.selection.borrow_mut() = None;
+    }
+
+    fn set_selection(&self, state: &Rc<State>, src: Option<Rc<PrimarySource>>) {
+        let old = self.selection.replace(src);
+        if let Some(old) = old {
+            let same = self
+                .selection
+                .borrow()
+                .as_ref()
+                .is_some_and(|s| Rc::ptr_eq(s, &old));
+            if !same {
+                old.client.event(|o| source::cancelled::send(o, old.id));
+            }
+        }
+        let focused = state
+            .seat
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.kb_focus.borrow().clone());
+        if let Some(surface) = focused {
+            self.offer_to(&surface.client);
+        }
+    }
+
+    pub fn offer_to(&self, client: &Rc<Client>) {
+        let devices = match self.devices.borrow().get(&client.id) {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        let selection = self.selection.borrow().clone();
+        for dev in devices {
+            match &selection {
+                Some(src) => {
+                    let id = client.objects.alloc_server_id();
+                    let off = Rc::new(PrimaryOffer {
+                        id,
+                        client: client.clone(),
+                        version: dev.version,
+                        source: Rc::downgrade(src),
+                    });
+                    client.add_server_obj(off);
+                    client.event(|o| {
+                        device::data_offer::send(o, dev.id, id);
+                        for mime in src.mimes.borrow().iter() {
+                            offer::offer::send(o, id, mime);
+                        }
+                        device::selection::send(o, dev.id, id);
+                    });
+                }
+                None => {
+                    client.event(|o| device::selection::send(o, dev.id, ObjectId::NONE));
+                }
+            }
+        }
+    }
+}
+
+fn seat(state: &Rc<State>) -> Option<Rc<crate::input::seat::SeatGlobal>> {
+    state.seat.borrow().clone()
+}
+
+// -- the manager --
+
+pub struct PrimarySelectionGlobal;
+
+impl Global for PrimarySelectionGlobal {
+    fn interface(&self) -> &'static str {
+        manager::NAME
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn bind(&self, client: &Rc<Client>, id: ObjectId, version: u32) -> Result<(), ClientError> {
+        client.add_client_obj(Rc::new(PrimaryManager {
+            id,
+            client: client.clone(),
+            version,
+        }))
+    }
+}
+
+pub struct PrimaryManager {
+    pub id: ObjectId,
+    pub client: Rc<Client>,
+    pub version: u32,
+}
+
+impl manager::Handler for PrimaryManager {
+    fn create_source(
+        &self,
+        req: manager::create_source::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let src = Rc::new(PrimarySource {
+            id: req.id,
+            client: self.client.clone(),
+            version: self.version,
+            mimes: RefCell::new(Vec::new()),
+        });
+        self.client.add_client_obj(src.clone())?;
+        if let Some(seat) = seat(&self.client.state) {
+            seat.primary
+                .sources
+                .borrow_mut()
+                .insert((self.client.id, req.id.0), src);
+        }
+        Ok(())
+    }
+
+    fn get_device(&self, req: manager::get_device::Request) -> Result<(), Box<dyn std::error::Error>> {
+        let dev = Rc::new(PrimaryDevice {
+            id: req.id,
+            client: self.client.clone(),
+            version: self.version,
+        });
+        self.client.add_client_obj(dev.clone())?;
+        if let Some(seat) = seat(&self.client.state) {
+            seat.primary
+                .devices
+                .borrow_mut()
+                .entry(self.client.id)
+                .or_default()
+                .push(dev);
+        }
+        Ok(())
+    }
+
+    fn destroy(&self, _req: manager::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
+        self.client.remove_obj(self.id)?;
+        Ok(())
+    }
+}
+
+impl Object for PrimaryManager {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    fn interface(&self) -> &'static str {
+        manager::NAME
+    }
+
+    fn handle_request(
+        self: Rc<Self>,
+        opcode: u32,
+        r: &mut MsgReader<'_>,
+    ) -> Result<(), DispatchError> {
+        manager::dispatch(&*self, self.version, opcode, r)
+    }
+}
+
+// -- the source --
+
+pub struct PrimarySource {
+    pub id: ObjectId,
+    pub client: Rc<Client>,
+    pub version: u32,
+    pub mimes: RefCell<Vec<String>>,
+}
+
+impl source::Handler for PrimarySource {
+    fn offer(&self, req: source::offer::Request) -> Result<(), Box<dyn std::error::Error>> {
+        self.mimes.borrow_mut().push(req.mime_type.to_string());
+        Ok(())
+    }
+
+    fn destroy(&self, _req: source::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(seat) = seat(&self.client.state) {
+            seat.primary
+                .sources
+                .borrow_mut()
+                .remove(&(self.client.id, self.id.0));
+            let is_selection = seat
+                .primary
+                .selection
+                .borrow()
+                .as_ref()
+                .is_some_and(|s| s.id == self.id && s.client.id == self.client.id);
+            if is_selection {
+                *seat.primary.selection.borrow_mut() = None;
+                let focused = seat.kb_focus.borrow().clone();
+                if let Some(surface) = focused {
+                    seat.primary.offer_to(&surface.client);
+                }
+            }
+        }
+        self.client.remove_obj(self.id)?;
+        Ok(())
+    }
+}
+
+impl Object for PrimarySource {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    fn interface(&self) -> &'static str {
+        source::NAME
+    }
+
+    fn handle_request(
+        self: Rc<Self>,
+        opcode: u32,
+        r: &mut MsgReader<'_>,
+    ) -> Result<(), DispatchError> {
+        source::dispatch(&*self, self.version, opcode, r)
+    }
+}
+
+// -- the device --
+
+pub struct PrimaryDevice {
+    pub id: ObjectId,
+    pub client: Rc<Client>,
+    pub version: u32,
+}
+
+impl device::Handler for PrimaryDevice {
+    fn set_selection(
+        &self,
+        req: device::set_selection::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(seat) = seat(&self.client.state) else {
+            return Ok(());
+        };
+        let src = if req.source == ObjectId::NONE {
+            None
+        } else {
+            let s = seat
+                .primary
+                .sources
+                .borrow()
+                .get(&(self.client.id, req.source.0))
+                .cloned();
+            match s {
+                Some(s) => Some(s),
+                None => {
+                    self.client.invalid_object(req.source);
+                    return Ok(());
+                }
+            }
+        };
+        seat.primary.set_selection(&self.client.state, src);
+        Ok(())
+    }
+
+    fn destroy(&self, _req: device::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(seat) = seat(&self.client.state) {
+            if let Some(list) = seat.primary.devices.borrow_mut().get_mut(&self.client.id) {
+                list.retain(|d| d.id != self.id);
+            }
+        }
+        self.client.remove_obj(self.id)?;
+        Ok(())
+    }
+}
+
+impl Object for PrimaryDevice {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    fn interface(&self) -> &'static str {
+        device::NAME
+    }
+
+    fn handle_request(
+        self: Rc<Self>,
+        opcode: u32,
+        r: &mut MsgReader<'_>,
+    ) -> Result<(), DispatchError> {
+        device::dispatch(&*self, self.version, opcode, r)
+    }
+}
+
+// -- the offer --
+
+pub struct PrimaryOffer {
+    pub id: ObjectId,
+    pub client: Rc<Client>,
+    pub version: u32,
+    source: Weak<PrimarySource>,
+}
+
+impl offer::Handler for PrimaryOffer {
+    fn receive(&self, req: offer::receive::Request) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(src) = self.source.upgrade() {
+            let mime = req.mime_type.to_string();
+            let fd = Rc::new(req.fd);
+            src.client.event(|o| source::send::send(o, src.id, &mime, fd));
+        }
+        Ok(())
+    }
+
+    fn destroy(&self, _req: offer::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
+        self.client.remove_obj(self.id)?;
+        Ok(())
+    }
+}
+
+impl Object for PrimaryOffer {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    fn interface(&self) -> &'static str {
+        offer::NAME
+    }
+
+    fn handle_request(
+        self: Rc<Self>,
+        opcode: u32,
+        r: &mut MsgReader<'_>,
+    ) -> Result<(), DispatchError> {
+        offer::dispatch(&*self, self.version, opcode, r)
+    }
+}

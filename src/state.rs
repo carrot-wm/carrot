@@ -77,7 +77,10 @@ impl State {
         self.run_toplevel.clear();
         self.display.borrow_mut().take();
         self.input.borrow_mut().take();
-        self.seat.borrow_mut().take();
+        if let Some(seat) = self.seat.borrow_mut().take() {
+            seat.data.clear();
+            seat.primary.clear();
+        }
         if let Some(s) = self.session.borrow_mut().take() {
             s.clear();
         }

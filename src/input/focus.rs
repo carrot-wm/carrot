@@ -35,5 +35,8 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
             kb.send_modifiers(serial, mods);
         });
         new.ext.borrow().set_active(true);
+        // the keyboard owner learns what both clipboards hold
+        seat.data.offer_to(&new.client);
+        seat.primary.offer_to(&new.client);
     }
 }
