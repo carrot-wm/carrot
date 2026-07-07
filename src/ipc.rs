@@ -177,12 +177,15 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
 
 // reap first so dead children never pile up as zombies, then detach the
 // new one into its own session
-fn spawn(_state: &Rc<State>, cmd: &str) {
+fn spawn(state: &Rc<State>, cmd: &str) {
     use rustix::process::{WaitOptions, wait};
     while let Ok(Some(_)) = wait(WaitOptions::NOHANG) {}
     use std::os::unix::process::CommandExt;
     let mut c = std::process::Command::new("/bin/sh");
     c.arg("-c").arg(cmd);
+    if let Some(xw) = state.xwayland.borrow().as_ref() {
+        c.env("DISPLAY", format!(":{}", xw.display));
+    }
     unsafe {
         c.pre_exec(|| {
             let _ = rustix::process::setsid();

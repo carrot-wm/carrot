@@ -512,7 +512,9 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         }
         let geo = win.geometry();
         draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, ops, live);
-        draw_popups(state, out, &win.xdg().xdg, rect.x1, rect.y1, screen, ops, live);
+        if let Some(tl) = win.xdg_opt() {
+            draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
+        }
     };
 
     // paint order: background, bottom, tiled, fullscreen, floats, top,

@@ -89,10 +89,10 @@ pub struct Clients {
 }
 
 impl Clients {
-    pub fn spawn(&self, state: &Rc<State>, socket: OwnedFd) {
+    pub fn spawn(&self, state: &Rc<State>, socket: OwnedFd) -> Option<Rc<Client>> {
         // a peer that died mid-handshake just goes away
         let Ok(cred) = rustix::net::sockopt::socket_peercred(&socket) else {
-            return;
+            return None;
         };
         let id = ClientId(self.next.fetch_add(1) + 1);
         let client = Rc::new(Client {
@@ -107,6 +107,7 @@ impl Clients {
             shutdown: AsyncEvent::default(),
             serials: RefCell::new(VecDeque::new()),
             checking_queue: Cell::new(false),
+            is_xwayland: Cell::new(false),
         });
         client
             .objects
@@ -121,6 +122,7 @@ impl Clients {
             },
         );
         crate::trace!("client {} connected", id);
+        Some(self.active.borrow().get(&id).unwrap().data.clone())
     }
 
     pub fn for_each(&self, mut f: impl FnMut(&Rc<Client>)) {
@@ -168,6 +170,11 @@ use crate::engine::SpawnedFuture;
 impl Drop for ClientHolder {
     fn drop(&mut self) {
         self.data.objects.destroy();
+        // seat state can outlive every wl_seat object, so the client's
+        // devices and sources go here, not in a break_loops
+        if let Some(seat) = self.data.state.seat.borrow().clone() {
+            seat.drop_client(self.data.id);
+        }
         self.data.flush_request.clear();
         self.data.shutdown.clear();
     }
@@ -182,6 +189,8 @@ pub struct Client {
     pub pid: i32,
     pub uid: u32,
     pub objects: Objects,
+    /// the pre-connected xwayland peer; sole binder of xwayland_shell_v1
+    pub is_xwayland: Cell<bool>,
     swapchain: RefCell<OutSwapchain>,
     flush_request: AsyncEvent,
     shutdown: AsyncEvent,

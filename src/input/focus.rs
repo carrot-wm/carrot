@@ -39,6 +39,10 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
         seat.data.offer_to(&new.client);
         seat.primary.offer_to(&new.client);
         if let Some(win) = crate::tree::window_for_surface(state, new) {
+            // x clients don't get focus from wl_keyboard::enter alone
+            if let Some(xw) = win.x11_opt() {
+                xw.take_focus();
+            }
             crate::ipc::emit(
                 state,
                 &serde_json::json!({ "window-focused": {

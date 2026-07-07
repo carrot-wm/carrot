@@ -17,6 +17,30 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
+// -- the provider trait --
+
+// whoever owns the selection: a wl source, a primary source, or the
+// x11 bridge. offers hold these weakly and pipe receive() through send()
+pub trait SelectionSource {
+    fn mimes(&self) -> Vec<String>;
+    // the receiver hands over the write end; forward the data, drop it
+    fn send(&self, mime: &str, fd: std::os::fd::OwnedFd);
+    fn cancelled(&self);
+    // x-bridge providers die with their server
+    fn is_x11(&self) -> bool {
+        false
+    }
+}
+
+// dyn slot vs a concrete source, by allocation
+pub(crate) fn same_source<T: SelectionSource + 'static>(
+    sel: &Rc<dyn SelectionSource>,
+    src: &Rc<T>,
+) -> bool {
+    let src: Rc<dyn SelectionSource> = src.clone();
+    Rc::ptr_eq(sel, &src)
+}
+
 // -- the seat-side selection state --
 
 #[derive(Default)]
@@ -24,18 +48,19 @@ pub struct DataDevices {
     devices: RefCell<HashMap<ClientId, Vec<Rc<WlDataDevice>>>>,
     // sources by (client, id); set_selection resolves through here
     sources: RefCell<HashMap<(ClientId, u32), Rc<WlDataSource>>>,
-    selection: RefCell<Option<Rc<WlDataSource>>>,
+    selection: RefCell<Option<Rc<dyn SelectionSource>>>,
 }
 
 impl DataDevices {
     pub fn drop_client(&self, id: ClientId) {
         self.devices.borrow_mut().remove(&id);
+        let owned = {
+            let sources = self.sources.borrow();
+            self.selection.borrow().as_ref().is_some_and(|sel| {
+                sources.iter().any(|(k, s)| k.0 == id && same_source(sel, s))
+            })
+        };
         self.sources.borrow_mut().retain(|k, _| k.0 != id);
-        let owned = self
-            .selection
-            .borrow()
-            .as_ref()
-            .is_some_and(|s| s.client.id == id);
         if owned {
             *self.selection.borrow_mut() = None;
         }
@@ -47,8 +72,12 @@ impl DataDevices {
         *self.selection.borrow_mut() = None;
     }
 
-    fn set_selection(&self, state: &Rc<State>, source: Option<Rc<WlDataSource>>) {
-        let old = self.selection.replace(source);
+    pub fn current_source(&self) -> Option<Rc<dyn SelectionSource>> {
+        self.selection.borrow().clone()
+    }
+
+    pub fn set_selection_source(&self, state: &Rc<State>, src: Option<Rc<dyn SelectionSource>>) {
+        let old = self.selection.replace(src);
         if let Some(old) = old {
             let same = self
                 .selection
@@ -56,8 +85,7 @@ impl DataDevices {
                 .as_ref()
                 .is_some_and(|s| Rc::ptr_eq(s, &old));
             if !same {
-                old.client
-                    .event(|o| wl_data_source::cancelled::send(o, old.id));
+                old.cancelled();
             }
         }
         // the holder of the keyboard learns about the new clipboard now;
@@ -92,8 +120,8 @@ impl DataDevices {
                     client.add_server_obj(offer);
                     client.event(|o| {
                         wl_data_device::data_offer::send(o, dev.id, id);
-                        for mime in src.mimes.borrow().iter() {
-                            wl_data_offer::offer::send(o, id, mime);
+                        for mime in src.mimes() {
+                            wl_data_offer::offer::send(o, id, &mime);
                         }
                         wl_data_device::selection::send(o, dev.id, id);
                     });
@@ -210,6 +238,23 @@ pub struct WlDataSource {
     pub mimes: RefCell<Vec<String>>,
 }
 
+impl SelectionSource for WlDataSource {
+    fn mimes(&self) -> Vec<String> {
+        self.mimes.borrow().clone()
+    }
+
+    fn send(&self, mime: &str, fd: std::os::fd::OwnedFd) {
+        let fd = Rc::new(fd);
+        self.client
+            .event(|o| wl_data_source::send::send(o, self.id, mime, fd));
+    }
+
+    fn cancelled(&self) {
+        self.client
+            .event(|o| wl_data_source::cancelled::send(o, self.id));
+    }
+}
+
 impl wl_data_source::Handler for WlDataSource {
     fn offer(&self, req: wl_data_source::offer::Request) -> Result<(), Box<dyn std::error::Error>> {
         self.mimes.borrow_mut().push(req.mime_type.to_string());
@@ -218,17 +263,16 @@ impl wl_data_source::Handler for WlDataSource {
 
     fn destroy(&self, _req: wl_data_source::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(seat) = seat_data(&self.client.state) {
-            seat.data
+            let removed = seat
+                .data
                 .sources
                 .borrow_mut()
                 .remove(&(self.client.id, self.id.0));
             // destroying the live selection unsets it
-            let is_selection = seat
-                .data
-                .selection
-                .borrow()
-                .as_ref()
-                .is_some_and(|s| s.id == self.id && s.client.id == self.client.id);
+            let is_selection = match (&removed, &*seat.data.selection.borrow()) {
+                (Some(r), Some(sel)) => same_source(sel, r),
+                _ => false,
+            };
             if is_selection {
                 *seat.data.selection.borrow_mut() = None;
                 let focused = seat.kb_focus.borrow().clone();
@@ -291,7 +335,7 @@ impl wl_data_device::Handler for WlDataDevice {
         let Some(seat) = seat_data(&self.client.state) else {
             return Ok(());
         };
-        let source = if req.source == ObjectId::NONE {
+        let source: Option<Rc<dyn SelectionSource>> = if req.source == ObjectId::NONE {
             None
         } else {
             let src = seat
@@ -308,7 +352,14 @@ impl wl_data_device::Handler for WlDataDevice {
                 }
             }
         };
-        seat.data.set_selection(&self.client.state, source);
+        seat.data.set_selection_source(&self.client.state, source);
+        // the x bridge follows wl-side changes from here; it installs its
+        // own providers via set_selection_source directly, so no loop
+        let xw = self.client.state.xwayland.borrow().clone();
+        if let Some(xw) = xw {
+            xw.queue
+                .push(crate::xwayland::XwmEvent::WlSelection { primary: false });
+        }
         Ok(())
     }
 
@@ -347,7 +398,7 @@ pub struct WlDataOffer {
     pub id: ObjectId,
     pub client: Rc<Client>,
     pub version: u32,
-    source: Weak<WlDataSource>,
+    source: Weak<dyn SelectionSource>,
 }
 
 impl wl_data_offer::Handler for WlDataOffer {
@@ -359,10 +410,7 @@ impl wl_data_offer::Handler for WlDataOffer {
         // hand the pipe's write end to the source owner; dropping it on a
         // dead source closes it and the reader sees eof
         if let Some(src) = self.source.upgrade() {
-            let mime = req.mime_type.to_string();
-            let fd = Rc::new(req.fd);
-            src.client
-                .event(|o| wl_data_source::send::send(o, src.id, &mime, fd));
+            src.send(&req.mime_type, req.fd);
         }
         Ok(())
     }
@@ -475,11 +523,12 @@ mod tests {
             serial: 1,
         })
         .unwrap();
+        let dyn_src: Rc<dyn SelectionSource> = src.clone();
         let offer = Rc::new(WlDataOffer {
             id: ObjectId(MIN_SERVER_ID),
             client: client.clone(),
             version: 3,
-            source: Rc::downgrade(&src),
+            source: Rc::downgrade(&dyn_src),
         });
         let fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::empty()).unwrap();
         offer
@@ -510,5 +559,27 @@ mod tests {
         // two selection events: the offer, then the null
         assert_eq!(count_events(&bytes, dev.id, 5), 2);
         assert!(seat.data.selection.borrow().is_none());
+    }
+
+    struct DummySource;
+
+    impl SelectionSource for DummySource {
+        fn mimes(&self) -> Vec<String> {
+            vec!["text/plain".to_string()]
+        }
+        fn send(&self, _mime: &str, _fd: std::os::fd::OwnedFd) {}
+        fn cancelled(&self) {}
+    }
+
+    #[test]
+    fn a_dyn_provider_installs_without_xwayland() {
+        let (state, client, seat, dev, _src) = setup();
+        seat.data
+            .set_selection_source(&state, Some(Rc::new(DummySource)));
+        assert!(seat.data.selection.borrow().is_some());
+        // the focused client got an offer for the dummy's mime
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, dev.id, 0), 1, "data_offer");
+        assert_eq!(count_events(&bytes, dev.id, 5), 1, "selection");
     }
 }

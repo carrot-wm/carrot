@@ -25,6 +25,7 @@ pub fn output_extent(state: &State) -> (i32, i32) {
 
 pub enum WindowKind {
     Xdg(Rc<XdgToplevel>),
+    X11(Rc<crate::xwayland::XWindow>),
 }
 
 pub struct Window {
@@ -47,34 +48,64 @@ impl Window {
         }
     }
 
-    pub fn xdg(&self) -> &Rc<XdgToplevel> {
+    pub fn xdg_opt(&self) -> Option<&Rc<XdgToplevel>> {
         match &self.kind {
-            WindowKind::Xdg(tl) => tl,
+            WindowKind::Xdg(tl) => Some(tl),
+            _ => None,
+        }
+    }
+
+    pub fn x11_opt(&self) -> Option<&Rc<crate::xwayland::XWindow>> {
+        match &self.kind {
+            WindowKind::X11(xw) => Some(xw),
+            _ => None,
         }
     }
 
     pub fn surface(&self) -> Rc<WlSurface> {
-        self.xdg().xdg.surface.clone()
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.xdg.surface.clone(),
+            WindowKind::X11(xw) => xw.surface().expect("x window in tree without a surface"),
+        }
     }
 
+    // x windows have no client-declared geometry; the surface is the window
     pub fn geometry(&self) -> Rect {
-        self.xdg().xdg.geometry()
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.xdg.geometry(),
+            WindowKind::X11(_) => {
+                let (w, h) = self.surface().size.get();
+                Rect::new_sized_saturating(0, 0, w, h)
+            }
+        }
     }
 
     pub fn title(&self) -> String {
-        self.xdg().title.borrow().clone()
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.title.borrow().clone(),
+            WindowKind::X11(xw) => xw.title.borrow().clone(),
+        }
     }
 
     pub fn app_id(&self) -> String {
-        self.xdg().app_id.borrow().clone()
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.app_id.borrow().clone(),
+            WindowKind::X11(xw) => xw.class.borrow().clone(),
+        }
     }
 
     pub fn set_fullscreen_state(&self, on: bool) {
-        self.xdg().set_fullscreen_state(on);
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.set_fullscreen_state(on),
+            WindowKind::X11(_) => {}
+        }
     }
 
     pub fn wants_fullscreen(&self) -> bool {
-        self.xdg().wants_fullscreen()
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.wants_fullscreen(),
+            WindowKind::X11(_) => false,
+        }
     }
 
     /// where this window paints
@@ -89,11 +120,17 @@ impl Window {
 
     pub fn configure_rect(&self) {
         let r = self.rect.get();
-        self.xdg().configure_size(r.width(), r.height());
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.configure_size(r.width(), r.height()),
+            WindowKind::X11(xw) => xw.configure_to(r),
+        }
     }
 
     pub fn send_close(&self) {
-        self.xdg().send_close();
+        match &self.kind {
+            WindowKind::Xdg(tl) => tl.send_close(),
+            WindowKind::X11(xw) => xw.close(),
+        }
     }
 }
 
@@ -184,6 +221,39 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize) {
         .insert(&win, (area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2);
     switch_workspace(state, n);
     focus_window(state, Some(&win));
+}
+
+// the x server died; every window it owned goes with it
+pub fn remove_x11_windows(state: &Rc<State>) {
+    let list = state.workspaces.borrow().clone();
+    for ws in list {
+        let mut gone = Vec::new();
+        ws.for_each(|w| {
+            if w.x11_opt().is_some() {
+                gone.push(w.clone());
+            }
+        });
+        for w in gone {
+            if w.fullscreen.get() {
+                w.fullscreen.set(false);
+                let mut slot = ws.fullscreen.borrow_mut();
+                if slot.as_ref().is_some_and(|f| Rc::ptr_eq(f, &w)) {
+                    *slot = None;
+                }
+            }
+            if w.floating.get() {
+                ws.remove_float(&w);
+            } else {
+                ws.tiling.remove(&w);
+            }
+            if let Some(xw) = w.x11_opt() {
+                *xw.window.borrow_mut() = None;
+            }
+        }
+    }
+    let ws = active(state);
+    relayout(state, &ws);
+    state.damage.trigger();
 }
 
 // step focus through the workspace in tree order; wraps around
@@ -307,7 +377,12 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
         *slot = Some(win.clone());
         win.fullscreen.set(true);
         let (w, h) = output_extent(state);
-        win.xdg().configure_size(w, h);
+        match &win.kind {
+            WindowKind::Xdg(tl) => tl.configure_size(w, h),
+            WindowKind::X11(xw) => {
+                xw.configure_to(Rect::new_sized_saturating(0, 0, w, h));
+            }
+        }
     } else {
         let mut slot = ws.fullscreen.borrow_mut();
         if slot.as_ref().is_some_and(|w| Rc::ptr_eq(w, win)) {
@@ -407,8 +482,10 @@ fn window_hit(
     y: i32,
 ) -> Option<(Rc<Window>, Rc<WlSurface>, i32, i32)> {
     let rect = win.draw_rect(state);
-    if let Some(hit) = popups_hit(&win.xdg().xdg, rect.x1, rect.y1, x, y) {
-        return Some((win.clone(), hit.0, hit.1, hit.2));
+    if let Some(tl) = win.xdg_opt() {
+        if let Some(hit) = popups_hit(&tl.xdg, rect.x1, rect.y1, x, y) {
+            return Some((win.clone(), hit.0, hit.1, hit.2));
+        }
     }
     let geo = win.geometry();
     let (lx, ly) = (x - rect.x1 + geo.x1, y - rect.y1 + geo.y1);

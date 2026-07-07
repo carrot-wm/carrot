@@ -280,6 +280,18 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface xwayland_shell_v1, version = 1;
+    request destroy();
+    request get_xwayland_surface(id: new_id, surface: object);
+}
+
+crate::wl_protocol! {
+    interface xwayland_surface_v1, version = 1;
+    request set_serial(serial_lo: uint, serial_hi: uint);
+    request destroy();
+}
+
+crate::wl_protocol! {
     interface zwlr_layer_shell_v1, version = 5;
     request get_layer_surface(id: new_id, surface: object, output: object, layer: uint, namespace: string);
     request destroy() since 3;
@@ -457,6 +469,9 @@ mod tests {
         assert_eq!(zwp_primary_selection_device_v1::selection::OPCODE, 1);
         assert_eq!(zwp_primary_selection_offer_v1::receive::OPCODE, 0);
         assert_eq!(zwp_primary_selection_offer_v1::offer::OPCODE, 0);
+        assert_eq!(xwayland_shell_v1::get_xwayland_surface::OPCODE, 1);
+        assert_eq!(xwayland_surface_v1::set_serial::OPCODE, 0);
+        assert_eq!(xwayland_surface_v1::destroy::OPCODE, 1);
         assert_eq!(zwlr_layer_shell_v1::get_layer_surface::OPCODE, 0);
         assert_eq!(zwlr_layer_shell_v1::destroy::OPCODE, 1);
         assert_eq!(zwlr_layer_shell_v1::destroy::SINCE, 3);

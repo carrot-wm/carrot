@@ -93,6 +93,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::output::XdgOutputManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(xwayland::XwaylandShellGlobal));
     let st = state.clone();
     let configure_pump = engine.spawn("configure pump", async move {
         shell::xdg::configure_loop(st).await;
@@ -160,7 +163,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _sock = sock;
         loop {
             match st.ring.accept(&listen_fd).await {
-                Ok(fd) => st.clients.spawn(&st, fd),
+                Ok(fd) => {
+                    st.clients.spawn(&st, fd);
+                }
                 Err(e) => {
                     // a broken listening socket takes the session with it
                     eprintln!("carrot: accept failed: {e}");
@@ -169,6 +174,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    });
+    let st = state.clone();
+    let xwayland_task = engine.spawn("xwayland", async move {
+        xwayland::run(st).await;
     });
     let st = state.clone();
     let police = engine.spawn("slow clients", async move {
@@ -185,6 +194,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(police);
     drop(bring_up);
     drop(configure_pump);
+    drop(xwayland_task);
     drop(ipc);
     state.clear();
     drop(cpu);

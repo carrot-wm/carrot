@@ -3,6 +3,7 @@
 // fresh offer, receive() forwards the pipe fd to the source owner.
 
 use crate::client::{Client, ClientError, ClientId, Object};
+use crate::protocol::data_device::{SelectionSource, same_source};
 use crate::protocol::globals::Global;
 use crate::protocol::interfaces::{
     zwp_primary_selection_device_manager_v1 as manager, zwp_primary_selection_device_v1 as device,
@@ -21,18 +22,19 @@ use std::rc::{Rc, Weak};
 pub struct PrimaryDevices {
     devices: RefCell<HashMap<ClientId, Vec<Rc<PrimaryDevice>>>>,
     sources: RefCell<HashMap<(ClientId, u32), Rc<PrimarySource>>>,
-    selection: RefCell<Option<Rc<PrimarySource>>>,
+    selection: RefCell<Option<Rc<dyn SelectionSource>>>,
 }
 
 impl PrimaryDevices {
     pub fn drop_client(&self, id: ClientId) {
         self.devices.borrow_mut().remove(&id);
+        let owned = {
+            let sources = self.sources.borrow();
+            self.selection.borrow().as_ref().is_some_and(|sel| {
+                sources.iter().any(|(k, s)| k.0 == id && same_source(sel, s))
+            })
+        };
         self.sources.borrow_mut().retain(|k, _| k.0 != id);
-        let owned = self
-            .selection
-            .borrow()
-            .as_ref()
-            .is_some_and(|s| s.client.id == id);
         if owned {
             *self.selection.borrow_mut() = None;
         }
@@ -44,7 +46,11 @@ impl PrimaryDevices {
         *self.selection.borrow_mut() = None;
     }
 
-    fn set_selection(&self, state: &Rc<State>, src: Option<Rc<PrimarySource>>) {
+    pub fn current_source(&self) -> Option<Rc<dyn SelectionSource>> {
+        self.selection.borrow().clone()
+    }
+
+    pub fn set_selection_source(&self, state: &Rc<State>, src: Option<Rc<dyn SelectionSource>>) {
         let old = self.selection.replace(src);
         if let Some(old) = old {
             let same = self
@@ -53,7 +59,7 @@ impl PrimaryDevices {
                 .as_ref()
                 .is_some_and(|s| Rc::ptr_eq(s, &old));
             if !same {
-                old.client.event(|o| source::cancelled::send(o, old.id));
+                old.cancelled();
             }
         }
         let focused = state
@@ -85,8 +91,8 @@ impl PrimaryDevices {
                     client.add_server_obj(off);
                     client.event(|o| {
                         device::data_offer::send(o, dev.id, id);
-                        for mime in src.mimes.borrow().iter() {
-                            offer::offer::send(o, id, mime);
+                        for mime in src.mimes() {
+                            offer::offer::send(o, id, &mime);
                         }
                         device::selection::send(o, dev.id, id);
                     });
@@ -203,6 +209,22 @@ pub struct PrimarySource {
     pub mimes: RefCell<Vec<String>>,
 }
 
+impl SelectionSource for PrimarySource {
+    fn mimes(&self) -> Vec<String> {
+        self.mimes.borrow().clone()
+    }
+
+    fn send(&self, mime: &str, fd: std::os::fd::OwnedFd) {
+        let fd = Rc::new(fd);
+        self.client
+            .event(|o| source::send::send(o, self.id, mime, fd));
+    }
+
+    fn cancelled(&self) {
+        self.client.event(|o| source::cancelled::send(o, self.id));
+    }
+}
+
 impl source::Handler for PrimarySource {
     fn offer(&self, req: source::offer::Request) -> Result<(), Box<dyn std::error::Error>> {
         self.mimes.borrow_mut().push(req.mime_type.to_string());
@@ -211,16 +233,15 @@ impl source::Handler for PrimarySource {
 
     fn destroy(&self, _req: source::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(seat) = seat(&self.client.state) {
-            seat.primary
+            let removed = seat
+                .primary
                 .sources
                 .borrow_mut()
                 .remove(&(self.client.id, self.id.0));
-            let is_selection = seat
-                .primary
-                .selection
-                .borrow()
-                .as_ref()
-                .is_some_and(|s| s.id == self.id && s.client.id == self.client.id);
+            let is_selection = match (&removed, &*seat.primary.selection.borrow()) {
+                (Some(r), Some(sel)) => same_source(sel, r),
+                _ => false,
+            };
             if is_selection {
                 *seat.primary.selection.borrow_mut() = None;
                 let focused = seat.kb_focus.borrow().clone();
@@ -268,7 +289,7 @@ impl device::Handler for PrimaryDevice {
         let Some(seat) = seat(&self.client.state) else {
             return Ok(());
         };
-        let src = if req.source == ObjectId::NONE {
+        let src: Option<Rc<dyn SelectionSource>> = if req.source == ObjectId::NONE {
             None
         } else {
             let s = seat
@@ -285,7 +306,14 @@ impl device::Handler for PrimaryDevice {
                 }
             }
         };
-        seat.primary.set_selection(&self.client.state, src);
+        seat.primary.set_selection_source(&self.client.state, src);
+        // the x bridge follows wl-side changes from here; it installs its
+        // own providers via set_selection_source directly, so no loop
+        let xw = self.client.state.xwayland.borrow().clone();
+        if let Some(xw) = xw {
+            xw.queue
+                .push(crate::xwayland::XwmEvent::WlSelection { primary: true });
+        }
         Ok(())
     }
 
@@ -324,15 +352,13 @@ pub struct PrimaryOffer {
     pub id: ObjectId,
     pub client: Rc<Client>,
     pub version: u32,
-    source: Weak<PrimarySource>,
+    source: Weak<dyn SelectionSource>,
 }
 
 impl offer::Handler for PrimaryOffer {
     fn receive(&self, req: offer::receive::Request) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(src) = self.source.upgrade() {
-            let mime = req.mime_type.to_string();
-            let fd = Rc::new(req.fd);
-            src.client.event(|o| source::send::send(o, src.id, &mime, fd));
+            src.send(&req.mime_type, req.fd);
         }
         Ok(())
     }

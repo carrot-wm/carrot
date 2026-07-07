@@ -38,6 +38,7 @@ pub struct State {
     pub usable: std::cell::Cell<crate::rect::Rect>,
     /// swapped whole on reload; readers grab an Rc and never hold it
     pub config: RefCell<Rc<crate::config::Config>>,
+    pub xwayland: RefCell<Option<Rc<crate::xwayland::Xwayland>>>,
     /// ipc connections that asked for the event stream
     pub ipc_subs: RefCell<Vec<Rc<crate::ipc::Subscriber>>>,
     serial: NumCell<u64>,
@@ -66,6 +67,7 @@ impl State {
             layers: RefCell::new(Vec::new()),
             usable: std::cell::Cell::new(crate::rect::Rect::default()),
             config: RefCell::new(Rc::new(crate::config::Config::default())),
+            xwayland: RefCell::new(None),
             ipc_subs: RefCell::new(Vec::new()),
             serial: NumCell::new(0),
         })
@@ -96,6 +98,9 @@ impl State {
             seat.primary.clear();
             seat.popup_grab.borrow_mut().clear();
             seat.grab_prev_focus.borrow_mut().take();
+        }
+        if let Some(x) = self.xwayland.borrow_mut().take() {
+            x.clear();
         }
         if let Some(s) = self.session.borrow_mut().take() {
             s.clear();
