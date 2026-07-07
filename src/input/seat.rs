@@ -456,6 +456,7 @@ impl Object for WlPointer {
 impl SeatGlobal {
     /// one key edge: xkb, then binds, then the client
     pub fn key(&self, state: &Rc<State>, time_usec: u64, key: u32, pressed: bool) -> KeyAction {
+        crate::protocol::idle::note_activity(state);
         let changed = self
             .kb_state
             .borrow_mut()
@@ -708,6 +709,7 @@ impl SeatGlobal {
         udx: f64,
         udy: f64,
     ) {
+        crate::protocol::idle::note_activity(state);
         // an active lock freezes the cursor: raw deltas keep flowing, the
         // absolute stream and focus stay exactly where they are
         if let Some(con) = self.active_lock() {
@@ -881,6 +883,7 @@ impl SeatGlobal {
     }
 
     pub fn pointer_button(self: &Rc<Self>, state: &Rc<State>, time_usec: u64, button: u32, pressed: bool) {
+        crate::protocol::idle::note_activity(state);
         {
             let mut held = self.ptr_buttons.borrow_mut();
             if pressed {

@@ -173,6 +173,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::screencopy::ScreencopyManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::idle::IdleNotifierGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::idle::IdleInhibitGlobal));
+    let st = state.clone();
+    let _idle_pump = engine.spawn("idle pump", protocol::idle::pump(st));
     let st = state.clone();
     let configure_pump = engine.spawn("configure pump", async move {
         shell::xdg::configure_loop(st).await;

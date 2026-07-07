@@ -49,6 +49,7 @@ pub struct State {
     /// advertised drm formats + modifiers, filled once the renderer is up
     pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
     pub ftl_managers: RefCell<Vec<Rc<crate::protocol::foreign_toplevel::FtlManager>>>,
+    pub idle: crate::protocol::idle::IdleState,
 }
 
 impl State {
@@ -81,6 +82,7 @@ impl State {
             retired: RefCell::new(Vec::new()),
             dmabuf_info: RefCell::new(None),
             ftl_managers: RefCell::new(Vec::new()),
+            idle: Default::default(),
         })
     }
 

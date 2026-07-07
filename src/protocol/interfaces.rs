@@ -406,6 +406,30 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface ext_idle_notifier_v1, version = 1;
+    request destroy();
+    request get_idle_notification(id: new_id, timeout: uint, seat: object);
+}
+
+crate::wl_protocol! {
+    interface ext_idle_notification_v1, version = 1;
+    request destroy();
+    event idled();
+    event resumed();
+}
+
+crate::wl_protocol! {
+    interface zwp_idle_inhibit_manager_v1, version = 1;
+    request destroy();
+    request create_inhibitor(id: new_id, surface: object);
+}
+
+crate::wl_protocol! {
+    interface zwp_idle_inhibitor_v1, version = 1;
+    request destroy();
+}
+
+crate::wl_protocol! {
     interface zwlr_screencopy_manager_v1, version = 3;
     request capture_output(frame: new_id, overlay_cursor: int, output: object);
     request capture_output_region(frame: new_id, overlay_cursor: int, output: object, x: int, y: int, width: int, height: int);
@@ -677,6 +701,9 @@ mod tests {
         assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
         assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
         assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
+        assert_eq!(ext_idle_notifier_v1::get_idle_notification::OPCODE, 1);
+        assert_eq!(ext_idle_notification_v1::resumed::OPCODE, 1);
+        assert_eq!(zwp_idle_inhibit_manager_v1::create_inhibitor::OPCODE, 1);
         assert_eq!(zwlr_screencopy_frame_v1::copy_with_damage::OPCODE, 2);
         assert_eq!(zwlr_screencopy_frame_v1::buffer_done::OPCODE, 6);
         assert_eq!(zwlr_foreign_toplevel_handle_v1::activate::OPCODE, 4);

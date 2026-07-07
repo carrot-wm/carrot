@@ -8,6 +8,7 @@ pub mod dmabuf;
 pub mod display;
 pub mod foreign_toplevel;
 pub mod globals;
+pub mod idle;
 pub mod interfaces;
 pub mod output;
 pub mod pointer_constraints;
