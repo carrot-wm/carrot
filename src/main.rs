@@ -139,6 +139,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::tearing::TearingManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::relative_pointer::RelativePointerManagerGlobal));
+    state.globals.add(std::rc::Rc::new(
+        protocol::pointer_constraints::PointerConstraintsGlobal,
+    ));
     state.globals.add(std::rc::Rc::new(shell::xdg::XdgWmBaseGlobal));
     state
         .globals

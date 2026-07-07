@@ -373,6 +373,42 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface zwp_relative_pointer_manager_v1, version = 1;
+    request destroy();
+    request get_relative_pointer(id: new_id, pointer: object);
+}
+
+crate::wl_protocol! {
+    interface zwp_relative_pointer_v1, version = 1;
+    request destroy();
+    event relative_motion(utime_hi: uint, utime_lo: uint, dx: fixed, dy: fixed, dx_unaccel: fixed, dy_unaccel: fixed);
+}
+
+crate::wl_protocol! {
+    interface zwp_pointer_constraints_v1, version = 1;
+    request destroy();
+    request lock_pointer(id: new_id, surface: object, pointer: object, region: object, lifetime: uint);
+    request confine_pointer(id: new_id, surface: object, pointer: object, region: object, lifetime: uint);
+}
+
+crate::wl_protocol! {
+    interface zwp_locked_pointer_v1, version = 1;
+    request destroy();
+    request set_cursor_position_hint(surface_x: fixed, surface_y: fixed);
+    request set_region(region: object);
+    event locked();
+    event unlocked();
+}
+
+crate::wl_protocol! {
+    interface zwp_confined_pointer_v1, version = 1;
+    request destroy();
+    request set_region(region: object);
+    event confined();
+    event unconfined();
+}
+
+crate::wl_protocol! {
     interface wp_tearing_control_manager_v1, version = 1;
     request destroy();
     request get_tearing_control(id: new_id, surface: object);
@@ -558,6 +594,10 @@ mod tests {
         assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
         assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
         assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
+        assert_eq!(zwp_relative_pointer_v1::relative_motion::OPCODE, 0);
+        assert_eq!(zwp_pointer_constraints_v1::lock_pointer::OPCODE, 1);
+        assert_eq!(zwp_pointer_constraints_v1::confine_pointer::OPCODE, 2);
+        assert_eq!(zwp_locked_pointer_v1::set_cursor_position_hint::OPCODE, 1);
     }
 
     /// byte-exact fixtures pin arg offsets and padding, not just opcodes

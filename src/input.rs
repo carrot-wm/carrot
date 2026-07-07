@@ -150,7 +150,7 @@ async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<Log
                 }
             }
             InputEvent::Motion { time_usec, dx, dy } => {
-                seat.pointer_motion(&state, time_usec, dx, dy);
+                seat.pointer_motion(&state, time_usec, dx, dy, dx, dy);
                 if let Some(d) = state.display.borrow().as_ref() {
                     d.move_cursor(seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
                 }

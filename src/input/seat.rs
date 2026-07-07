@@ -4,7 +4,9 @@
 
 use super::keymap::{KbState, Keymap, Mods};
 use crate::client::{Client, ClientError, ClientId, Object};
-use crate::protocol::interfaces::{wl_keyboard, wl_pointer, wl_seat};
+use crate::protocol::interfaces::{wl_keyboard, wl_pointer, wl_seat, zwp_relative_pointer_v1};
+use crate::protocol::pointer_constraints::{Constraint, Kind};
+use crate::protocol::relative_pointer::RelativePointer;
 use crate::protocol::wire::MsgReader;
 use crate::protocol::{DispatchError, Fixed, ObjectId};
 use crate::protocol::globals::Global;
@@ -49,6 +51,8 @@ pub struct SeatGlobal {
     // full dismissal
     pub popup_grab: RefCell<Vec<Rc<crate::shell::xdg::XdgPopup>>>,
     pub grab_prev_focus: RefCell<Option<Rc<WlSurface>>>,
+    pub relative: RefCell<HashMap<ClientId, Vec<Rc<RelativePointer>>>>,
+    pub constraints: RefCell<Vec<Rc<Constraint>>>,
 }
 
 impl SeatGlobal {
@@ -74,6 +78,8 @@ impl SeatGlobal {
             primary: Default::default(),
             popup_grab: RefCell::new(Vec::new()),
             grab_prev_focus: RefCell::new(None),
+            relative: RefCell::new(HashMap::new()),
+            constraints: RefCell::new(Vec::new()),
         }))
     }
 
@@ -556,10 +562,167 @@ impl SeatGlobal {
         crate::tree::surface_at(state, x as i32, y as i32)
     }
 
-    pub fn pointer_motion(self: &Rc<Self>, state: &Rc<State>, time_usec: u64, dx: f64, dy: f64) {
+    // -- relative pointers and constraints --
+
+    pub fn add_relative_pointer(&self, client: ClientId, rp: Rc<RelativePointer>) {
+        self.relative.borrow_mut().entry(client).or_default().push(rp);
+    }
+
+    pub fn remove_relative_pointer(&self, client: ClientId, id: ObjectId) {
+        if let Some(list) = self.relative.borrow_mut().get_mut(&client) {
+            list.retain(|r| r.id != id);
+        }
+    }
+
+    pub fn send_relative(
+        &self,
+        client: ClientId,
+        time_usec: u64,
+        dx: f64,
+        dy: f64,
+        udx: f64,
+        udy: f64,
+    ) {
+        let rel = self.relative.borrow();
+        let Some(list) = rel.get(&client) else { return };
+        let hi = (time_usec >> 32) as u32;
+        let lo = time_usec as u32;
+        let (fdx, fdy) = (Fixed::from_f64(dx), Fixed::from_f64(dy));
+        let (fux, fuy) = (Fixed::from_f64(udx), Fixed::from_f64(udy));
+        for r in list.iter() {
+            r.client.event(|o| {
+                zwp_relative_pointer_v1::relative_motion::send(o, r.id, hi, lo, fdx, fdy, fux, fuy)
+            });
+        }
+    }
+
+    pub fn constraint_for(&self, surface: &Rc<WlSurface>) -> Option<Rc<Constraint>> {
+        self.constraints
+            .borrow()
+            .iter()
+            .find(|c| Rc::ptr_eq(&c.surface, surface))
+            .cloned()
+    }
+
+    pub fn add_constraint(self: &Rc<Self>, state: &Rc<State>, con: Rc<Constraint>) {
+        self.constraints.borrow_mut().push(con);
+        self.refresh_constraint(state);
+    }
+
+    pub fn remove_constraint(self: &Rc<Self>, state: &Rc<State>, con: &Rc<Constraint>) {
+        self.deactivate_constraint(state, con);
+        self.constraints.borrow_mut().retain(|c| !Rc::ptr_eq(c, con));
+    }
+
+    /// focus decides which constraint is live; call after every focus move
+    pub fn refresh_constraint(self: &Rc<Self>, state: &Rc<State>) {
+        let focus = self.ptr_focus.borrow().clone();
+        let cons: Vec<_> = self.constraints.borrow().clone();
+        for con in cons.iter() {
+            let usable = !con.surface.destroyed.get() && con.surface.mapped.get();
+            let is_focus =
+                usable && focus.as_ref().is_some_and(|f| Rc::ptr_eq(f, &con.surface));
+            if con.active.get() && !is_focus {
+                self.deactivate_constraint(state, con);
+            } else if !con.active.get() && !con.dead.get() && is_focus {
+                con.origin.set(self.ptr_origin.get());
+                con.send_active(true);
+            }
+        }
+        self.constraints.borrow_mut().retain(|c| !c.dead.get());
+    }
+
+    fn deactivate_constraint(&self, state: &Rc<State>, con: &Rc<Constraint>) {
+        if !con.active.get() {
+            return;
+        }
+        con.send_active(false);
+        // release the lock at the client's position hint, where it last drew
+        if con.kind == Kind::Lock {
+            if let Some((hx, hy)) = con.hint.take() {
+                let (ox, oy) = con.origin.get();
+                let (w, h) = state.output_size.get();
+                let x = (ox as f64 + hx).clamp(0.0, (w.max(1) - 1) as f64);
+                let y = (oy as f64 + hy).clamp(0.0, (h.max(1) - 1) as f64);
+                self.ptr_x.set(x);
+                self.ptr_y.set(y);
+                if let Some(d) = state.display.borrow().as_ref() {
+                    d.move_cursor(x as i32, y as i32);
+                }
+            }
+        }
+    }
+
+    fn active_lock(&self) -> Option<Rc<Constraint>> {
+        self.constraints
+            .borrow()
+            .iter()
+            .find(|c| c.active.get() && c.kind == Kind::Lock)
+            .cloned()
+    }
+
+    fn active_confine(&self) -> Option<Rc<Constraint>> {
+        self.constraints
+            .borrow()
+            .iter()
+            .find(|c| c.active.get() && c.kind == Kind::Confine)
+            .cloned()
+    }
+
+    /// clamp into the constrained surface, minus any client region
+    fn confine_clamp(&self, con: &Constraint, x: f64, y: f64) -> (f64, f64) {
+        let (ox, oy) = self.ptr_origin.get();
+        let (sw, sh) = con.surface.size.get();
+        let mut r = crate::rect::Rect::new_sized_saturating(ox, oy, sw, sh);
+        if let Some(reg) = con.region.borrow().as_ref() {
+            let e = reg.extents();
+            let e = crate::rect::Rect::new_sized_saturating(
+                ox + e.x1,
+                oy + e.y1,
+                e.width(),
+                e.height(),
+            );
+            r = r.intersect(e);
+        }
+        if r.is_empty() {
+            return (x, y);
+        }
+        (
+            x.clamp(r.x1 as f64, (r.x2 - 1).max(r.x1) as f64),
+            y.clamp(r.y1 as f64, (r.y2 - 1).max(r.y1) as f64),
+        )
+    }
+
+    pub fn pointer_motion(
+        self: &Rc<Self>,
+        state: &Rc<State>,
+        time_usec: u64,
+        dx: f64,
+        dy: f64,
+        udx: f64,
+        udy: f64,
+    ) {
+        // an active lock freezes the cursor: raw deltas keep flowing, the
+        // absolute stream and focus stay exactly where they are
+        if let Some(con) = self.active_lock() {
+            if con.surface.destroyed.get() || !con.surface.mapped.get() {
+                self.refresh_constraint(state);
+            } else {
+                self.send_relative(con.client.id, time_usec, dx, dy, udx, udy);
+                self.ptr_frame(con.client.id);
+                return;
+            }
+        }
         let (w, h) = state.output_size.get();
-        let x = (self.ptr_x.get() + dx).clamp(0.0, (w.max(1) - 1) as f64);
-        let y = (self.ptr_y.get() + dy).clamp(0.0, (h.max(1) - 1) as f64);
+        let mut x = (self.ptr_x.get() + dx).clamp(0.0, (w.max(1) - 1) as f64);
+        let mut y = (self.ptr_y.get() + dy).clamp(0.0, (h.max(1) - 1) as f64);
+        if let Some(con) = self.active_confine() {
+            if con.surface.destroyed.get() || !con.surface.mapped.get() {
+                self.refresh_constraint(state);
+            } else {
+                (x, y) = self.confine_clamp(&con, x, y);
+            }
+        }
         self.ptr_x.set(x);
         self.ptr_y.set(y);
 
@@ -622,6 +785,7 @@ impl SeatGlobal {
                 p.client
                     .event(|o| wl_pointer::motion::send(o, p.id, ms, fx, fy));
             });
+            self.send_relative(surface.client.id, time_usec, dx, dy, udx, udy);
         }
     }
 
