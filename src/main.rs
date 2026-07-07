@@ -35,6 +35,48 @@ mod sighand;
 mod tree;
 mod xwayland;
 
+/// mirror stderr into /tmp/carrot-last.log so a wedged session still
+/// leaves its story behind; the tty keeps getting everything
+fn tee_stderr() {
+    use std::io::{Read, Write};
+    use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+    let Ok(file) = std::fs::File::create("/tmp/carrot-last.log") else {
+        return;
+    };
+    let tty = unsafe { BorrowedFd::borrow_raw(2) };
+    let Ok(tty) = rustix::io::fcntl_dupfd_cloexec(tty, 3) else {
+        return;
+    };
+    let Ok((r, w)) = rustix::pipe::pipe() else {
+        return;
+    };
+    {
+        let mut two = unsafe { OwnedFd::from_raw_fd(2) };
+        if rustix::io::dup2(&w, &mut two).is_err() {
+            let _ = two.into_raw_fd();
+            return;
+        }
+        std::mem::forget(two);
+    }
+    drop(w);
+    let mut tty = std::fs::File::from(tty);
+    let mut src = std::fs::File::from(r);
+    let mut log = file;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let _ = tty.write_all(&buf[..n]);
+                    let _ = log.write_all(&buf[..n]);
+                    let _ = log.flush();
+                }
+            }
+        }
+    });
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("carrot {}", env!("CARGO_PKG_VERSION"));
@@ -69,6 +111,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // mask first: every thread spawned later inherits it, so int/term can
     // only ever land on the signalfd
     let sig_fd = sighand::install()?;
+    tee_stderr();
+    // which binary is actually running; kills every "is the fix live" doubt
+    if let Ok(md) = std::fs::metadata("/proc/self/exe") {
+        if let Ok(t) = md.modified() {
+            eprintln!(
+                "carrot: {} built {:?}",
+                env!("CARGO_PKG_VERSION"),
+                t
+            );
+        }
+    }
     let engine = engine::Engine::new();
     let ring = uring::Ring::new(&engine, 32)?;
     let wheel = engine::Wheel::new(&engine, &ring)?;

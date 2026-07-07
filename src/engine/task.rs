@@ -248,8 +248,18 @@ impl<T: 'static, F: Future<Output = T> + 'static> Task<T, F> {
             ));
             let mut cx = Context::from_waker(&waker);
             let guard = AbortOnUnwind;
+            let t0 = crate::util::Time::now();
             let poll = Pin::new_unchecked(&mut *(*self.data.get()).future).poll(&mut cx);
             std::mem::forget(guard);
+            // single-threaded loop: a long poll stalls everything, so name the offender
+            let held = crate::util::Time::now().nsec().saturating_sub(t0.nsec());
+            if held > 30_000_000 {
+                eprintln!(
+                    "carrot: stall: task '{}' held the loop {}ms",
+                    self.name,
+                    held / 1_000_000
+                );
+            }
             if let Poll::Ready(v) = poll {
                 ManuallyDrop::drop(&mut (*self.data.get()).future);
                 ptr::write(&raw mut (*self.data.get()).result, ManuallyDrop::new(v));

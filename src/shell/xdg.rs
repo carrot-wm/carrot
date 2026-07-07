@@ -529,6 +529,15 @@ impl XdgSurface {
             XdgExt::Toplevel(tl) => {
                 let (w, h) = tl.desired.get();
                 let states = tl.states_bytes();
+                // size changes are load-bearing; catch a spurious one mid-drag
+                if tl.last_logged.replace((w, h)) != (w, h) {
+                    eprintln!(
+                        "carrot: configure {}x{} -> \"{}\"",
+                        w,
+                        h,
+                        tl.title.borrow()
+                    );
+                }
                 self.client.event(|o| {
                     xdg_toplevel::configure::send(o, tl.id, w, h, &states);
                     xdg_surface::configure::send(o, self.id, serial);
@@ -605,6 +614,7 @@ impl xdg_surface::Handler for XdgSurface {
             max_size: Cell::new((0, 0)),
             states: Cell::new(base),
             desired: Cell::new((0, 0)),
+            last_logged: Cell::new((0, 0)),
         });
         c.add_client_obj(tl.clone())?;
         c.objects.track_toplevel(tl.clone());
@@ -836,6 +846,8 @@ pub struct XdgToplevel {
     pub max_size: Cell<(i32, i32)>,
     states: Cell<u32>,
     pub desired: Cell<(i32, i32)>,
+    /// last size printed to the log; dedupes the configure trace
+    last_logged: Cell<(i32, i32)>,
 }
 
 impl XdgToplevel {
