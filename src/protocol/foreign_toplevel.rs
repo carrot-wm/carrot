@@ -296,6 +296,7 @@ pub fn window_mapped(state: &Rc<State>, win: &Rc<Window>) {
     for mgr in managers {
         publish(state, &mgr, win);
     }
+    crate::protocol::foreign_toplevel_list::window_mapped(state, win);
 }
 
 pub fn window_unmapped(state: &Rc<State>, win: &Rc<Window>) {
@@ -310,6 +311,8 @@ pub fn window_unmapped(state: &Rc<State>, win: &Rc<Window>) {
         }
         mgr.handles.borrow_mut().retain(|h| h.win().is_some());
     }
+    crate::protocol::foreign_toplevel_list::window_unmapped(state, win);
+    crate::protocol::image_copy_capture::window_unmapped(state, win);
 }
 
 pub fn title_changed(state: &Rc<State>, win: &Rc<Window>) {
@@ -320,6 +323,7 @@ pub fn title_changed(state: &Rc<State>, win: &Rc<Window>) {
             handle_v1::done::send(o, h.id);
         });
     });
+    crate::protocol::foreign_toplevel_list::title_changed(state, win);
 }
 
 pub fn app_id_changed(state: &Rc<State>, win: &Rc<Window>) {
@@ -330,6 +334,7 @@ pub fn app_id_changed(state: &Rc<State>, win: &Rc<Window>) {
             handle_v1::done::send(o, h.id);
         });
     });
+    crate::protocol::foreign_toplevel_list::app_id_changed(state, win);
 }
 
 pub fn state_changed(state: &Rc<State>, win: &Rc<Window>) {
@@ -379,4 +384,6 @@ pub fn output_changed(state: &Rc<State>, win: &Rc<Window>) {
 
 pub fn drop_client(state: &Rc<State>, id: ClientId) {
     state.ftl_managers.borrow_mut().retain(|m| m.client.id != id);
+    crate::protocol::foreign_toplevel_list::drop_client(state, id);
+    crate::protocol::image_copy_capture::drop_client(state, id);
 }

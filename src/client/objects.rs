@@ -36,6 +36,8 @@ pub struct Objects {
     toplevels: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgToplevel>>>,
     popups: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPopup>>>,
     outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::WlOutput>>>,
+    capture_sources:
+        RefCell<HashMap<ObjectId, Rc<crate::protocol::image_copy_capture::CaptureSource>>>,
 }
 
 impl Objects {
@@ -148,6 +150,24 @@ impl Objects {
 
     pub fn forget_popup(&self, id: ObjectId) {
         self.popups.borrow_mut().remove(&id);
+    }
+
+    pub fn track_capture_source(
+        &self,
+        s: Rc<crate::protocol::image_copy_capture::CaptureSource>,
+    ) {
+        self.capture_sources.borrow_mut().insert(s.id, s);
+    }
+
+    pub fn capture_source(
+        &self,
+        id: ObjectId,
+    ) -> Option<Rc<crate::protocol::image_copy_capture::CaptureSource>> {
+        self.capture_sources.borrow().get(&id).cloned()
+    }
+
+    pub fn forget_capture_source(&self, id: ObjectId) {
+        self.capture_sources.borrow_mut().remove(&id);
     }
 
     pub fn track_output(&self, o: Rc<crate::protocol::output::WlOutput>) {

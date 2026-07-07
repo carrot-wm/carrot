@@ -513,6 +513,8 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         }
         // parked dmabufs are free now the sampling frame is done; drop sends release
         state.retired.borrow_mut().clear();
+        // output copy-capture sessions get their frame from the composed output
+        crate::protocol::image_copy_capture::output_presented(state, "");
         let ms = (Time::now().nsec() / 1_000_000) as u32;
         state.clients.for_each(|c| {
             c.objects.for_each_surface(|s| {
@@ -896,6 +898,49 @@ pub fn screencopy(state: &Rc<State>, _out_index: usize, region: Rect) -> Option<
     let mut px = vec![0u8; rw * rh * 4];
     for row in 0..rh {
         let s0 = (oy + row) * src_stride + ox * 4;
+        px[row * rw * 4..][..rw * 4].copy_from_slice(&full[s0..s0 + rw * 4]);
+    }
+    Some(px)
+}
+
+/// compose only a toplevel's surface tree - subsurfaces included, popups
+/// and borders not - then read back and crop to its rect. tightly packed.
+pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Option<Vec<u8>> {
+    let surface = win.surface();
+    if !surface.mapped.get() {
+        return None;
+    }
+    let out = {
+        let d = state.display.borrow();
+        d.as_ref()?.out.clone()
+    };
+    let rect = win.draw_rect(state);
+    if rect.is_empty() {
+        return None;
+    }
+    let geo = win.geometry();
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, &mut ops, &mut live);
+    let mut waits = Vec::new();
+    for fence in out.frame_fences.borrow_mut().drain(..) {
+        if let Ok(sem) = out.renderer.import_wait(fence) {
+            waits.push(sem);
+        }
+    }
+    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+        Ok(px) => px,
+        Err(e) => {
+            eprintln!("carrot: window capture render failed: {e}");
+            return None;
+        }
+    };
+    let (rw, rh) = (rect.width() as usize, rect.height() as usize);
+    let src_stride = out.width as usize * 4;
+    let mut px = vec![0u8; rw * rh * 4];
+    for row in 0..rh {
+        let sy = rect.y1 as usize + row;
+        let s0 = sy * src_stride + rect.x1 as usize * 4;
         px[row * rw * 4..][..rw * 4].copy_from_slice(&full[s0..s0 + rw * 4]);
     }
     Some(px)

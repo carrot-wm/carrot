@@ -172,6 +172,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .add(std::rc::Rc::new(protocol::foreign_toplevel::ForeignToplevelGlobal));
     state
         .globals
+        .add(std::rc::Rc::new(protocol::foreign_toplevel_list::ForeignToplevelListGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::image_copy_capture::OutputSourceManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::image_copy_capture::ToplevelSourceManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::image_copy_capture::IccManagerGlobal));
+    state
+        .globals
         .add(std::rc::Rc::new(protocol::screencopy::ScreencopyManagerGlobal));
     state
         .globals

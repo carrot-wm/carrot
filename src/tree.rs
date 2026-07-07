@@ -30,6 +30,8 @@ pub enum WindowKind {
 
 pub struct Window {
     pub kind: WindowKind,
+    /// stable identity for the window's lifetime; uids never get reused
+    pub ident: u64,
     /// assigned box, gaps/border applied
     pub rect: Cell<Rect>,
     pub node: RefCell<Weak<dwindle::Node>>,
@@ -38,9 +40,10 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(kind: WindowKind) -> Window {
+    pub fn new(state: &State, kind: WindowKind) -> Window {
         Window {
             kind,
+            ident: state.next_uid(),
             rect: Cell::new(Rect::default()),
             node: RefCell::new(Weak::new()),
             floating: Cell::new(false),

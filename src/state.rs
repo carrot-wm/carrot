@@ -49,6 +49,9 @@ pub struct State {
     /// advertised drm formats + modifiers, filled once the renderer is up
     pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
     pub ftl_managers: RefCell<Vec<Rc<crate::protocol::foreign_toplevel::FtlManager>>>,
+    pub ext_toplevel_lists:
+        RefCell<Vec<Rc<crate::protocol::foreign_toplevel_list::ExtToplevelList>>>,
+    pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
     pub idle: crate::protocol::idle::IdleState,
 }
 
@@ -82,6 +85,8 @@ impl State {
             retired: RefCell::new(Vec::new()),
             dmabuf_info: RefCell::new(None),
             ftl_managers: RefCell::new(Vec::new()),
+            ext_toplevel_lists: RefCell::new(Vec::new()),
+            icc_sessions: RefCell::new(Vec::new()),
             idle: Default::default(),
         })
     }

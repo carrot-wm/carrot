@@ -944,7 +944,7 @@ impl Xwm {
                 .is_some_and(|s| s.mapped.get());
         let in_tree = xwin.window.borrow().is_some();
         if mapped && !in_tree {
-            let win = Rc::new(Window::new(WindowKind::X11(xwin.clone())));
+            let win = Rc::new(Window::new(&self.state, WindowKind::X11(xwin.clone())));
             *xwin.window.borrow_mut() = Some(win.clone());
             if xwin.override_redirect.get() {
                 // menus and tooltips place themselves and steal no focus

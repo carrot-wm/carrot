@@ -331,6 +331,11 @@ impl WlSurface {
             self.size.get()
         );
         self.client.state.damage.trigger();
+        // toplevel captures latch on commits, not presents, so windows on
+        // invisible workspaces keep delivering frames
+        if content_changed {
+            crate::protocol::image_copy_capture::content_changed(&self.client.state, self);
+        }
         // recycle the box (the sync-subsurface stash path keeps its own)
         pending.reset();
         self.pending_free.push(pending);

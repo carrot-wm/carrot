@@ -794,7 +794,7 @@ impl SurfaceExt for XdgSurfaceExt {
                 let mapped = x.surface.mapped.get();
                 let in_tree = tl.window.borrow().is_some();
                 if mapped && !in_tree {
-                    let win = Rc::new(Window::new(WindowKind::Xdg(tl.clone())));
+                    let win = Rc::new(Window::new(&x.client.state, WindowKind::Xdg(tl.clone())));
                     *tl.window.borrow_mut() = Some(win.clone());
                     crate::tree::map_window(&x.client.state, &win);
                 } else if !mapped && in_tree {
