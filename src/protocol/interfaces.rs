@@ -406,6 +406,35 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface zwlr_foreign_toplevel_manager_v1, version = 3;
+    request stop();
+    event toplevel(toplevel: new_id);
+    event finished();
+}
+
+crate::wl_protocol! {
+    interface zwlr_foreign_toplevel_handle_v1, version = 3;
+    request set_maximized();
+    request unset_maximized();
+    request set_minimized();
+    request unset_minimized();
+    request activate(seat: object);
+    request close();
+    request set_rectangle(surface: object, x: int, y: int, width: int, height: int);
+    request destroy();
+    request set_fullscreen(output: object) since 2;
+    request unset_fullscreen() since 2;
+    event title(title: string);
+    event app_id(app_id: string);
+    event output_enter(output: object);
+    event output_leave(output: object);
+    event state(state: array);
+    event done();
+    event closed();
+    event parent(parent: object) since 3;
+}
+
+crate::wl_protocol! {
     interface zwp_relative_pointer_manager_v1, version = 1;
     request destroy();
     request get_relative_pointer(id: new_id, pointer: object);
@@ -627,6 +656,9 @@ mod tests {
         assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
         assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
         assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::activate::OPCODE, 4);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::close::OPCODE, 5);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::closed::OPCODE, 6);
         assert_eq!(zwlr_data_control_device_v1::set_primary_selection::OPCODE, 2);
         assert_eq!(zwlr_data_control_device_v1::primary_selection::OPCODE, 3);
         assert_eq!(zwlr_data_control_offer_v1::receive::OPCODE, 0);

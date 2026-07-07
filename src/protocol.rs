@@ -6,6 +6,7 @@ pub mod data_control;
 pub mod data_device;
 pub mod dmabuf;
 pub mod display;
+pub mod foreign_toplevel;
 pub mod globals;
 pub mod interfaces;
 pub mod output;

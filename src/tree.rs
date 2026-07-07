@@ -274,7 +274,7 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
     state.damage.trigger();
 }
 
-fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {
+pub(crate) fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {
     // an exclusive layer surface owns the keyboard; windows wait
     if crate::shell::layer::kb_lock(state).is_some() {
         return;
@@ -323,6 +323,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
             "app-id": win.app_id(),
         }}),
     );
+    crate::protocol::foreign_toplevel::window_mapped(state, win);
     state.damage.trigger();
 }
 
@@ -364,6 +365,7 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
             "title": win.title(),
         }}),
     );
+    crate::protocol::foreign_toplevel::window_unmapped(state, win);
     state.damage.trigger();
 }
 
@@ -392,6 +394,7 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
         win.configure_rect();
     }
     crate::ipc::emit(state, &serde_json::json!({ "fullscreen": on }));
+    crate::protocol::foreign_toplevel::state_changed(state, win);
     state.damage.trigger();
 }
 

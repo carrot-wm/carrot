@@ -48,6 +48,7 @@ pub struct State {
     pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
     /// advertised drm formats + modifiers, filled once the renderer is up
     pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
+    pub ftl_managers: RefCell<Vec<Rc<crate::protocol::foreign_toplevel::FtlManager>>>,
 }
 
 impl State {
@@ -79,6 +80,7 @@ impl State {
             obj_uid: NumCell::new(0),
             retired: RefCell::new(Vec::new()),
             dmabuf_info: RefCell::new(None),
+            ftl_managers: RefCell::new(Vec::new()),
         })
     }
 
@@ -103,6 +105,7 @@ impl State {
         self.layers.borrow_mut().clear();
         self.ipc_subs.borrow_mut().clear();
         self.retired.borrow_mut().clear();
+        self.ftl_managers.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
         self.display.borrow_mut().take();

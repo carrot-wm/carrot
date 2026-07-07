@@ -953,6 +953,9 @@ impl xdg_toplevel::Handler for XdgToplevel {
         req: xdg_toplevel::set_title::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
         *self.title.borrow_mut() = req.title.to_string();
+        if let Some(win) = self.window.borrow().clone() {
+            crate::protocol::foreign_toplevel::title_changed(&self.client.state, &win);
+        }
         Ok(())
     }
 
@@ -961,6 +964,9 @@ impl xdg_toplevel::Handler for XdgToplevel {
         req: xdg_toplevel::set_app_id::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
         *self.app_id.borrow_mut() = req.app_id.to_string();
+        if let Some(win) = self.window.borrow().clone() {
+            crate::protocol::foreign_toplevel::app_id_changed(&self.client.state, &win);
+        }
         Ok(())
     }
 

@@ -24,7 +24,10 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
         });
         old.ext.borrow().set_active(false);
     }
+    let old_win = old.as_ref().and_then(|s| crate::tree::window_for_surface(state, s));
     *seat.kb_focus.borrow_mut() = new.clone();
+    let new_win = new.as_ref().and_then(|s| crate::tree::window_for_surface(state, s));
+    crate::protocol::foreign_toplevel::focus_changed(state, old_win, new_win);
     if let Some(new) = &new {
         let serial = state.next_serial(Some(&new.client)) as u32;
         let keys = seat.keys_bytes();
