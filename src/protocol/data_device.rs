@@ -1,9 +1,15 @@
-// the clipboard: wl_data_device_manager, sources, devices, offers.
+// the clipboard and dnd: wl_data_device_manager, sources, devices, offers.
 //
-// selection only for now - a source is set with the copied mime types,
-// every keyboard focus change hands the focused client a fresh offer,
-// and receive() pipes the fd straight through to the source's owner.
-// drag and drop requests are accepted and go nowhere.
+// selection: a source is set with the copied mime types, every keyboard
+// focus change hands the focused client a fresh offer, and receive()
+// pipes the fd straight through to the source's owner.
+//
+// dnd: start_drag rides the implicit pointer grab. while it holds, the
+// pointer stream becomes data_device enter/leave/motion on the surface
+// under the cursor. releasing the grab drops if the target accepted a
+// mime (and, v3+, an action survived negotiation), else cancels. a
+// source-less drag stays inside the initiating client. x11 dnd bridging
+// is xwayland's own business.
 
 use crate::client::{Client, ClientError, ClientId, Object};
 use crate::protocol::globals::Global;
@@ -11,9 +17,10 @@ use crate::protocol::interfaces::{
     wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
 };
 use crate::protocol::wire::MsgReader;
-use crate::protocol::{DispatchError, ObjectId};
+use crate::protocol::{DispatchError, Fixed, ObjectId};
 use crate::state::State;
-use std::cell::RefCell;
+use crate::surface::WlSurface;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
@@ -41,6 +48,78 @@ pub(crate) fn same_source<T: SelectionSource + 'static>(
     Rc::ptr_eq(sel, &src)
 }
 
+// -- dnd actions (wl_data_device_manager.dnd_action) --
+
+pub const DND_COPY: u32 = 1;
+pub const DND_MOVE: u32 = 2;
+pub const DND_ASK: u32 = 4;
+
+// -- an in-flight drag session --
+
+// lives on the seat while the grab button is held; after a drop the
+// target's offers keep it alive until finish()/destroy conclude it
+pub struct Drag {
+    pub client: Rc<Client>,
+    pub source: Option<Rc<WlDataSource>>,
+    pub icon: RefCell<Option<Rc<WlSurface>>>,
+    /// wl_surface.offset sum; shifts the icon relative to the pointer
+    pub icon_off: Cell<(i32, i32)>,
+    target: RefCell<Option<Rc<WlSurface>>>,
+    // the offers minted for the current target, one per data device
+    offers: RefCell<Vec<Rc<WlDataOffer>>>,
+    accepted: Cell<bool>,
+    dest_actions: Cell<u32>,
+    preferred: Cell<u32>,
+    action: Cell<u32>,
+    // any v3 device on the target: drop validity then needs an action
+    dest_v3: Cell<bool>,
+    dropped: Cell<bool>,
+}
+
+impl Drag {
+    pub fn target(&self) -> Option<Rc<WlSurface>> {
+        self.target.borrow().clone()
+    }
+
+    // intersect both sides, prefer the target's pick, else copy>move>ask
+    fn update_action(&self) {
+        let Some(src) = &self.source else { return };
+        let both = src.dnd_actions.get() & self.dest_actions.get();
+        let preferred = self.preferred.get();
+        let chosen = if both & preferred != 0 {
+            preferred
+        } else if both & DND_COPY != 0 {
+            DND_COPY
+        } else if both & DND_MOVE != 0 {
+            DND_MOVE
+        } else if both & DND_ASK != 0 {
+            DND_ASK
+        } else {
+            0
+        };
+        if self.action.replace(chosen) == chosen {
+            return;
+        }
+        for offer in self.offers.borrow().iter() {
+            if offer.version >= wl_data_offer::action::SINCE {
+                offer
+                    .client
+                    .event(|o| wl_data_offer::action::send(o, offer.id, chosen));
+            }
+        }
+        if src.version >= wl_data_source::action::SINCE {
+            src.client
+                .event(|o| wl_data_source::action::send(o, src.id, chosen));
+        }
+    }
+
+    fn unlink_offers(&self) {
+        for o in self.offers.borrow_mut().drain(..) {
+            o.drag.borrow_mut().take();
+        }
+    }
+}
+
 // -- the seat-side selection state --
 
 #[derive(Default)]
@@ -49,10 +128,19 @@ pub struct DataDevices {
     // sources by (client, id); set_selection resolves through here
     sources: RefCell<HashMap<(ClientId, u32), Rc<WlDataSource>>>,
     selection: RefCell<Option<Rc<dyn SelectionSource>>>,
+    drag: RefCell<Option<Rc<Drag>>>,
 }
 
 impl DataDevices {
     pub fn drop_client(&self, id: ClientId) {
+        if let Some(drag) = self.drag() {
+            if drag.client.id == id {
+                self.dnd_teardown(false);
+            } else if drag.target.borrow().as_ref().is_some_and(|t| t.client.id == id) {
+                drag.target.borrow_mut().take();
+                drag.unlink_offers();
+            }
+        }
         self.devices.borrow_mut().remove(&id);
         let owned = {
             let sources = self.sources.borrow();
@@ -70,6 +158,159 @@ impl DataDevices {
         self.devices.borrow_mut().clear();
         self.sources.borrow_mut().clear();
         *self.selection.borrow_mut() = None;
+        *self.drag.borrow_mut() = None;
+    }
+
+    pub fn drag(&self) -> Option<Rc<Drag>> {
+        self.drag.borrow().clone()
+    }
+
+    pub fn begin_drag_session(&self, drag: Rc<Drag>) {
+        *self.drag.borrow_mut() = Some(drag);
+    }
+
+    fn client_devices(&self, id: ClientId) -> Vec<Rc<WlDataDevice>> {
+        self.devices.borrow().get(&id).cloned().unwrap_or_default()
+    }
+
+    /// fresh offers for the new target, then enter
+    pub fn dnd_enter(&self, state: &Rc<State>, surface: &Rc<WlSurface>, sx: f64, sy: f64) {
+        let Some(drag) = self.drag() else { return };
+        let client = &surface.client;
+        drag.target.replace(Some(surface.clone()));
+        drag.accepted.set(false);
+        drag.dest_actions.set(0);
+        drag.preferred.set(0);
+        drag.action.set(0);
+        drag.dest_v3.set(false);
+        let devices = self.client_devices(client.id);
+        if devices.is_empty() {
+            return;
+        }
+        let serial = state.next_serial(Some(client)) as u32;
+        let (fx, fy) = (Fixed::from_f64(sx), Fixed::from_f64(sy));
+        let mut offers = Vec::new();
+        for dev in devices {
+            let offer_id = match &drag.source {
+                Some(src) => {
+                    let id = client.objects.alloc_server_id();
+                    let dyn_src: Rc<dyn SelectionSource> = src.clone();
+                    let offer = Rc::new(WlDataOffer {
+                        id,
+                        client: client.clone(),
+                        version: dev.version,
+                        source: Rc::downgrade(&dyn_src),
+                        drag: RefCell::new(Some(drag.clone())),
+                    });
+                    client.add_server_obj(offer.clone());
+                    client.event(|o| {
+                        wl_data_device::data_offer::send(o, dev.id, id);
+                        for mime in src.mimes.borrow().iter() {
+                            wl_data_offer::offer::send(o, id, mime);
+                        }
+                        if dev.version >= wl_data_offer::source_actions::SINCE {
+                            wl_data_offer::source_actions::send(o, id, src.dnd_actions.get());
+                        }
+                    });
+                    if dev.version >= wl_data_offer::action::SINCE {
+                        drag.dest_v3.set(true);
+                    }
+                    offers.push(offer);
+                    id
+                }
+                None => ObjectId::NONE,
+            };
+            client.event(|o| {
+                wl_data_device::enter::send(o, dev.id, serial, surface.id, fx, fy, offer_id)
+            });
+        }
+        *drag.offers.borrow_mut() = offers;
+    }
+
+    pub fn dnd_motion(&self, time_ms: u32, sx: f64, sy: f64) {
+        let Some(drag) = self.drag() else { return };
+        let Some(target) = drag.target() else { return };
+        if target.destroyed.get() {
+            return;
+        }
+        let (fx, fy) = (Fixed::from_f64(sx), Fixed::from_f64(sy));
+        for dev in self.client_devices(target.client.id) {
+            target
+                .client
+                .event(|o| wl_data_device::motion::send(o, dev.id, time_ms, fx, fy));
+        }
+    }
+
+    pub fn dnd_leave(&self) {
+        let Some(drag) = self.drag() else { return };
+        let Some(target) = drag.target.borrow_mut().take() else { return };
+        drag.unlink_offers();
+        drag.accepted.set(false);
+        drag.action.set(0);
+        if target.destroyed.get() {
+            return;
+        }
+        for dev in self.client_devices(target.client.id) {
+            target
+                .client
+                .event(|o| wl_data_device::leave::send(o, dev.id));
+        }
+    }
+
+    /// the grab released: drop onto an accepting target, else cancel.
+    /// clears the seat-side session either way; a dropped session lives
+    /// on inside the target's offers until finish()/destroy
+    pub fn dnd_finish_session(&self) {
+        let Some(drag) = self.drag.borrow_mut().take() else { return };
+        let target = drag.target().filter(|t| !t.destroyed.get());
+        let valid = target.is_some()
+            && match &drag.source {
+                None => true,
+                Some(_) => drag.accepted.get() && (!drag.dest_v3.get() || drag.action.get() != 0),
+            };
+        if !valid {
+            if let Some(t) = &target {
+                for dev in self.client_devices(t.client.id) {
+                    t.client.event(|o| wl_data_device::leave::send(o, dev.id));
+                }
+            }
+            drag.unlink_offers();
+            if let Some(src) = &drag.source {
+                src.cancelled();
+            }
+            return;
+        }
+        let t = target.unwrap();
+        drag.dropped.set(true);
+        // the offers keep their one-way ref for finish(); dropping ours
+        // breaks the rc cycle so a vanishing client can't leak the session
+        drag.offers.borrow_mut().clear();
+        for dev in self.client_devices(t.client.id) {
+            t.client.event(|o| wl_data_device::drop::send(o, dev.id));
+        }
+        if let Some(src) = &drag.source {
+            if src.version >= wl_data_source::dnd_drop_performed::SINCE {
+                src.client
+                    .event(|o| wl_data_source::dnd_drop_performed::send(o, src.id));
+            }
+        }
+    }
+
+    // the drag died out of band (client gone, source destroyed);
+    // notify_source is off when the source itself is what died
+    fn dnd_teardown(&self, notify_source: bool) {
+        let Some(drag) = self.drag.borrow_mut().take() else { return };
+        if let Some(t) = drag.target().filter(|t| !t.destroyed.get()) {
+            for dev in self.client_devices(t.client.id) {
+                t.client.event(|o| wl_data_device::leave::send(o, dev.id));
+            }
+        }
+        drag.unlink_offers();
+        if notify_source {
+            if let Some(src) = &drag.source {
+                src.cancelled();
+            }
+        }
     }
 
     pub fn current_source(&self) -> Option<Rc<dyn SelectionSource>> {
@@ -116,6 +357,7 @@ impl DataDevices {
                         client: client.clone(),
                         version: dev.version,
                         source: Rc::downgrade(src),
+                        drag: RefCell::new(None),
                     });
                     client.add_server_obj(offer);
                     client.event(|o| {
@@ -178,6 +420,7 @@ impl wl_data_device_manager::Handler for WlDataDeviceManager {
             client: self.client.clone(),
             version: self.version,
             mimes: RefCell::new(Vec::new()),
+            dnd_actions: Cell::new(0),
         });
         self.client.add_client_obj(src.clone())?;
         if let Some(seat) = seat_data(&self.client.state) {
@@ -236,6 +479,7 @@ pub struct WlDataSource {
     pub client: Rc<Client>,
     pub version: u32,
     pub mimes: RefCell<Vec<String>>,
+    pub dnd_actions: Cell<u32>,
 }
 
 impl SelectionSource for WlDataSource {
@@ -263,6 +507,15 @@ impl wl_data_source::Handler for WlDataSource {
 
     fn destroy(&self, _req: wl_data_source::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(seat) = seat_data(&self.client.state) {
+            // destroying the source of a live drag cancels the drag
+            let dragging = seat.data.drag().is_some_and(|d| {
+                d.source
+                    .as_ref()
+                    .is_some_and(|s| s.client.id == self.client.id && s.id == self.id)
+            });
+            if dragging {
+                seat.data.dnd_teardown(false);
+            }
             let removed = seat
                 .data
                 .sources
@@ -287,8 +540,9 @@ impl wl_data_source::Handler for WlDataSource {
 
     fn set_actions(
         &self,
-        _req: wl_data_source::set_actions::Request,
+        req: wl_data_source::set_actions::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.dnd_actions.set(req.dnd_actions);
         Ok(())
     }
 }
@@ -322,9 +576,79 @@ pub struct WlDataDevice {
 impl wl_data_device::Handler for WlDataDevice {
     fn start_drag(
         &self,
-        _req: wl_data_device::start_drag::Request,
+        req: wl_data_device::start_drag::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // no dnd yet; a drag that never enters anything is legal
+        let c = &self.client;
+        let Some(seat) = seat_data(&c.state) else {
+            return Ok(());
+        };
+        let Some(origin) = c.objects.surface(req.origin) else {
+            c.invalid_object(req.origin);
+            return Ok(());
+        };
+        // the drag rides the implicit grab named by the serial; anything
+        // stale is silently ignored, per spec
+        if !seat.drag_grab_valid(&origin, req.serial) {
+            return Ok(());
+        }
+        let source = if req.source == ObjectId::NONE {
+            None
+        } else {
+            let src = seat
+                .data
+                .sources
+                .borrow()
+                .get(&(c.id, req.source.0))
+                .cloned();
+            match src {
+                Some(s) => Some(s),
+                None => {
+                    c.invalid_object(req.source);
+                    return Ok(());
+                }
+            }
+        };
+        let icon = if req.icon == ObjectId::NONE {
+            None
+        } else {
+            let Some(s) = c.objects.surface(req.icon) else {
+                c.invalid_object(req.icon);
+                return Ok(());
+            };
+            match s.role.get() {
+                crate::surface::SurfaceRole::None | crate::surface::SurfaceRole::DndIcon => {}
+                other => {
+                    c.protocol_error(
+                        self.id,
+                        0, // wl_data_device error role
+                        &format!("the icon surface already has the {} role", other.name()),
+                    );
+                    return Ok(());
+                }
+            }
+            s.role.set(crate::surface::SurfaceRole::DndIcon);
+            *s.ext.borrow_mut() = Rc::new(DndIconExt {
+                seat: Rc::downgrade(&seat),
+                state: Rc::downgrade(&c.state),
+                key: (c.id, s.id),
+            });
+            Some(s)
+        };
+        let drag = Rc::new(Drag {
+            client: c.clone(),
+            source,
+            icon: RefCell::new(icon),
+            icon_off: Cell::new((0, 0)),
+            target: RefCell::new(None),
+            offers: RefCell::new(Vec::new()),
+            accepted: Cell::new(false),
+            dest_actions: Cell::new(0),
+            preferred: Cell::new(0),
+            action: Cell::new(0),
+            dest_v3: Cell::new(false),
+            dropped: Cell::new(false),
+        });
+        seat.begin_drag(&c.state, drag);
         Ok(())
     }
 
@@ -392,6 +716,61 @@ impl Object for WlDataDevice {
     }
 }
 
+// -- the drag icon role --
+
+// tracks wl_surface.offset shifts and detaches from the drag on death
+struct DndIconExt {
+    seat: Weak<crate::input::seat::SeatGlobal>,
+    state: Weak<State>,
+    key: (ClientId, ObjectId),
+}
+
+impl DndIconExt {
+    fn my_drag(&self) -> Option<Rc<Drag>> {
+        let seat = self.seat.upgrade()?;
+        let drag = seat.data.drag()?;
+        let mine = drag
+            .icon
+            .borrow()
+            .as_ref()
+            .is_some_and(|i| (i.client.id, i.id) == self.key);
+        mine.then_some(drag)
+    }
+}
+
+impl crate::surface::SurfaceExt for DndIconExt {
+    fn commit_requested(
+        self: Rc<Self>,
+        pending: Box<crate::surface::PendingState>,
+    ) -> Option<Box<crate::surface::PendingState>> {
+        if let Some(drag) = self.my_drag() {
+            let (x, y) = drag.icon_off.get();
+            drag.icon_off
+                .set((x + pending.offset.0, y + pending.offset.1));
+        }
+        Some(pending)
+    }
+
+    fn after_apply(&self) {
+        // the icon's first buffer usually lands after start_drag
+        if self.my_drag().is_some() {
+            if let Some(state) = self.state.upgrade() {
+                state.damage.trigger();
+            }
+        }
+    }
+
+    fn on_surface_destroy(&self) -> Result<(), ()> {
+        if let Some(drag) = self.my_drag() {
+            drag.icon.borrow_mut().take();
+            if let Some(state) = self.state.upgrade() {
+                state.damage.trigger();
+            }
+        }
+        Ok(())
+    }
+}
+
 // -- wl_data_offer --
 
 pub struct WlDataOffer {
@@ -399,10 +778,22 @@ pub struct WlDataOffer {
     pub client: Rc<Client>,
     pub version: u32,
     source: Weak<dyn SelectionSource>,
+    // set while this offer belongs to a dnd session; None for selections
+    drag: RefCell<Option<Rc<Drag>>>,
 }
 
 impl wl_data_offer::Handler for WlDataOffer {
-    fn accept(&self, _req: wl_data_offer::accept::Request) -> Result<(), Box<dyn std::error::Error>> {
+    fn accept(&self, req: wl_data_offer::accept::Request) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(drag) = self.drag.borrow().clone() {
+            if !drag.dropped.get() {
+                drag.accepted.set(req.mime_type.is_some());
+                if let Some(src) = &drag.source {
+                    src.client.event(|o| {
+                        wl_data_source::target::send(o, src.id, req.mime_type.as_deref())
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -416,18 +807,48 @@ impl wl_data_offer::Handler for WlDataOffer {
     }
 
     fn destroy(&self, _req: wl_data_offer::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
+        // dropping the offer after a drop but before finish aborts the
+        // transfer; the source learns via cancelled (v3 targets only -
+        // older ones legitimately end with a destroy)
+        if let Some(drag) = self.drag.borrow_mut().take() {
+            drag.offers
+                .borrow_mut()
+                .retain(|o| !(o.id == self.id && o.client.id == self.client.id));
+            if drag.dropped.get() && self.version >= wl_data_offer::finish::SINCE {
+                if let Some(src) = &drag.source {
+                    src.cancelled();
+                }
+            }
+        }
         self.client.remove_obj(self.id)?;
         Ok(())
     }
 
     fn finish(&self, _req: wl_data_offer::finish::Request) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(drag) = self.drag.borrow_mut().take() {
+            if drag.dropped.get() {
+                if let Some(src) = &drag.source {
+                    if src.version >= wl_data_source::dnd_finished::SINCE {
+                        src.client
+                            .event(|o| wl_data_source::dnd_finished::send(o, src.id));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     fn set_actions(
         &self,
-        _req: wl_data_offer::set_actions::Request,
+        req: wl_data_offer::set_actions::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(drag) = self.drag.borrow().clone() {
+            if !drag.dropped.get() {
+                drag.dest_actions.set(req.dnd_actions);
+                drag.preferred.set(req.preferred_action);
+                drag.update_action();
+            }
+        }
         Ok(())
     }
 }
@@ -529,6 +950,7 @@ mod tests {
             client: client.clone(),
             version: 3,
             source: Rc::downgrade(&dyn_src),
+            drag: RefCell::new(None),
         });
         let fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::empty()).unwrap();
         offer
@@ -569,6 +991,110 @@ mod tests {
         }
         fn send(&self, _mime: &str, _fd: std::os::fd::OwnedFd) {}
         fn cancelled(&self) {}
+    }
+
+    fn test_drag(client: &Rc<Client>, src: Option<Rc<WlDataSource>>) -> Rc<Drag> {
+        Rc::new(Drag {
+            client: client.clone(),
+            source: src,
+            icon: RefCell::new(None),
+            icon_off: Cell::new((0, 0)),
+            target: RefCell::new(None),
+            offers: RefCell::new(Vec::new()),
+            accepted: Cell::new(false),
+            dest_actions: Cell::new(0),
+            preferred: Cell::new(0),
+            action: Cell::new(0),
+            dest_v3: Cell::new(false),
+            dropped: Cell::new(false),
+        })
+    }
+
+    #[test]
+    fn dnd_enter_accept_drop_finish() {
+        let (state, client, seat, dev, src) = setup();
+        src.set_actions(wl_data_source::set_actions::Request {
+            dnd_actions: DND_COPY | DND_MOVE,
+        })
+        .unwrap();
+        let surface = seat.kb_focus.borrow().clone().unwrap();
+        let drag = test_drag(&client, Some(src.clone()));
+        seat.data.begin_drag_session(drag.clone());
+        seat.data.dnd_enter(&state, &surface, 5.0, 7.0);
+        let bytes = client.queued_out_bytes();
+        let offer_id = ObjectId(MIN_SERVER_ID);
+        assert_eq!(count_events(&bytes, dev.id, 0), 1, "data_offer");
+        assert_eq!(count_events(&bytes, offer_id, 0), 1, "offer(mime)");
+        assert_eq!(count_events(&bytes, offer_id, 1), 1, "source_actions");
+        assert_eq!(count_events(&bytes, dev.id, 1), 1, "enter");
+        // the target accepts and negotiates copy
+        let offer = drag.offers.borrow()[0].clone();
+        offer
+            .accept(wl_data_offer::accept::Request {
+                serial: 0,
+                mime_type: Some("text/plain;charset=utf-8".to_string()),
+            })
+            .unwrap();
+        offer
+            .set_actions(wl_data_offer::set_actions::Request {
+                dnd_actions: DND_COPY,
+                preferred_action: DND_COPY,
+            })
+            .unwrap();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, src.id, 0), 1, "source.target");
+        assert_eq!(count_events(&bytes, src.id, 5), 1, "source.action");
+        assert_eq!(count_events(&bytes, offer_id, 2), 1, "offer.action");
+        assert_eq!(drag.action.get(), DND_COPY);
+        // grab release: drop, then the target finishes
+        seat.data.dnd_finish_session();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, dev.id, 4), 1, "drop");
+        assert_eq!(count_events(&bytes, src.id, 3), 1, "dnd_drop_performed");
+        assert!(seat.data.drag().is_none());
+        offer.finish(wl_data_offer::finish::Request {}).unwrap();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, src.id, 4), 1, "dnd_finished");
+    }
+
+    #[test]
+    fn an_unaccepted_drag_cancels_on_release() {
+        let (state, client, seat, dev, src) = setup();
+        src.set_actions(wl_data_source::set_actions::Request {
+            dnd_actions: DND_COPY,
+        })
+        .unwrap();
+        let surface = seat.kb_focus.borrow().clone().unwrap();
+        let drag = test_drag(&client, Some(src.clone()));
+        seat.data.begin_drag_session(drag);
+        seat.data.dnd_enter(&state, &surface, 0.0, 0.0);
+        seat.data.dnd_finish_session();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, dev.id, 2), 1, "leave");
+        assert_eq!(count_events(&bytes, dev.id, 4), 0, "no drop");
+        assert_eq!(count_events(&bytes, src.id, 2), 1, "cancelled");
+        assert!(seat.data.drag().is_none());
+    }
+
+    #[test]
+    fn leaving_the_target_detaches_its_offers() {
+        let (state, client, seat, _dev, src) = setup();
+        let surface = seat.kb_focus.borrow().clone().unwrap();
+        let drag = test_drag(&client, Some(src));
+        seat.data.begin_drag_session(drag.clone());
+        seat.data.dnd_enter(&state, &surface, 0.0, 0.0);
+        let offer = drag.offers.borrow()[0].clone();
+        seat.data.dnd_leave();
+        assert!(drag.target().is_none());
+        assert!(offer.drag.borrow().is_none());
+        // a stale accept after leave is inert
+        offer
+            .accept(wl_data_offer::accept::Request {
+                serial: 0,
+                mime_type: Some("text/plain".to_string()),
+            })
+            .unwrap();
+        assert!(!drag.accepted.get());
     }
 
     #[test]

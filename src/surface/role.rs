@@ -14,6 +14,7 @@ pub enum SurfaceRole {
     Popup,
     LayerSurface,
     Xwayland,
+    DndIcon,
 }
 
 impl SurfaceRole {
@@ -25,6 +26,7 @@ impl SurfaceRole {
             SurfaceRole::Popup => "xdg_popup",
             SurfaceRole::LayerSurface => "zwlr_layer_surface_v1",
             SurfaceRole::Xwayland => "xwayland_surface_v1",
+            SurfaceRole::DndIcon => "dnd_icon",
         }
     }
 }

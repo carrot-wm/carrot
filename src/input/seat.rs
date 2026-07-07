@@ -44,6 +44,8 @@ pub struct SeatGlobal {
     ptr_focus: RefCell<Option<Rc<WlSurface>>>,
     ptr_origin: Cell<(i32, i32)>,
     ptr_buttons: RefCell<Vec<u32>>,
+    /// serial of the most recent button press; drag/move grabs validate on it
+    last_press_serial: Cell<u32>,
     // clipboard state rides on the seat: devices, sources, selection
     pub data: crate::protocol::data_device::DataDevices,
     pub primary: crate::protocol::primary_selection::PrimaryDevices,
@@ -74,6 +76,7 @@ impl SeatGlobal {
             ptr_focus: RefCell::new(None),
             ptr_origin: Cell::new((0, 0)),
             ptr_buttons: RefCell::new(Vec::new()),
+            last_press_serial: Cell::new(0),
             data: Default::default(),
             primary: Default::default(),
             popup_grab: RefCell::new(Vec::new()),
@@ -726,6 +729,13 @@ impl SeatGlobal {
         self.ptr_x.set(x);
         self.ptr_y.set(y);
 
+        // an active drag owns the pointer: the wl_pointer stream stays quiet
+        // and dnd enter/leave/motion track the surface underneath
+        if let Some(drag) = self.data.drag() {
+            self.drag_motion(state, &drag, time_usec, x, y);
+            return;
+        }
+
         let grabbed = !self.ptr_buttons.borrow().is_empty();
         if !grabbed {
             let hit = self.surface_at(state, x, y);
@@ -789,6 +799,84 @@ impl SeatGlobal {
         }
     }
 
+    // -- drag and drop; the session itself lives on self.data --
+
+    /// start_drag is only honored for the client holding the implicit grab,
+    /// naming the press serial, from the surface under the pointer
+    pub fn drag_grab_valid(&self, origin: &Rc<WlSurface>, serial: u32) -> bool {
+        if self.ptr_buttons.borrow().is_empty() || self.data.drag().is_some() {
+            return false;
+        }
+        if serial != self.last_press_serial.get() {
+            return false;
+        }
+        self.ptr_focus
+            .borrow()
+            .as_ref()
+            .is_some_and(|f| Rc::ptr_eq(&f.get_root(), &origin.get_root()))
+    }
+
+    pub fn begin_drag(self: &Rc<Self>, state: &Rc<State>, drag: Rc<crate::protocol::data_device::Drag>) {
+        // the grab moves to the dnd session; the origin loses wl_pointer
+        // focus and gets it back when the session ends
+        if let Some(old) = self.ptr_focus.borrow_mut().take() {
+            if !old.destroyed.get() {
+                let serial = state.next_serial(Some(&old.client)) as u32;
+                self.for_each_pointer(old.client.id, 1, |p| {
+                    p.client
+                        .event(|o| wl_pointer::leave::send(o, p.id, serial, old.id));
+                });
+                self.ptr_frame(old.client.id);
+            }
+        }
+        self.data.begin_drag_session(drag.clone());
+        // whatever sits under the pointer right now gets the first enter
+        let usec = crate::util::Time::now().nsec() / 1_000;
+        self.drag_motion(state, &drag, usec, self.ptr_x.get(), self.ptr_y.get());
+        state.damage.trigger();
+    }
+
+    fn drag_motion(
+        &self,
+        state: &Rc<State>,
+        drag: &Rc<crate::protocol::data_device::Drag>,
+        time_usec: u64,
+        x: f64,
+        y: f64,
+    ) {
+        // a source-less drag is client-internal: only the initiator's
+        // surfaces are targets
+        let hit = self
+            .surface_at(state, x, y)
+            .filter(|(s, _, _)| drag.source.is_some() || s.client.id == drag.client.id);
+        let cur = drag.target();
+        let same = match (&cur, &hit) {
+            (Some(a), Some((b, _, _))) => Rc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.data.dnd_leave();
+            if let Some((s, lx, ly)) = &hit {
+                self.data.dnd_enter(state, s, *lx as f64, *ly as f64);
+            }
+        } else if let Some((_, lx, ly)) = &hit {
+            self.data
+                .dnd_motion((time_usec / 1000) as u32, *lx as f64, *ly as f64);
+        }
+        if drag.icon.borrow().is_some() {
+            state.damage.trigger();
+        }
+    }
+
+    fn end_drag(self: &Rc<Self>, state: &Rc<State>) {
+        self.data.dnd_finish_session();
+        state.damage.trigger();
+        // the pointer re-enters whatever it is over
+        let usec = crate::util::Time::now().nsec() / 1_000;
+        self.pointer_motion(state, usec, 0.0, 0.0, 0.0, 0.0);
+    }
+
     pub fn pointer_button(self: &Rc<Self>, state: &Rc<State>, time_usec: u64, button: u32, pressed: bool) {
         {
             let mut held = self.ptr_buttons.borrow_mut();
@@ -797,6 +885,14 @@ impl SeatGlobal {
             } else {
                 held.retain(|&b| b != button);
             }
+        }
+        // buttons never reach clients during a drag; the last release ends
+        // the session as a drop or a cancel
+        if let Some(_drag) = self.data.drag() {
+            if !pressed && self.ptr_buttons.borrow().is_empty() {
+                self.end_drag(state);
+            }
+            return;
         }
         let focus = self.ptr_focus.borrow().clone();
         // a press outside the popup grab chain dismisses it; the click
@@ -830,6 +926,9 @@ impl SeatGlobal {
             return;
         };
         let serial = state.next_serial(Some(&surface.client)) as u32;
+        if pressed {
+            self.last_press_serial.set(serial);
+        }
         let ms = (time_usec / 1000) as u32;
         self.for_each_pointer(surface.client.id, 1, |p| {
             p.client.event(|o| {
