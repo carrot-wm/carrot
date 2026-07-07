@@ -340,6 +340,38 @@ crate::wl_protocol! {
     event description(description: string) since 4;
 }
 
+crate::wl_protocol! {
+    interface zwp_linux_dmabuf_v1, version = 4;
+    request destroy();
+    request create_params(params_id: new_id);
+    request get_default_feedback(id: new_id) since 4;
+    request get_surface_feedback(id: new_id, surface: object) since 4;
+    event format(format: uint);
+    event modifier(format: uint, modifier_hi: uint, modifier_lo: uint) since 3;
+}
+
+crate::wl_protocol! {
+    interface zwp_linux_dmabuf_feedback_v1, version = 4;
+    request destroy();
+    event done();
+    event format_table(fd: fd, size: uint);
+    event main_device(device: array);
+    event tranche_done();
+    event tranche_target_device(device: array);
+    event tranche_formats(indices: array);
+    event tranche_flags(flags: uint);
+}
+
+crate::wl_protocol! {
+    interface zwp_linux_buffer_params_v1, version = 4;
+    request destroy();
+    request add(fd: fd, plane_idx: uint, offset: uint, stride: uint, modifier_hi: uint, modifier_lo: uint);
+    request create(width: int, height: int, format: uint, flags: uint);
+    request create_immed(buffer_id: new_id, width: int, height: int, format: uint, flags: uint) since 2;
+    event created(buffer: new_id);
+    event failed();
+}
+
 // wl_display.error codes
 pub const INVALID_OBJECT: u32 = 0;
 pub const INVALID_METHOD: u32 = 1;
@@ -502,6 +534,16 @@ mod tests {
         assert_eq!(wl_output::scale::OPCODE, 3);
         assert_eq!(wl_output::name::OPCODE, 4);
         assert_eq!(wl_output::description::OPCODE, 5);
+        assert_eq!(zwp_linux_dmabuf_v1::create_params::OPCODE, 1);
+        assert_eq!(zwp_linux_dmabuf_v1::get_default_feedback::OPCODE, 2);
+        assert_eq!(zwp_linux_dmabuf_v1::get_surface_feedback::OPCODE, 3);
+        assert_eq!(zwp_linux_dmabuf_v1::modifier::OPCODE, 1);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::format_table::OPCODE, 1);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::main_device::OPCODE, 2);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_done::OPCODE, 3);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_formats::OPCODE, 5);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_flags::OPCODE, 6);
+        assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
     }
 
     /// byte-exact fixtures pin arg offsets and padding, not just opcodes

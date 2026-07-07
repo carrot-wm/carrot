@@ -122,6 +122,8 @@ struct Output {
     textures: RefCell<HashMap<(ClientId, u64), (Texture, u64)>>,
     /// evicted textures still in a submitted frame; drained past the fence
     retired_tex: RefCell<Vec<Texture>>,
+    /// client dmabuf read fences to wait on before this frame samples them
+    frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
     /// card's dev_t, matches logind pause/resume signals
     devnum: u64,
     /// vt elsewhere; render but never commit until resume
@@ -147,7 +149,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
     };
     cards.sort();
     for path in cards {
-        match init_card(&path, session).await {
+        match init_card(state, &path, session).await {
             Ok(out) => {
                 println!(
                     "carrot: output up on {} ({}x{})",
@@ -229,6 +231,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
 }
 
 async fn init_card(
+    state: &Rc<State>,
     path: &std::path::Path,
     session: Option<&Rc<LogindSession>>,
 ) -> Result<Output, String> {
@@ -268,6 +271,35 @@ async fn init_card(
     let renderer = Rc::new(
         Renderer::new(&core, vk::Format::B8G8R8A8_UNORM).map_err(|e| format!("renderer: {e}"))?,
     );
+
+    // the dmabuf global speaks for this device from here on
+    {
+        let rdev = rustix::fs::fstat(dev.fd.as_fd())
+            .map(|st| st.st_rdev)
+            .unwrap_or(0);
+        let mut formats = Vec::new();
+        match core.sample_modifiers(vk::Format::B8G8R8A8_UNORM) {
+            Ok(mods) => {
+                for &m in &mods {
+                    formats.push((XRGB8888.drm, m));
+                    formats.push((crate::format::ARGB8888.drm, m));
+                }
+            }
+            Err(e) => eprintln!("carrot: dmabuf modifier probe failed: {e}"),
+        }
+        if formats.is_empty() {
+            formats.push((XRGB8888.drm, 0));
+            formats.push((crate::format::ARGB8888.drm, 0));
+        }
+        eprintln!(
+            "carrot: dmabuf: {} format+modifier pairs, main device {rdev:#x}",
+            formats.len()
+        );
+        *state.dmabuf_info.borrow_mut() = Some(crate::protocol::dmabuf::DmabufInfo {
+            main_device: rdev,
+            formats,
+        });
+    }
 
     let mk_buf = || -> Result<OutBuf, String> {
         // tier 1: vulkan-native, addfb2 arbitrates
@@ -382,6 +414,7 @@ async fn init_card(
         height,
         textures: RefCell::new(HashMap::new()),
         retired_tex: RefCell::new(Vec::new()),
+        frame_fences: RefCell::new(Vec::new()),
         devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
@@ -413,6 +446,13 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         }
 
         let ops = compose(state, out);
+        // clients' in-flight renders gate our sampling of their dmabufs
+        for fence in out.frame_fences.borrow_mut().drain(..) {
+            match out.renderer.import_wait(fence) {
+                Ok(sem) => waits.push(sem),
+                Err(e) => eprintln!("carrot: dmabuf fence import failed: {e}"),
+            }
+        }
         crate::trace!("present: {} ops, paused={}", ops.len(), out.paused.get());
         let target = FrameTarget {
             image: buf.bo.image,
@@ -471,6 +511,8 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         for t in out.retired_tex.borrow_mut().drain(..) {
             out.renderer.destroy_texture(&t);
         }
+        // parked dmabufs are free now the sampling frame is done; drop sends release
+        state.retired.borrow_mut().clear();
         let ms = (Time::now().nsec() / 1_000_000) as u32;
         state.clients.for_each(|c| {
             c.objects.for_each_surface(|s| {
@@ -671,9 +713,43 @@ fn draw_buffer(
     if bw == 0 || bh == 0 {
         return;
     }
-    let key = (s.client.id, s.uid);
+    // dmabufs are per-buffer imports; shm shadows belong to the surface
+    let key = if buf.dmabuf().is_some() {
+        (s.client.id, buf.uid)
+    } else {
+        (s.client.id, s.uid)
+    };
     let opaque = !buf.format.has_alpha();
-    {
+    if let Some(img) = buf.dmabuf() {
+        // gpu buffers import once and sample in place - the client's renders
+        // never round-trip through the cpu
+        let mut textures = out.textures.borrow_mut();
+        let need_new = match textures.get(&key) {
+            Some((t, _)) => t.width != bw || t.height != bh,
+            None => true,
+        };
+        if need_new {
+            if let Some((old, _)) = textures.remove(&key) {
+                out.retired_tex.borrow_mut().push(old);
+            }
+            match out
+                .renderer
+                .import_dmabuf(&img.planes, img.modifier, bw, bh, opaque)
+            {
+                Ok(t) => {
+                    textures.insert(key, (t, 0));
+                }
+                Err(e) => {
+                    eprintln!("carrot: dmabuf import failed: {e}");
+                    return;
+                }
+            }
+        }
+        // wait out the client's pending gpu writes before sampling
+        if let Some(fence) = img.read_fence() {
+            out.frame_fences.borrow_mut().push(fence);
+        }
+    } else {
         let mut textures = out.textures.borrow_mut();
         let need_new = match textures.get(&key) {
             Some((t, _)) => t.width != bw || t.height != bh,
@@ -710,7 +786,11 @@ fn draw_buffer(
             } else {
                 // shadow missing (capture failed): fall back to the client
                 // buffer, zero-filling short rows instead of leaking staging
-                out.renderer.upload_texture(&entry.0, |dst| match buf.access() {
+                let access = match buf.shm_access() {
+                    Some(a) => a,
+                    None => return,
+                };
+                out.renderer.upload_texture(&entry.0, |dst| match access {
                     ShmAccess::Ptr(p) => {
                         for yy in 0..bh as usize {
                             unsafe {

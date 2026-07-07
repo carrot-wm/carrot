@@ -135,6 +135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.globals.add(std::rc::Rc::new(surface::WlCompositorGlobal));
     state.globals.add(std::rc::Rc::new(surface::WlSubcompositorGlobal));
     state.globals.add(std::rc::Rc::new(protocol::shm::WlShmGlobal));
+    state.globals.add(std::rc::Rc::new(protocol::dmabuf::DmabufGlobal));
     state.globals.add(std::rc::Rc::new(shell::xdg::XdgWmBaseGlobal));
     state
         .globals

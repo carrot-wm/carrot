@@ -113,6 +113,11 @@ pub enum ShmAccess<'a> {
 }
 
 impl ClientMemOffset {
+    /// writes go through the fd: the mapping is PROT_READ only
+    pub fn write_target(&self) -> (&Rc<OwnedFd>, usize) {
+        (&self.mem.fd, self.offset)
+    }
+
     #[allow(dead_code)]
     pub fn safe_access(&self) -> ShmAccess<'_> {
         if self.mem.sealed {

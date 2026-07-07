@@ -611,6 +611,167 @@ impl Renderer {
         }
     }
 
+    /// wrap a client dmabuf as a sampled texture. the import happens once
+    /// per wl_buffer; every later commit samples in place.
+    pub fn import_dmabuf(
+        &self,
+        planes: &[crate::protocol::shm::DmabufPlane],
+        modifier: u64,
+        w: u32,
+        h: u32,
+        opaque: bool,
+    ) -> Result<Texture, RenderError> {
+        use std::os::fd::AsRawFd;
+        let dev = &self.core.device;
+        let first = planes
+            .first()
+            .ok_or_else(|| RenderError::Load("dmabuf with no planes".into()))?;
+        let fd = first
+            .fd
+            .try_clone()
+            .map_err(|e| RenderError::Load(format!("dmabuf dup: {e}")))?;
+        let size = rustix::fs::seek(&fd, rustix::fs::SeekFrom::End(0))
+            .map_err(|e| RenderError::Load(format!("dmabuf seek: {e}")))?;
+        let layouts: Vec<vk::SubresourceLayout> = planes
+            .iter()
+            .map(|p| {
+                vk::SubresourceLayout::default()
+                    .offset(p.offset as u64)
+                    .row_pitch(p.stride as u64)
+            })
+            .collect();
+        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&layouts);
+        let mut ext = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(self.format)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut explicit)
+            .push_next(&mut ext);
+        let image = unsafe { dev.create_image(&info, None) }?;
+        let image_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image(image, None) });
+
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        unsafe {
+            self.core.ext_mem_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_props,
+            )
+        }?;
+        let reqs = unsafe { dev.get_image_memory_requirements(image) };
+        let mem_type = self.core.find_memory_type(
+            reqs.memory_type_bits & fd_props.memory_type_bits,
+            vk::MemoryPropertyFlags::empty(),
+        )?;
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(fd.as_raw_fd());
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(mem_type)
+            .push_next(&mut import)
+            .push_next(&mut dedicated);
+        let memory = match unsafe { dev.allocate_memory(&alloc, None) } {
+            Ok(m) => {
+                // the device owns the fd now
+                std::mem::forget(fd);
+                m
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(memory, None) });
+        unsafe { dev.bind_image_memory(image, memory, 0) }?;
+
+        let alpha = if opaque {
+            vk::ComponentSwizzle::ONE
+        } else {
+            vk::ComponentSwizzle::IDENTITY
+        };
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(self.format)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: alpha,
+            })
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let view = unsafe { dev.create_image_view(&view_info, None) }?;
+        let view_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image_view(view, None) });
+
+        // the draw pass expects SHADER_READ_ONLY; linear has no metadata so a
+        // one-time transition stays valid across the client's rewrites
+        self.transition_sampled(image)?;
+
+        std::mem::forget(view_guard);
+        std::mem::forget(mem_guard);
+        std::mem::forget(image_guard);
+        Ok(Texture {
+            image,
+            memory,
+            view,
+            width: w,
+            height: h,
+            undefined: std::cell::Cell::new(false),
+        })
+    }
+
+    fn transition_sampled(&self, image: vk::Image) -> Result<(), RenderError> {
+        let dev = &self.core.device;
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(self.core.queue_family);
+        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
+        let pool_guard = crate::util::OnDrop(|| unsafe { dev.destroy_command_pool(pool, None) });
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { dev.allocate_command_buffers(&alloc) }?[0];
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        let barrier = image_barrier(image)
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        barrier2(dev, cb, &[barrier]);
+        unsafe { dev.end_command_buffer(cb) }?;
+        let cbs = [cb];
+        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+        unsafe {
+            dev.queue_submit(self.core.queue, &[submit], vk::Fence::null())?;
+            dev.queue_wait_idle(self.core.queue)?;
+        }
+        drop(pool_guard);
+        Ok(())
+    }
+
     /// blocking staging upload; `fill` writes tightly packed rows into the
     /// staging slice. bring-up grade.
     pub fn upload_texture(

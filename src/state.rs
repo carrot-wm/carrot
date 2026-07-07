@@ -44,6 +44,10 @@ pub struct State {
     serial: NumCell<u64>,
     /// identity for cache keys: wire ids get reused, uids never do
     obj_uid: NumCell<u64>,
+    /// dmabuf attachments sampled in place; released once the frame does
+    pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
+    /// advertised drm formats + modifiers, filled once the renderer is up
+    pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
 }
 
 impl State {
@@ -73,6 +77,8 @@ impl State {
             ipc_subs: RefCell::new(Vec::new()),
             serial: NumCell::new(0),
             obj_uid: NumCell::new(0),
+            retired: RefCell::new(Vec::new()),
+            dmabuf_info: RefCell::new(None),
         })
     }
 
@@ -96,6 +102,7 @@ impl State {
         self.configures.borrow_mut().clear();
         self.layers.borrow_mut().clear();
         self.ipc_subs.borrow_mut().clear();
+        self.retired.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
         self.display.borrow_mut().take();

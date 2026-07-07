@@ -140,9 +140,12 @@ fn capture_shadow(buf: &crate::protocol::shm::WlBuffer, slot: &mut Option<Vec<u8
         return false;
     }
     let stride = buf.stride as usize;
+    let Some(access) = buf.shm_access() else {
+        return false;
+    };
     let px = slot.get_or_insert_with(Vec::new);
     px.resize(need, 0);
-    match buf.access() {
+    match access {
         ShmAccess::Ptr(p) => {
             for yy in 0..h {
                 unsafe {
@@ -232,9 +235,16 @@ impl WlSurface {
             self.content_gen.set(self.content_gen.get().wrapping_add(1));
         }
         if let Some(buf) = pending.buffer.take() {
-            // dropping the previous attachment sends its release
+            // dropping the previous attachment sends its release. dmabufs are
+            // sampled in place, so their release waits out the frame that may
+            // still reference them - the present loop drains the parking lot
             let old = self.buffer.borrow_mut().take();
-            drop(old);
+            if let Some(old) = old {
+                let st = &self.client.state;
+                if old.buf.dmabuf().is_some() && st.display.borrow().is_some() {
+                    st.retired.borrow_mut().push(old);
+                }
+            }
             match buf {
                 Some(b) => {
                     *self.buffer.borrow_mut() = Some(b);
@@ -252,7 +262,9 @@ impl WlSurface {
         if content_changed {
             let att = self.buffer.borrow();
             if let Some(att) = att.as_ref() {
-                if capture_shadow(&att.buf, &mut self.shm_shadow.borrow_mut()) {
+                if att.buf.dmabuf().is_none()
+                    && capture_shadow(&att.buf, &mut self.shm_shadow.borrow_mut())
+                {
                     att.send_release.set(false);
                     if !att.buf.destroyed.get() {
                         let b = &att.buf;

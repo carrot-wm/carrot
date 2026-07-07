@@ -149,11 +149,12 @@ impl wl_shm_pool::Handler for WlShmPool {
         let mem = self.mem.borrow().offset(req.offset as usize);
         let buf = Rc::new(WlBuffer {
             id: req.id,
+            uid: c.state.next_uid(),
             client: c.clone(),
             rect: Rect::new_sized_saturating(0, 0, req.width, req.height),
             format,
             stride: req.stride,
-            mem,
+            storage: BufferStorage::Shm(mem),
             destroyed: Cell::new(false),
         });
         c.add_client_obj(buf.clone())?;
@@ -201,17 +202,107 @@ impl Object for WlShmPool {
 
 pub struct WlBuffer {
     pub id: ObjectId,
+    /// never-reused identity, shares the surface uid space
+    pub uid: u64,
     pub client: Rc<Client>,
     pub rect: Rect,
     pub format: &'static Format,
     pub stride: i32,
-    mem: ClientMemOffset,
+    pub storage: BufferStorage,
     pub destroyed: Cell<bool>,
 }
 
+pub enum BufferStorage {
+    Shm(ClientMemOffset),
+    Dmabuf(DmabufImage),
+}
+
+pub struct DmabufImage {
+    pub planes: Vec<DmabufPlane>,
+    pub modifier: u64,
+}
+
+pub struct DmabufPlane {
+    pub fd: std::os::fd::OwnedFd,
+    pub offset: u32,
+    pub stride: u32,
+}
+
+// DMA_BUF_IOCTL_EXPORT_SYNC_FILE: the kernel's implicit fences as a
+// sync_file. SYNC_READ asks for everything a reader must wait on.
+#[repr(C)]
+struct ExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+
+struct ExportIoctl {
+    data: ExportSyncFile,
+}
+
+unsafe impl rustix::ioctl::Ioctl for ExportIoctl {
+    type Output = i32;
+    const IS_MUTATING: bool = true;
+
+    fn opcode(&self) -> rustix::ioctl::Opcode {
+        rustix::ioctl::opcode::read_write::<ExportSyncFile>(b'b', 2)
+    }
+
+    fn as_ptr(&mut self) -> *mut std::ffi::c_void {
+        (&raw mut self.data).cast()
+    }
+
+    unsafe fn output_from_ptr(
+        _: rustix::ioctl::IoctlOutput,
+        ptr: *mut std::ffi::c_void,
+    ) -> rustix::io::Result<i32> {
+        Ok(unsafe { (*ptr.cast::<ExportSyncFile>()).fd })
+    }
+}
+
+impl DmabufImage {
+    /// pending gpu writes as a sync_file; imported as a wait semaphore so
+    /// compositing never samples a half-rendered client frame
+    pub fn read_fence(&self) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let plane = self.planes.first()?;
+        let ioc = ExportIoctl {
+            data: ExportSyncFile {
+                flags: DMA_BUF_SYNC_READ,
+                fd: -1,
+            },
+        };
+        match unsafe { rustix::ioctl::ioctl(&plane.fd, ioc) } {
+            Ok(fd) if fd >= 0 => Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+            _ => None,
+        }
+    }
+}
+
 impl WlBuffer {
-    pub fn access(&self) -> crate::clientmem::ShmAccess<'_> {
-        self.mem.safe_access()
+    pub fn shm_access(&self) -> Option<crate::clientmem::ShmAccess<'_>> {
+        match &self.storage {
+            BufferStorage::Shm(mem) => Some(mem.safe_access()),
+            BufferStorage::Dmabuf(_) => None,
+        }
+    }
+
+    /// (pool fd, absolute byte offset) for writing INTO the buffer;
+    /// None for dmabuf storage
+    pub fn shm_write_target(&self) -> Option<(&std::rc::Rc<std::os::fd::OwnedFd>, usize)> {
+        match &self.storage {
+            BufferStorage::Shm(mem) => Some(mem.write_target()),
+            BufferStorage::Dmabuf(_) => None,
+        }
+    }
+
+    pub fn dmabuf(&self) -> Option<&DmabufImage> {
+        match &self.storage {
+            BufferStorage::Dmabuf(img) => Some(img),
+            BufferStorage::Shm(_) => None,
+        }
     }
 }
 
@@ -272,11 +363,12 @@ pub(crate) fn test_buffer(client: &Rc<Client>, id: ObjectId, w: i32, h: i32) -> 
     let mem = ClientMem::new(&fd, size).unwrap();
     let buf = Rc::new(WlBuffer {
         id,
+        uid: client.state.next_uid(),
         client: client.clone(),
         rect: Rect::new_sized_saturating(0, 0, w, h),
         format: &crate::format::ARGB8888,
         stride: w * 4,
-        mem: mem.offset(0),
+        storage: BufferStorage::Shm(mem.offset(0)),
         destroyed: Cell::new(false),
     });
     client.add_client_obj(buf.clone()).unwrap();

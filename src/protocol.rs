@@ -3,6 +3,7 @@
 // events numbered separately. wl_array and fd args are first class.
 
 pub mod data_device;
+pub mod dmabuf;
 pub mod display;
 pub mod globals;
 pub mod interfaces;

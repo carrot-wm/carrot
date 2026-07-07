@@ -239,6 +239,65 @@ impl VkCore {
         Ok(out)
     }
 
+    /// modifiers this device can import + sample for `format` - what the
+    /// dmabuf global advertises to gpu clients
+    pub fn sample_modifiers(&self, format: vk::Format) -> Result<Vec<u64>, RenderError> {
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            self.instance
+                .get_physical_device_format_properties2(self.pdev, format, &mut fp2)
+        };
+        let count = list.drm_format_modifier_count as usize;
+        let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+            .drm_format_modifier_properties(&mut props);
+        let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            self.instance
+                .get_physical_device_format_properties2(self.pdev, format, &mut fp2)
+        };
+        let filled = list.drm_format_modifier_count as usize;
+        props.truncate(filled);
+
+        let mut out = Vec::new();
+        for p in &props {
+            if !p
+                .drm_format_modifier_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+            {
+                continue;
+            }
+            let mut mod_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+                .drm_format_modifier(p.drm_format_modifier)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let mut ext_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let info = vk::PhysicalDeviceImageFormatInfo2::default()
+                .format(format)
+                .ty(vk::ImageType::TYPE_2D)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .push_next(&mut mod_info)
+                .push_next(&mut ext_info);
+            let mut ext_props = vk::ExternalImageFormatProperties::default();
+            let mut ifp2 = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+            let ok = unsafe {
+                self.instance
+                    .get_physical_device_image_format_properties2(self.pdev, &info, &mut ifp2)
+            };
+            if ok.is_ok()
+                && ext_props
+                    .external_memory_properties
+                    .external_memory_features
+                    .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+            {
+                out.push(p.drm_format_modifier);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn find_memory_type(
         &self,
         bits: u32,
