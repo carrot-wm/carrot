@@ -166,6 +166,8 @@ impl Plane {
 
 pub struct DrmDevice {
     pub fd: Rc<OwnedFd>,
+    /// kernel driver name; gates driver-private ioctls
+    pub driver: String,
     pub cursor_size: (u32, u32),
     /// kernel takes PAGE_FLIP_ASYNC on atomic commits (6.8+); tearing needs it
     pub supports_async_flip: bool,
@@ -190,6 +192,7 @@ impl DrmDevice {
                 .map_err(DrmError::NotAtomic)?;
         }
 
+        let driver = sys::driver_name(fd.as_fd()).unwrap_or_default();
         let cursor_size = (
             sys::get_cap(fd.as_fd(), sys::CAP_CURSOR_WIDTH).unwrap_or(64) as u32,
             sys::get_cap(fd.as_fd(), sys::CAP_CURSOR_HEIGHT).unwrap_or(64) as u32,
@@ -256,6 +259,7 @@ impl DrmDevice {
 
         let dev = Rc::new(DrmDevice {
             fd,
+            driver,
             cursor_size,
             supports_async_flip,
             crtcs,
@@ -471,7 +475,8 @@ pub fn probe_dump() -> i32 {
             }
         };
         println!(
-            "{} crtcs, {} planes, cursor {}x{}",
+            "driver {:?}, {} crtcs, {} planes, cursor {}x{}",
+            dev.driver,
             dev.crtcs.len(),
             dev.planes.len(),
             dev.cursor_size.0,

@@ -3,7 +3,7 @@
 // prev scanout's OUT fence gates the render, render fence rides IN_FENCE_FD
 // into the commit. composition in tree z order: tiled, fullscreen, floats.
 
-use crate::allocator::{ScanoutBo, create_scanout_bo, import_linear_bo};
+use crate::allocator::{ScanoutBo, create_scanout_bo, import_bo, import_linear_bo};
 use crate::client::ClientId;
 use crate::clientmem::ShmAccess;
 use crate::dbus::{DeviceEvent, LogindSession};
@@ -659,6 +659,9 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
         if state.config.borrow().software_cursor {
             display.set_software_cursor(state, true);
         }
+        // heads on OTHER cards are a phase-11 (multi-gpu) problem; say so
+        // instead of leaving a black monitor unexplained
+        warn_other_cards(&path);
         // paint over the modesets' uninitialized first buffers
         state.damage.trigger();
         return Some(display);
@@ -825,6 +828,105 @@ fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>) 
         mul: 1.0,
         opaque: false,
     });
+}
+
+/// I915_FORMAT_MOD_4_TILED: fourcc_mod_code(INTEL=1, 9); single-plane,
+/// no compression metadata, display-engine friendly
+const TILE4: u64 = (1u64 << 56) | 9;
+
+/// kms-side tile4 allocation for one scanout buffer (xe only)
+fn xe_tiled_buf(
+    dev: &Rc<DrmDevice>,
+    core: &Rc<VkCore>,
+    renderer: &Rc<Renderer>,
+    width: u32,
+    height: u32,
+    primary: &Rc<crate::drm::device::Plane>,
+) -> Result<OutBuf, String> {
+    let kms_mods = primary.modifiers(XRGB8888.drm);
+    if !kms_mods.is_empty() && !kms_mods.contains(&TILE4) {
+        return Err("plane does not advertise tile4".into());
+    }
+    // tile4 tiles are 128B x 32 rows; anv validates the explicit layout
+    let pitch = (width * 4 + 127) & !127;
+    let rows = (height + 31) & !31;
+    let (placement, page) =
+        sys::xe_vram_placement(dev.fd.as_fd()).map_err(|e| format!("mem regions: {e}"))?;
+    let size = (pitch as u64 * rows as u64 + page - 1) & !(page - 1);
+    let handle = sys::xe_gem_create_scanout(dev.fd.as_fd(), size, placement)
+        .map_err(|e| format!("gem create: {e}"))?;
+    let fb = match sys::addfb2(
+        dev.fd.as_fd(),
+        width,
+        height,
+        XRGB8888.drm,
+        &[handle],
+        &[pitch],
+        &[0],
+        Some(TILE4),
+    ) {
+        Ok(fb) => fb,
+        Err(e) => {
+            let _ = sys::gem_close(dev.fd.as_fd(), handle);
+            return Err(format!("addfb2: {e}"));
+        }
+    };
+    let dmabuf = match sys::prime_handle_to_fd(dev.fd.as_fd(), handle) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = sys::rmfb(dev.fd.as_fd(), fb);
+            let _ = sys::gem_close(dev.fd.as_fd(), handle);
+            return Err(format!("prime export: {e}"));
+        }
+    };
+    // fb + dmabuf hold their own refs now
+    let _ = sys::gem_close(dev.fd.as_fd(), handle);
+    let bo = match import_bo(
+        core,
+        dmabuf,
+        width,
+        height,
+        pitch,
+        size,
+        vk::Format::B8G8R8A8_UNORM,
+        TILE4,
+    ) {
+        Ok(bo) => bo,
+        Err(e) => {
+            let _ = sys::rmfb(dev.fd.as_fd(), fb);
+            return Err(format!("vulkan import: {e}"));
+        }
+    };
+    let view = renderer
+        .create_target_view(bo.image)
+        .map_err(|e| format!("view: {e}"))?;
+    Ok(OutBuf {
+        bo,
+        fb,
+        view,
+        undefined: Cell::new(true),
+        dumb: None,
+    })
+}
+
+/// sysfs peek: connected connectors on cards we did NOT bring up
+fn warn_other_cards(active: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir("/sys/class/drm") else { return };
+    let active = active.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // card1-DP-2 style entries only, skipping the active card's
+        let Some((card, conn)) = name.split_once('-') else { continue };
+        if card == active || !card.starts_with("card") {
+            continue;
+        }
+        let status = std::fs::read_to_string(e.path().join("status")).unwrap_or_default();
+        if status.trim() == "connected" {
+            eprintln!(
+                "carrot: {card} {conn} is connected but multi-gpu output is not built yet (phase 11); that monitor stays dark"
+            );
+        }
+    }
 }
 
 /// seed the cursor plane: system theme, else built-in arrow
@@ -1235,6 +1337,17 @@ fn init_output(
                 }
             }
         }
+        // tier 1.5: kms-allocated tile4, imported into vulkan. linear dumb
+        // scanout starves the display fifo once a second head splits the
+        // dbuf slices; tiled fetch is what the engine is built for
+        if dev.driver == "xe" {
+            match xe_tiled_buf(&dev, &core, &renderer, width, height, &primary) {
+                Ok(buf) => return Ok(buf),
+                Err(e) => {
+                    eprintln!("carrot: tiled scanout unavailable ({e}); dumb-linear fallback")
+                }
+            }
+        }
         // tier 2: dumb buffer imported into vulkan
         let db = sys::create_dumb(dev.fd.as_fd(), width, height, 32)
             .map_err(|e| format!("create_dumb: {e}"))?;
@@ -1277,6 +1390,8 @@ fn init_output(
         "carrot: scanout tier: {}",
         if bufs[0].dumb.is_some() {
             "dumb-buffer import"
+        } else if bufs[0].bo.modifier == TILE4 {
+            "kms tile4 import"
         } else {
             "vulkan-native"
         }

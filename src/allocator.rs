@@ -144,9 +144,24 @@ pub fn import_linear_bo(
     size: u64,
     format: vk::Format,
 ) -> Result<ScanoutBo, RenderError> {
+    import_bo(core, dmabuf, width, height, pitch, size, format, 0)
+}
+
+/// like import_linear_bo but with the modifier the bo was really made with;
+/// single memory plane only (tile4 qualifies, ccs does not)
+pub fn import_bo(
+    core: &VkCore,
+    dmabuf: OwnedFd,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    size: u64,
+    format: vk::Format,
+    modifier: u64,
+) -> Result<ScanoutBo, RenderError> {
     let layouts = [vk::SubresourceLayout::default().row_pitch(pitch as u64)];
     let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-        .drm_format_modifier(0)
+        .drm_format_modifier(modifier)
         .plane_layouts(&layouts);
     let mut ext = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -219,7 +234,7 @@ pub fn import_linear_bo(
         image,
         memory,
         fd: dmabuf,
-        modifier: 0,
+        modifier,
         planes: vec![BoPlane {
             offset: 0,
             pitch: pitch as u64,

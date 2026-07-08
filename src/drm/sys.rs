@@ -645,6 +645,125 @@ struct drm_prime_handle {
     fd: i32,
 }
 
+// -- driver identity + xe-specific allocation --
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_version {
+    version_major: i32,
+    version_minor: i32,
+    version_patchlevel: i32,
+    name_len: usize,
+    name: u64,
+    date_len: usize,
+    date: u64,
+    desc_len: usize,
+    desc: u64,
+}
+
+/// which kernel driver owns this card ("xe", "amdgpu", ...) - driver-private
+/// ioctl numbers collide across drivers, so gate before using any
+pub fn driver_name(fd: BorrowedFd<'_>) -> Result<String, Errno> {
+    let mut d = drm_version::default();
+    drm_ioctl(fd, iowr::<drm_version>(0x00), &mut d)?;
+    let mut buf = vec![0u8; d.name_len.max(1)];
+    let mut d = drm_version {
+        name_len: buf.len(),
+        name: buf.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    drm_ioctl(fd, iowr::<drm_version>(0x00), &mut d)?;
+    buf.truncate(d.name_len.min(buf.len()));
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_xe_device_query {
+    extensions: u64,
+    query: u32,
+    size: u32,
+    data: u64,
+    reserved: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Default, Copy, Clone)]
+struct drm_xe_mem_region {
+    mem_class: u16,
+    instance: u16,
+    min_page_size: u32,
+    total_size: u64,
+    used: u64,
+    cpu_visible_size: u64,
+    cpu_visible_used: u64,
+    reserved: [u64; 6],
+}
+
+const DRM_XE_DEVICE_QUERY_MEM_REGIONS: u32 = 1;
+const DRM_XE_MEM_REGION_CLASS_VRAM: u16 = 1;
+
+/// (placement mask, min page size), preferring vram
+pub fn xe_vram_placement(fd: BorrowedFd<'_>) -> Result<(u32, u64), Errno> {
+    let mut q = drm_xe_device_query {
+        query: DRM_XE_DEVICE_QUERY_MEM_REGIONS,
+        ..Default::default()
+    };
+    drm_ioctl(fd, iowr::<drm_xe_device_query>(0x40), &mut q)?;
+    let mut buf = vec![0u8; (q.size as usize).max(8)];
+    let mut q = drm_xe_device_query {
+        query: DRM_XE_DEVICE_QUERY_MEM_REGIONS,
+        size: buf.len() as u32,
+        data: buf.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    drm_ioctl(fd, iowr::<drm_xe_device_query>(0x40), &mut q)?;
+    let n = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let stride = std::mem::size_of::<drm_xe_mem_region>();
+    let mut fallback: Option<(u32, u64)> = None;
+    for i in 0..n {
+        let off = 8 + i * stride;
+        let Some(sl) = buf.get(off..off + stride) else { break };
+        let r: drm_xe_mem_region = unsafe { std::ptr::read_unaligned(sl.as_ptr().cast()) };
+        let entry = (1u32 << r.instance, r.min_page_size.max(4096) as u64);
+        if r.mem_class == DRM_XE_MEM_REGION_CLASS_VRAM {
+            return Ok(entry);
+        }
+        fallback.get_or_insert(entry);
+    }
+    fallback.ok_or(Errno::NODEV)
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_xe_gem_create {
+    extensions: u64,
+    size: u64,
+    placement: u32,
+    flags: u32,
+    vm_id: u32,
+    handle: u32,
+    cpu_caching: u16,
+    pad: [u16; 3],
+    reserved: [u64; 2],
+}
+
+const DRM_XE_GEM_CREATE_FLAG_SCANOUT: u32 = 1 << 1;
+const DRM_XE_GEM_CPU_CACHING_WC: u16 = 2;
+
+/// a scanout-capable, write-combined bo; the display engine's preferred diet
+pub fn xe_gem_create_scanout(fd: BorrowedFd<'_>, size: u64, placement: u32) -> Result<u32, Errno> {
+    let mut d = drm_xe_gem_create {
+        size,
+        placement,
+        flags: DRM_XE_GEM_CREATE_FLAG_SCANOUT,
+        cpu_caching: DRM_XE_GEM_CPU_CACHING_WC,
+        ..Default::default()
+    };
+    drm_ioctl(fd, iowr::<drm_xe_gem_create>(0x41), &mut d)?;
+    Ok(d.handle)
+}
+
 pub fn prime_fd_to_handle(fd: BorrowedFd<'_>, dmabuf: BorrowedFd<'_>) -> Result<u32, Errno> {
     use std::os::fd::AsRawFd;
     let mut d = drm_prime_handle {
