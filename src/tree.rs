@@ -7,6 +7,7 @@ pub mod dwindle;
 pub mod float;
 pub mod workspace;
 
+use crate::config::Dir;
 use crate::rect::Rect;
 use crate::shell::xdg::XdgToplevel;
 use crate::state::State;
@@ -198,7 +199,7 @@ pub fn focused_window(state: &Rc<State>) -> Option<Rc<Window>> {
 
 // move the focused window to workspace n and follow it there; the moved
 // window keeps the keyboard
-pub fn send_to_workspace(state: &Rc<State>, n: usize) {
+pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
     if n == state.active_ws.get() {
         return;
     }
@@ -228,8 +229,18 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize) {
     target
         .tiling
         .insert(&win, (area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2);
-    switch_workspace(state, n);
-    focus_window(state, Some(&win));
+    if follow {
+        switch_workspace(state, n);
+        focus_window(state, Some(&win));
+    } else {
+        // the sender stays put; something on this workspace takes focus
+        let (cx, cy) = cursor_pos(state);
+        let next = window_at(state, cx, cy)
+            .map(|(w, ..)| w)
+            .or_else(|| ws.tiling.first())
+            .or_else(|| ws.top_float());
+        focus_window(state, next.as_ref());
+    }
 }
 
 // the x server died; every window it owned goes with it
@@ -281,6 +292,84 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
     };
     focus_window(state, Some(&wins[next]));
     state.damage.trigger();
+}
+
+// -- directional navigation --
+
+pub fn switch_workspace_rel(state: &Rc<State>, delta: i32) {
+    let count = state.workspaces.borrow().len();
+    switch_workspace(state, rel_wrap(state.active_ws.get(), delta, count));
+}
+
+fn rel_wrap(cur: usize, delta: i32, count: usize) -> usize {
+    (cur as i32 + delta).rem_euclid(count.max(1) as i32) as usize
+}
+
+fn span_overlap(a1: i32, a2: i32, b1: i32, b2: i32) -> i32 {
+    a2.min(b2) - a1.max(b1)
+}
+
+/// nearest rect whose facing edge lies in `dir` with some perpendicular
+/// overlap; ties go to the greatest overlap
+fn dir_pick(from: Rect, rects: &[Rect], dir: Dir) -> Option<usize> {
+    let mut best: Option<(i32, i32, usize)> = None;
+    for (i, r) in rects.iter().enumerate() {
+        let (dist, overlap) = match dir {
+            Dir::Left => (from.x1 - r.x2, span_overlap(from.y1, from.y2, r.y1, r.y2)),
+            Dir::Right => (r.x1 - from.x2, span_overlap(from.y1, from.y2, r.y1, r.y2)),
+            Dir::Up => (from.y1 - r.y2, span_overlap(from.x1, from.x2, r.x1, r.x2)),
+            Dir::Down => (r.y1 - from.y2, span_overlap(from.x1, from.x2, r.x1, r.x2)),
+        };
+        if dist < 0 || overlap <= 0 {
+            continue;
+        }
+        if best.is_none_or(|(bd, bo, _)| dist < bd || (dist == bd && overlap > bo)) {
+            best = Some((dist, overlap, i));
+        }
+    }
+    best.map(|(.., i)| i)
+}
+
+pub fn focus_dir(state: &Rc<State>, dir: Dir) {
+    let Some(cur) = focused_window(state) else {
+        return;
+    };
+    let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
+    let mut cands = Vec::new();
+    ws.for_each(|w| {
+        if !Rc::ptr_eq(w, &cur) {
+            cands.push(w.clone());
+        }
+    });
+    let rects: Vec<Rect> = cands.iter().map(|w| w.rect.get()).collect();
+    if let Some(i) = dir_pick(cur.rect.get(), &rects, dir) {
+        focus_window(state, Some(&cands[i]));
+        state.damage.trigger();
+    }
+}
+
+pub fn swap_dir(state: &Rc<State>, dir: Dir) {
+    let Some(cur) = focused_window(state) else {
+        return;
+    };
+    // floats and fullscreen have no tree slot to trade
+    if cur.floating.get() || cur.fullscreen.get() {
+        return;
+    }
+    let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
+    let mut cands = Vec::new();
+    ws.tiling.for_each(|w| {
+        if !Rc::ptr_eq(w, &cur) {
+            cands.push(w.clone());
+        }
+    });
+    let rects: Vec<Rect> = cands.iter().map(|w| w.rect.get()).collect();
+    if let Some(i) = dir_pick(cur.rect.get(), &rects, dir) {
+        if dwindle::swap_windows(&cur, &cands[i]) {
+            relayout(state, &ws);
+            state.damage.trigger();
+        }
+    }
 }
 
 pub(crate) fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {

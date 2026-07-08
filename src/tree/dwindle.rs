@@ -225,6 +225,24 @@ impl Tree {
     }
 }
 
+// -- leaf swap --
+
+/// exchange two windows' leaf slots; the nodes (and so the split
+/// structure) stay put, only the occupants trade places
+pub fn swap_windows(a: &Rc<Window>, b: &Rc<Window>) -> bool {
+    let (Some(na), Some(nb)) = (a.node.borrow().upgrade(), b.node.borrow().upgrade()) else {
+        return false;
+    };
+    if Rc::ptr_eq(&na, &nb) {
+        return false;
+    }
+    *na.kind.borrow_mut() = Kind::Leaf(b.clone());
+    *nb.kind.borrow_mut() = Kind::Leaf(a.clone());
+    *a.node.borrow_mut() = Rc::downgrade(&nb);
+    *b.node.borrow_mut() = Rc::downgrade(&na);
+    true
+}
+
 // -- split ratio control --
 
 /// one boundary step: pointer delta over the split span, clamped

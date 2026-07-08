@@ -7,16 +7,30 @@ use serde::{Deserialize, Serialize};
 
 // action names double as the ipc vocabulary; every bind has a wire twin
 // by construction
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
     Workspace(usize),
+    /// signed jump from the active workspace, wrapping
+    WorkspaceRel(i32),
     SendToWorkspace(usize),
+    MoveToWorkspace(usize),
     ToggleFullscreen,
     ToggleFloating,
     CloseWindow,
     FocusNext,
     FocusPrev,
+    FocusDir(Dir),
+    SwapDir(Dir),
     /// nudge the focused window's parent split; signed fraction of the span
     SplitRatio(f64),
     Spawn(String),
@@ -962,16 +976,20 @@ fn parse_bind(node: &KdlNode, src: &str) -> Result<Option<Bind>, String> {
                 .ok_or_else(|| at(node, src, "exec needs a command"))?,
         ),
         "workspace" => {
-            // "+1"/"-1" relative jumps parse but aren't built yet
-            if args.get(3).is_some_and(|a| a.starts_with(['+', '-'])) {
-                eprintln!(
-                    "carrot: config: relative workspace navigation not implemented yet, bind ignored"
-                );
-                return Ok(None);
+            // "+1"/"-1" (an optional leading "r" is accepted) jumps relative
+            let rel = args
+                .get(3)
+                .map(|a| a.strip_prefix('r').unwrap_or(a))
+                .filter(|a| a.starts_with(['+', '-']));
+            match rel {
+                Some(r) => Action::WorkspaceRel(r.parse::<i32>().map_err(|_| {
+                    at(node, src, "relative workspace wants \"+N\" or \"-N\"")
+                })?),
+                None => Action::Workspace(ws_arg()?),
             }
-            Action::Workspace(ws_arg()?)
         }
-        "movetoworkspace" | "send-to-workspace" => Action::SendToWorkspace(ws_arg()?),
+        "movetoworkspace" | "move-to-workspace" => Action::MoveToWorkspace(ws_arg()?),
+        "sendtoworkspace" | "send-to-workspace" => Action::SendToWorkspace(ws_arg()?),
         "close" | "close-window" => Action::CloseWindow,
         "fullscreen" | "fullscreen-bordered" | "fullscreen-borderless" | "toggle-fullscreen" => {
             Action::ToggleFullscreen
@@ -979,6 +997,17 @@ fn parse_bind(node: &KdlNode, src: &str) -> Result<Option<Bind>, String> {
         "float" | "toggle-floating" => Action::ToggleFloating,
         "focus-next" => Action::FocusNext,
         "focus-prev" => Action::FocusPrev,
+        "focus-left" => Action::FocusDir(Dir::Left),
+        "focus-right" => Action::FocusDir(Dir::Right),
+        "focus-up" => Action::FocusDir(Dir::Up),
+        "focus-down" => Action::FocusDir(Dir::Down),
+        "swap-left" => Action::SwapDir(Dir::Left),
+        "swap-right" => Action::SwapDir(Dir::Right),
+        "swap-up" => Action::SwapDir(Dir::Up),
+        "swap-down" => Action::SwapDir(Dir::Down),
+        // two-arg spelling: `"focus" "left"`
+        "focus" => Action::FocusDir(dir_arg(&args, node, src)?),
+        "swap" => Action::SwapDir(dir_arg(&args, node, src)?),
         "split-ratio" => Action::SplitRatio(
             args.get(3)
                 .and_then(|a| a.parse::<f64>().ok())
@@ -986,7 +1015,7 @@ fn parse_bind(node: &KdlNode, src: &str) -> Result<Option<Bind>, String> {
         ),
         "quit" => Action::Quit,
         // the rest of the dispatcher set; recognized so configs keep parsing
-        known @ ("screenshot" | "focus" | "move" | "swap" | "resize"
+        known @ ("screenshot" | "move" | "resize"
         | "center" | "pin" | "toggle-group" | "group-next" | "group-prev"
         | "special" | "workspace-group" | "submap") => {
             eprintln!("carrot: config: bind action \"{known}\" not implemented yet, ignored");
@@ -995,6 +1024,16 @@ fn parse_bind(node: &KdlNode, src: &str) -> Result<Option<Bind>, String> {
         other => return Err(at(node, src, &format!("unknown action \"{other}\""))),
     };
     Ok(Some(Bind { mods, key, action, kind }))
+}
+
+fn dir_arg(args: &[String], node: &KdlNode, src: &str) -> Result<Dir, String> {
+    match args.get(3).map(String::as_str) {
+        Some("left" | "l") => Ok(Dir::Left),
+        Some("right" | "r") => Ok(Dir::Right),
+        Some("up" | "u") => Ok(Dir::Up),
+        Some("down" | "d") => Ok(Dir::Down),
+        _ => Err(at(node, src, "direction is left, right, up or down")),
+    }
 }
 
 fn parse_mods(spec: &str) -> Result<u32, String> {
@@ -1140,6 +1179,12 @@ mod tests {
         assert_eq!(j, "\"toggle-fullscreen\"");
         let j = serde_json::to_string(&Action::SplitRatio(-0.1)).unwrap();
         assert_eq!(j, "{\"split-ratio\":-0.1}");
+        let j = serde_json::to_string(&Action::WorkspaceRel(-1)).unwrap();
+        assert_eq!(j, "{\"workspace-rel\":-1}");
+        let j = serde_json::to_string(&Action::FocusDir(Dir::Left)).unwrap();
+        assert_eq!(j, "{\"focus-dir\":\"left\"}");
+        let j = serde_json::to_string(&Action::SwapDir(Dir::Down)).unwrap();
+        assert_eq!(j, "{\"swap-dir\":\"down\"}");
     }
 
     #[test]

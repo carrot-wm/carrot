@@ -150,7 +150,9 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
 pub fn dispatch_action(state: &Rc<State>, action: &Action) {
     match action {
         Action::Workspace(n) => crate::tree::switch_workspace(state, *n),
-        Action::SendToWorkspace(n) => crate::tree::send_to_workspace(state, *n),
+        Action::WorkspaceRel(d) => crate::tree::switch_workspace_rel(state, *d),
+        Action::SendToWorkspace(n) => crate::tree::send_to_workspace(state, *n, false),
+        Action::MoveToWorkspace(n) => crate::tree::send_to_workspace(state, *n, true),
         Action::ToggleFullscreen => {
             if let Some(win) = crate::tree::focused_window(state) {
                 let on = !win.fullscreen.get();
@@ -170,6 +172,8 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
         }
         Action::FocusNext => crate::tree::focus_cycle(state, 1),
         Action::FocusPrev => crate::tree::focus_cycle(state, -1),
+        Action::FocusDir(d) => crate::tree::focus_dir(state, *d),
+        Action::SwapDir(d) => crate::tree::swap_dir(state, *d),
         Action::SplitRatio(d) => {
             if let Some(win) = crate::tree::focused_window(state) {
                 if !win.floating.get()

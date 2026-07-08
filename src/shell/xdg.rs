@@ -1633,6 +1633,35 @@ mod tests {
     }
 
     #[test]
+    fn swap_trades_leaf_slots_and_rects() {
+        let (state, client, s1, x1, t1) = setup();
+        map(&state, &client, &s1, &x1, 20);
+        let base = mk_base(&client, 31);
+        let (s2, x2, t2) = mk_toplevel(&client, &base, 11, 41, 51);
+        map(&state, &client, &s2, &x2, 21);
+        let (w1, w2) = (
+            t1.window.borrow().clone().unwrap(),
+            t2.window.borrow().clone().unwrap(),
+        );
+        let (r1, r2) = (w1.rect.get(), w2.rect.get());
+        assert_ne!(r1, r2);
+        let ws = crate::tree::active(&state);
+        assert!(crate::tree::dwindle::swap_windows(&w1, &w2));
+        crate::tree::relayout(&state, &ws);
+        assert_eq!(w1.rect.get(), r2, "windows traded tiles");
+        assert_eq!(w2.rect.get(), r1);
+        // swapping back restores the layout; self-swap is refused
+        assert!(crate::tree::dwindle::swap_windows(&w1, &w2));
+        crate::tree::relayout(&state, &ws);
+        assert_eq!(w1.rect.get(), r1);
+        assert!(!crate::tree::dwindle::swap_windows(&w1, &w1));
+        // removal still works through the swapped backpointers
+        ws.tiling.remove(&w2);
+        crate::tree::relayout(&state, &ws);
+        assert_eq!(w1.rect.get().width(), r1.width() + r2.width());
+    }
+
+    #[test]
     fn unmap_resets_the_configure_cycle() {
         let (state, client, s, xdg, tl) = setup();
         map(&state, &client, &s, &xdg, 20);
