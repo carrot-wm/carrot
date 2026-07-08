@@ -47,6 +47,8 @@ pub struct SeatGlobal {
     /// serial of the most recent button press; drag/move grabs validate on it
     last_press_serial: Cell<u32>,
     remap_held: RefCell<HashMap<u32, u32>>,
+    /// a release bind is armed on press, disarmed by any other press
+    armed_release: RefCell<Option<(u32, crate::config::Action)>>,
     // clipboard state rides on the seat: devices, sources, selection
     pub data: crate::protocol::data_device::DataDevices,
     pub primary: crate::protocol::primary_selection::PrimaryDevices,
@@ -80,6 +82,7 @@ impl SeatGlobal {
             ptr_buttons: RefCell::new(Vec::new()),
             last_press_serial: Cell::new(0),
             remap_held: RefCell::new(HashMap::new()),
+            armed_release: RefCell::new(None),
             data: Default::default(),
             primary: Default::default(),
             data_control: Default::default(),
@@ -138,6 +141,20 @@ impl SeatGlobal {
     /// v10+ got rate=0 and rely on us for Repeated; v4-9 repeat client-side
     fn repeat_fire(&self, state: &Rc<State>, key: u32) {
         const REPEATED: u32 = 2;
+        {
+            const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
+            let held_mods = self.mods.get().depressed & MASK;
+            let cfg = state.config.borrow().clone();
+            let hit = cfg.binds.iter().find(|b| {
+                matches!(b.kind, crate::config::BindKind::Repeat)
+                    && b.mods == held_mods
+                    && b.key == key
+            });
+            if let Some(b) = hit {
+                crate::ipc::dispatch_action(state, &b.action);
+                return;
+            }
+        }
         let focus = self.kb_focus.borrow().clone();
         let Some(surface) = focus.filter(|s| !s.destroyed.get()) else {
             self.cancel_repeat();
@@ -535,15 +552,44 @@ impl SeatGlobal {
             // hardcoded above so a broken config can't strand the seat
             let cfg = state.config.borrow().clone();
             use crate::config::BindKind;
+            // a press of anything else disarms a waiting release bind
+            let mut armed = None;
             for b in cfg.binds.iter() {
                 if held_mods == b.mods && key == b.key {
-                    // release and mouse binds wait for their own dispatch paths
-                    if matches!(b.kind, BindKind::Release | BindKind::Mouse) {
-                        continue;
+                    match b.kind {
+                        BindKind::Mouse => continue,
+                        BindKind::Release => {
+                            armed = Some((key, b.action.clone()));
+                            continue;
+                        }
+                        BindKind::Repeat => {
+                            // re-fires from the repeat loop while held
+                            self.arm_repeat(key);
+                            return KeyAction::Act(b.action.clone());
+                        }
+                        // lock-safe fires like press until a session lock exists
+                        BindKind::Press | BindKind::LockSafe => {
+                            self.cancel_repeat();
+                            return KeyAction::Act(b.action.clone());
+                        }
                     }
-                    self.cancel_repeat();
-                    return KeyAction::Act(b.action.clone());
                 }
+            }
+            *self.armed_release.borrow_mut() = armed;
+        } else {
+            // the armed key came back up: fire, once
+            let hit = {
+                let mut slot = self.armed_release.borrow_mut();
+                match slot.take() {
+                    Some((k, act)) if k == key => Some(act),
+                    other => {
+                        *slot = other;
+                        None
+                    }
+                }
+            };
+            if let Some(act) = hit {
+                return KeyAction::Act(act);
             }
         }
 
@@ -977,6 +1023,21 @@ impl SeatGlobal {
                         super::focus::set_keyboard_focus(state, self, Some(root));
                     }
                 }
+            }
+        }
+        // mouse binds: evdev button code in the key slot, kb mods held
+        if pressed {
+            const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
+            let held_mods = self.mods.get().depressed & MASK;
+            let cfg = state.config.borrow().clone();
+            let hit = cfg.binds.iter().find(|b| {
+                matches!(b.kind, crate::config::BindKind::Mouse)
+                    && b.mods == held_mods
+                    && b.key == button
+            });
+            if let Some(b) = hit {
+                crate::ipc::dispatch_action(state, &b.action);
+                return;
             }
         }
         let Some(surface) = focus.filter(|s| !s.destroyed.get()) else {
