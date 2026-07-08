@@ -1,9 +1,9 @@
-// carrotctl - talk to the compositor over its json socket.
+// burrow - talk to the compositor over its json socket.
 //
-//   carrotctl workspace 3          carrotctl windows
-//   carrotctl spawn "foot"         carrotctl workspaces
-//   carrotctl toggle-fullscreen    carrotctl reload
-//   carrotctl close-window         carrotctl subscribe
+//   burrow workspace 3          burrow windows
+//   burrow spawn "foot"         burrow workspaces
+//   burrow toggle-fullscreen    burrow reload
+//   burrow close-window         burrow subscribe
 //
 // one request per line in, one json reply per line out; subscribe streams
 // events until killed.
@@ -34,7 +34,7 @@ fn socket_path() -> Option<std::path::PathBuf> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: carrotctl <command>\n\
+        "usage: burrow <command>\n\
          actions:  workspace N | send-to-workspace N | toggle-fullscreen |\n\
                    toggle-floating | close-window | focus-next | focus-prev | spawn CMD.. | quit\n\
          queries:  workspaces | windows\n\
@@ -69,13 +69,13 @@ fn main() {
         _ => usage(),
     };
     let Some(path) = socket_path() else {
-        eprintln!("carrotctl: no carrot socket found (is carrot running?)");
+        eprintln!("burrow: no carrot socket found (is carrot running?)");
         std::process::exit(1);
     };
     let mut stream = match UnixStream::connect(&path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("carrotctl: {}: {e}", path.display());
+            eprintln!("burrow: {}: {e}", path.display());
             std::process::exit(1);
         }
     };
