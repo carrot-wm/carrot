@@ -7,8 +7,8 @@
 // committed buffer on its paired wl surface. override-redirect windows
 // go straight to the float stack and place themselves.
 
-use crate::carrotconx::conn::{Xcon, XconError};
-use crate::carrotconx::wire;
+use crate::xparsnip::conn::{Parsnip, ParsnipError};
+use crate::xparsnip::wire;
 use crate::engine::SpawnedFuture;
 use crate::protocol::data_device::{SelectionSource, same_source};
 use crate::rect::Rect;
@@ -54,7 +54,7 @@ const FETCH_TIMEOUT_NS: u64 = 5_000_000_000;
 struct Xwm {
     state: Rc<State>,
     xw: Rc<Xwayland>,
-    c: Rc<Xcon>,
+    c: Rc<Parsnip>,
     atoms: Rc<XAtoms>,
     // xwayland's own pairing atoms
     wl_surface_serial: u32,
@@ -147,17 +147,17 @@ const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
 const NORMAL_STATE: u32 = 1;
 const WITHDRAWN_STATE: u32 = 0;
 
-pub async fn run(state: Rc<State>, xw: Rc<Xwayland>, xcon: Rc<Xcon>) {
-    if let Err(e) = bring_up(&xcon).await {
+pub async fn run(state: Rc<State>, xw: Rc<Xwayland>, parsnip: Rc<Parsnip>) {
+    if let Err(e) = bring_up(&parsnip).await {
         eprintln!("carrot: xwm bring-up failed: {e}");
         return;
     }
     let (atoms, wl_surface_serial, wl_surface_id) = {
         let a = async {
-            Ok::<_, XconError>((
-                intern_atoms(&xcon).await?,
-                xcon.intern("WL_SURFACE_SERIAL").await?,
-                xcon.intern("WL_SURFACE_ID").await?,
+            Ok::<_, ParsnipError>((
+                intern_atoms(&parsnip).await?,
+                parsnip.intern("WL_SURFACE_SERIAL").await?,
+                parsnip.intern("WL_SURFACE_ID").await?,
             ))
         };
         match a.await {
@@ -172,21 +172,21 @@ pub async fn run(state: Rc<State>, xw: Rc<Xwayland>, xcon: Rc<Xcon>) {
     *xw.atoms.borrow_mut() = Some(atoms.clone());
     let (sel_atoms, cb_props, prim_props) = {
         let a = async {
-            Ok::<_, XconError>((
+            Ok::<_, ParsnipError>((
                 SelAtoms {
-                    clipboard: xcon.intern("CLIPBOARD").await?,
-                    targets: xcon.intern("TARGETS").await?,
-                    text: xcon.intern("TEXT").await?,
-                    incr: xcon.intern("INCR").await?,
+                    clipboard: parsnip.intern("CLIPBOARD").await?,
+                    targets: parsnip.intern("TARGETS").await?,
+                    text: parsnip.intern("TEXT").await?,
+                    incr: parsnip.intern("INCR").await?,
                     utf8: atoms.utf8_string,
                 },
                 (
-                    xcon.intern("_CARROT_CLIPBOARD_TARGETS").await?,
-                    xcon.intern("_CARROT_CLIPBOARD").await?,
+                    parsnip.intern("_CARROT_CLIPBOARD_TARGETS").await?,
+                    parsnip.intern("_CARROT_CLIPBOARD").await?,
                 ),
                 (
-                    xcon.intern("_CARROT_PRIMARY_TARGETS").await?,
-                    xcon.intern("_CARROT_PRIMARY").await?,
+                    parsnip.intern("_CARROT_PRIMARY_TARGETS").await?,
+                    parsnip.intern("_CARROT_PRIMARY").await?,
                 ),
             ))
         };
@@ -199,19 +199,19 @@ pub async fn run(state: Rc<State>, xw: Rc<Xwayland>, xcon: Rc<Xcon>) {
         }
     };
     // the selection window fields conversions and watches both selections
-    let selwin = xcon.alloc_xid();
-    xcon.send(|b| {
-        wire::create_window(b, 0, selwin, xcon.root, -1, -1, 1, 1, 0, INPUT_ONLY, 0, &[])
+    let selwin = parsnip.alloc_xid();
+    parsnip.send(|b| {
+        wire::create_window(b, 0, selwin, parsnip.root, -1, -1, 1, 1, 0, INPUT_ONLY, 0, &[])
     });
-    let xfixes = xcon.ext.borrow().as_ref().map(|e| e.xfixes).unwrap_or(0);
+    let xfixes = parsnip.ext.borrow().as_ref().map(|e| e.xfixes).unwrap_or(0);
     for sel in [sel_atoms.clipboard, PRIMARY] {
-        xcon.send(|b| wire::xfixes_select_selection_input(b, xfixes, selwin, sel, SEL_EVENTS));
+        parsnip.send(|b| wire::xfixes_select_selection_input(b, xfixes, selwin, sel, SEL_EVENTS));
     }
     println!("carrot: xwm managing :{}", xw.display);
     let wm = Xwm {
         state,
         xw: xw.clone(),
-        c: xcon,
+        c: parsnip,
         atoms,
         wl_surface_serial,
         wl_surface_id,
@@ -263,7 +263,7 @@ async fn pop_or_timeout(
     .await
 }
 
-async fn intern_atoms(c: &Rc<Xcon>) -> Result<XAtoms, XconError> {
+async fn intern_atoms(c: &Rc<Parsnip>) -> Result<XAtoms, ParsnipError> {
     Ok(XAtoms {
         wm_protocols: c.intern("WM_PROTOCOLS").await?,
         wm_delete_window: c.intern("WM_DELETE_WINDOW").await?,
@@ -297,7 +297,7 @@ impl Xwm {
             E::CreateNotify { window, x, y, width, height, override_redirect, .. } => {
                 let xwin = Rc::new(XWindow {
                     xid: window,
-                    xcon: self.c.clone(),
+                    parsnip: self.c.clone(),
                     override_redirect: Cell::new(override_redirect),
                     x_mapped: Cell::new(false),
                     serial: Cell::new(0),
@@ -1132,7 +1132,7 @@ impl Xwm {
     }
 }
 
-async fn bring_up(c: &Rc<Xcon>) -> Result<(), XconError> {
+async fn bring_up(c: &Rc<Parsnip>) -> Result<(), ParsnipError> {
     let composite = c.ext.borrow().as_ref().map(|e| e.composite).unwrap_or(0);
     let xfixes = c.ext.borrow().as_ref().map(|e| e.xfixes).unwrap_or(0);
 

@@ -6,7 +6,7 @@ mod auth;
 pub mod conn;
 pub mod wire;
 
-// dev diagnostic (`carrot xcon-probe`): connect to the session's running
+// dev diagnostic (`carrot xparsnip-probe`): connect to the session's running
 // x server as a plain client and exercise the whole request pipeline.
 pub fn probe() -> i32 {
     use crate::engine::{Engine, Wheel};
@@ -44,7 +44,7 @@ pub fn probe() -> i32 {
     let st = status.clone();
     let eng = engine.clone();
     let rng = ring.clone();
-    let task = engine.spawn("xcon probe", async move {
+    let task = engine.spawn("parsnip probe", async move {
         let run = async {
             use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, socket};
             let path = format!("/tmp/.X11-unix/X{display}");
@@ -64,7 +64,7 @@ pub fn probe() -> i32 {
                     (b"", Vec::new())
                 }
             };
-            let c = conn::Xcon::connect(&eng, &rng, fd, name, &data)
+            let c = conn::Parsnip::connect(&eng, &rng, fd, name, &data)
                 .await
                 .map_err(|e| format!("connect: {e}"))?;
             println!("-> setup ok: root {:#x} depth {}", c.root, c.root_depth);
@@ -114,6 +114,12 @@ pub fn probe() -> i32 {
                         &[(1, 0x00ff8000)],
                     )
                 });
+                // WM_CLASS is predefined atom 67, WM_NAME 39; set both plus
+                // a utf8 _NET_WM_NAME so the wm has real strings to track
+                let net_wm_name = c.intern("_NET_WM_NAME").await.map_err(|e| e.to_string())?;
+                let utf8 = c.intern("UTF8_STRING").await.map_err(|e| e.to_string())?;
+                c.send(|b| wire::change_property(b, 0, win, 67, 31, 8, b"xprobe\0XProbe\0"));
+                c.send(|b| wire::change_property(b, 0, win, net_wm_name, utf8, 8, b"carrot x probe"));
                 c.send(|b| wire::map_window(b, win));
                 c.call(|b| wire::get_input_focus(b))
                     .await

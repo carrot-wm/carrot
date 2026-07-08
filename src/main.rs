@@ -26,7 +26,7 @@ mod render;
 mod spike;
 
 // the rest
-mod carrotconx;
+mod xparsnip;
 mod config;
 mod dbus;
 mod ei;
@@ -98,8 +98,8 @@ fn main() {
     if std::env::args().any(|a| a == "input-probe") {
         std::process::exit(input::probe());
     }
-    if std::env::args().any(|a| a == "xcon-probe") {
-        std::process::exit(carrotconx::probe());
+    if std::env::args().any(|a| a == "xparsnip-probe") {
+        std::process::exit(xparsnip::probe());
     }
 
     if let Err(e) = run() {
@@ -144,19 +144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.globals.add(std::rc::Rc::new(surface::WlCompositorGlobal));
     state.globals.add(std::rc::Rc::new(surface::WlSubcompositorGlobal));
     state.globals.add(std::rc::Rc::new(protocol::shm::WlShmGlobal));
-    state
-        .globals
-        .add(std::rc::Rc::new(protocol::data_control::DataControlManagerGlobal));
     state.globals.add(std::rc::Rc::new(protocol::dmabuf::DmabufGlobal));
-    state
-        .globals
-        .add(std::rc::Rc::new(protocol::tearing::TearingManagerGlobal));
-    state
-        .globals
-        .add(std::rc::Rc::new(protocol::relative_pointer::RelativePointerManagerGlobal));
-    state.globals.add(std::rc::Rc::new(
-        protocol::pointer_constraints::PointerConstraintsGlobal,
-    ));
     state.globals.add(std::rc::Rc::new(shell::xdg::XdgWmBaseGlobal));
     state
         .globals
@@ -178,10 +166,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .add(std::rc::Rc::new(xwayland::XwaylandShellGlobal));
     state
         .globals
+        .add(std::rc::Rc::new(protocol::tearing::TearingManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::relative_pointer::RelativePointerManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::screencopy::ScreencopyManagerGlobal));
+    state.globals.add(std::rc::Rc::new(
+        protocol::pointer_constraints::PointerConstraintsGlobal,
+    ));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::data_control::DataControlManagerGlobal));
+    state
+        .globals
         .add(std::rc::Rc::new(protocol::foreign_toplevel::ForeignToplevelGlobal));
     state
         .globals
         .add(std::rc::Rc::new(protocol::foreign_toplevel_list::ForeignToplevelListGlobal));
+    // the source managers and the copy-capture manager ship together:
+    // clients gate on the source manager and then use the consumer blind
     state
         .globals
         .add(std::rc::Rc::new(protocol::image_copy_capture::OutputSourceManagerGlobal));
@@ -191,9 +196,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::image_copy_capture::IccManagerGlobal));
-    state
-        .globals
-        .add(std::rc::Rc::new(protocol::screencopy::ScreencopyManagerGlobal));
     state
         .globals
         .add(std::rc::Rc::new(protocol::idle::IdleNotifierGlobal));
@@ -257,9 +259,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let display = output::start(&st, session.as_ref()).await;
-        if let Some(d) = &display {
-            st.globals.add(std::rc::Rc::new(d.output_global()));
-        }
         if let Some(s) = &session {
             *st.input.borrow_mut() = Some(input::start(&st, s).await);
         }

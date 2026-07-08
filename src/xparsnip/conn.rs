@@ -16,18 +16,18 @@ use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
-pub enum XconError {
+pub enum ParsnipError {
     Dead,
     Setup(String),
     Error(u8, u8),
 }
 
-impl fmt::Display for XconError {
+impl fmt::Display for ParsnipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            XconError::Dead => write!(f, "connection dead"),
-            XconError::Setup(e) => write!(f, "setup failed: {e}"),
-            XconError::Error(code, major) => {
+            ParsnipError::Dead => write!(f, "connection dead"),
+            ParsnipError::Setup(e) => write!(f, "setup failed: {e}"),
+            ParsnipError::Error(code, major) => {
                 write!(f, "x error Bad{} from request {major}", wire::error_name(*code))
             }
         }
@@ -49,12 +49,12 @@ pub struct Extensions {
 
 struct Slot {
     done: AsyncEvent,
-    val: RefCell<Option<Result<Vec<u8>, XconError>>>,
+    val: RefCell<Option<Result<Vec<u8>, ParsnipError>>>,
     // fence replies get dropped instead of delivered
     discard: bool,
 }
 
-pub struct Xcon {
+pub struct Parsnip {
     ring: Rc<Ring>,
     fd: Rc<OwnedFd>,
     pub root: u32,
@@ -77,7 +77,7 @@ pub struct Xcon {
     tasks: RefCell<Vec<SpawnedFuture<()>>>,
 }
 
-impl Xcon {
+impl Parsnip {
     // fd is already connected (the wm socketpair, or a display socket for
     // the probe); auth is whatever the caller scraped up, usually empty
     pub async fn connect(
@@ -86,34 +86,34 @@ impl Xcon {
         fd: OwnedFd,
         auth_name: &[u8],
         auth_data: &[u8],
-    ) -> Result<Rc<Xcon>, XconError> {
+    ) -> Result<Rc<Parsnip>, ParsnipError> {
         let fd = Rc::new(fd);
         let mut hello = Vec::new();
         wire::encode_setup_request(&mut hello, auth_name, auth_data);
-        write_all(ring, &fd, hello).await.map_err(|e| XconError::Setup(e))?;
+        write_all(ring, &fd, hello).await.map_err(|e| ParsnipError::Setup(e))?;
 
-        let prefix = read_exact(ring, &fd, 8).await.map_err(XconError::Setup)?;
+        let prefix = read_exact(ring, &fd, 8).await.map_err(ParsnipError::Setup)?;
         let more = wire::setup_reply_len(&prefix).unwrap_or(0);
         let mut full = prefix;
-        full.extend(read_exact(ring, &fd, more).await.map_err(XconError::Setup)?);
+        full.extend(read_exact(ring, &fd, more).await.map_err(ParsnipError::Setup)?);
         match full[0] {
             1 => {}
             0 => {
                 let len = full.get(1).copied().unwrap_or(0) as usize;
                 let msg = full.get(8..8 + len).unwrap_or(b"");
-                return Err(XconError::Setup(String::from_utf8_lossy(msg).into_owned()));
+                return Err(ParsnipError::Setup(String::from_utf8_lossy(msg).into_owned()));
             }
-            _ => return Err(XconError::Setup("authenticate is not supported".into())),
+            _ => return Err(ParsnipError::Setup("authenticate is not supported".into())),
         }
         let setup = wire::parse_setup(&full)
-            .ok_or_else(|| XconError::Setup("malformed setup reply".into()))?;
+            .ok_or_else(|| ParsnipError::Setup("malformed setup reply".into()))?;
         let screen = setup
             .screens
             .first()
-            .ok_or_else(|| XconError::Setup("no screens".into()))?;
+            .ok_or_else(|| ParsnipError::Setup("no screens".into()))?;
 
         let inc = setup.resource_id_mask & setup.resource_id_mask.wrapping_neg();
-        let conn = Rc::new(Xcon {
+        let conn = Rc::new(Parsnip {
             ring: ring.clone(),
             fd,
             root: screen.root,
@@ -135,9 +135,9 @@ impl Xcon {
         });
 
         let c = conn.clone();
-        let outgoing = eng.spawn("xcon out", async move { c.outgoing().await });
+        let outgoing = eng.spawn("parsnip out", async move { c.outgoing().await });
         let c = conn.clone();
-        let incoming = eng.spawn("xcon in", async move { c.incoming().await });
+        let incoming = eng.spawn("parsnip in", async move { c.incoming().await });
         conn.tasks.borrow_mut().push(outgoing);
         conn.tasks.borrow_mut().push(incoming);
 
@@ -167,7 +167,7 @@ impl Xcon {
     }
 
     // a request with a reply; resolution is strictly in send order
-    pub async fn call(&self, build: impl FnOnce(&mut Vec<u8>)) -> Result<Vec<u8>, XconError> {
+    pub async fn call(&self, build: impl FnOnce(&mut Vec<u8>)) -> Result<Vec<u8>, ParsnipError> {
         self.call_inner(build, false).await
     }
 
@@ -175,9 +175,9 @@ impl Xcon {
         &self,
         build: impl FnOnce(&mut Vec<u8>),
         discard: bool,
-    ) -> Result<Vec<u8>, XconError> {
+    ) -> Result<Vec<u8>, ParsnipError> {
         if self.dead.get() {
-            return Err(XconError::Dead);
+            return Err(ParsnipError::Dead);
         }
         build(&mut self.out.borrow_mut());
         let serial = self.send_serial.get();
@@ -191,7 +191,7 @@ impl Xcon {
         self.pending.borrow_mut().push_back((serial, slot.clone()));
         self.kick.trigger();
         slot.done.triggered().await;
-        slot.val.borrow_mut().take().unwrap_or(Err(XconError::Dead))
+        slot.val.borrow_mut().take().unwrap_or(Err(ParsnipError::Dead))
     }
 
     async fn outgoing(self: Rc<Self>) {
@@ -243,7 +243,7 @@ impl Xcon {
                 let frame_len = if pending[0] == 1 {
                     let extra = wire::reply_extra_len(&pending);
                     if extra > MAX_REPLY {
-                        eprintln!("carrot: xcon: oversized reply, killing the connection");
+                        eprintln!("carrot: xparsnip: oversized reply, killing the connection");
                         self.kill();
                         return;
                     }
@@ -290,7 +290,7 @@ impl Xcon {
                         true
                     }
                     _ => {
-                        eprintln!("carrot: xcon: reply out of order, killing the connection");
+                        eprintln!("carrot: xparsnip: reply out of order, killing the connection");
                         false
                     }
                 }
@@ -307,12 +307,12 @@ impl Xcon {
                     .is_some_and(|(s, _)| *s == serial);
                 if matches_front {
                     let (_, slot) = self.pending.borrow_mut().pop_front().unwrap();
-                    *slot.val.borrow_mut() = Some(Err(XconError::Error(err.code, err.major)));
+                    *slot.val.borrow_mut() = Some(Err(ParsnipError::Error(err.code, err.major)));
                     slot.done.trigger();
                 } else {
                     // a void request misbehaved; loud but not fatal
                     eprintln!(
-                        "carrot: xcon: Bad{} from void request {} (value {:#x})",
+                        "carrot: xparsnip: Bad{} from void request {} (value {:#x})",
                         wire::error_name(err.code),
                         err.major,
                         err.bad_value
@@ -341,13 +341,13 @@ impl Xcon {
 
     // -- conveniences --
 
-    pub async fn intern(&self, name: &str) -> Result<u32, XconError> {
+    pub async fn intern(&self, name: &str) -> Result<u32, ParsnipError> {
         if let Some(a) = self.atoms.borrow().get(name) {
             return Ok(*a);
         }
         let bytes = name.as_bytes().to_vec();
         let reply = self.call(|b| wire::intern_atom(b, false, &bytes)).await?;
-        let atom = wire::parse_intern_atom(&reply).ok_or(XconError::Dead)?;
+        let atom = wire::parse_intern_atom(&reply).ok_or(ParsnipError::Dead)?;
         if let Entry::Vacant(e) = self.atoms.borrow_mut().entry(name.to_string()) {
             e.insert(atom);
         }
@@ -360,14 +360,14 @@ impl Xcon {
         window: u32,
         property: u32,
         ty: u32,
-    ) -> Result<wire::GetPropertyReply, XconError> {
+    ) -> Result<wire::GetPropertyReply, ParsnipError> {
         let mut acc: Option<wire::GetPropertyReply> = None;
         let mut offset = 0u32;
         loop {
             let reply = self
                 .call(|b| wire::get_property(b, 0, window, property, ty, offset, PROP_CHUNK))
                 .await?;
-            let part = wire::parse_get_property(&reply).ok_or(XconError::Dead)?;
+            let part = wire::parse_get_property(&reply).ok_or(ParsnipError::Dead)?;
             let after = part.bytes_after;
             offset += part.data.len() as u32 / 4;
             match &mut acc {
@@ -380,13 +380,13 @@ impl Xcon {
         }
     }
 
-    async fn bind_extensions(&self) -> Result<(), XconError> {
+    async fn bind_extensions(&self) -> Result<(), ParsnipError> {
         // pipelined: all four queries go out in one batch
         let composite = self.call(|b| wire::query_extension(b, b"Composite"));
         let xfixes = self.call(|b| wire::query_extension(b, b"XFIXES"));
         let render = self.call(|b| wire::query_extension(b, b"RENDER"));
         let res = self.call(|b| wire::query_extension(b, b"X-Resource"));
-        let parse = |r: Vec<u8>| wire::parse_query_extension(&r).ok_or(XconError::Dead);
+        let parse = |r: Vec<u8>| wire::parse_query_extension(&r).ok_or(ParsnipError::Dead);
         let composite = parse(composite.await?)?;
         let xfixes = parse(xfixes.await?)?;
         let render = parse(render.await?)?;
@@ -398,7 +398,7 @@ impl Xcon {
             ("X-Resource", &res),
         ] {
             if !e.present {
-                return Err(XconError::Setup(format!("{name} extension missing")));
+                return Err(ParsnipError::Setup(format!("{name} extension missing")));
             }
         }
         *self.ext.borrow_mut() = Some(Extensions {
@@ -418,7 +418,7 @@ impl Xcon {
         let _ = rustix::net::shutdown(&*self.fd, rustix::net::Shutdown::Both);
         let mut pending = self.pending.borrow_mut();
         while let Some((_, slot)) = pending.pop_front() {
-            *slot.val.borrow_mut() = Some(Err(XconError::Dead));
+            *slot.val.borrow_mut() = Some(Err(ParsnipError::Dead));
             slot.done.trigger();
         }
     }

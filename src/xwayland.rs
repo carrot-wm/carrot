@@ -8,7 +8,7 @@
 
 mod xwm;
 
-use crate::carrotconx::conn::Xcon;
+use crate::xparsnip::conn::Parsnip;
 use crate::client::{Client, ClientError, Object};
 use crate::protocol::data_device::SelectionSource;
 use crate::protocol::globals::Global;
@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 pub struct Xwayland {
     pub display: u32,
-    pub xcon: RefCell<Option<Rc<Xcon>>>,
+    pub parsnip: RefCell<Option<Rc<Parsnip>>>,
     // wl surfaces by their xwayland serial, ready for the wm to pair
     pub serials: RefCell<HashMap<u64, Rc<WlSurface>>>,
     // one queue serializes x events and compositor-side pokes into the wm
@@ -35,7 +35,7 @@ pub struct Xwayland {
 }
 
 pub enum XwmEvent {
-    X(crate::carrotconx::wire::XEvent),
+    X(crate::xparsnip::wire::XEvent),
     // an xwayland surface committed; serial pairing and the map gate
     // both re-evaluate on this
     Commit(u64),
@@ -109,7 +109,7 @@ pub struct XAtoms {
 
 impl Xwayland {
     pub fn clear(&self) {
-        if let Some(x) = self.xcon.borrow_mut().take() {
+        if let Some(x) = self.parsnip.borrow_mut().take() {
             x.clear();
         }
         self.serials.borrow_mut().clear();
@@ -123,7 +123,7 @@ impl Xwayland {
 // WindowKind::X11 once the map gate passes
 pub struct XWindow {
     pub xid: u32,
-    pub xcon: Rc<Xcon>,
+    pub parsnip: Rc<Parsnip>,
     pub override_redirect: Cell<bool>,
     pub x_mapped: Cell<bool>,
     pub serial: Cell<u64>,
@@ -159,8 +159,8 @@ impl XWindow {
     // the tree hands us our slot; x coordinates are compositor-global
     // because the rootless root is the output
     pub fn configure_to(&self, r: crate::rect::Rect) {
-        use crate::carrotconx::wire;
-        self.xcon.send(|b| {
+        use crate::xparsnip::wire;
+        self.parsnip.send(|b| {
             wire::configure_window(
                 b,
                 self.xid,
@@ -176,7 +176,7 @@ impl XWindow {
 
     // WM_DELETE_WINDOW when the client offered it, KillClient otherwise
     pub fn close(&self) {
-        use crate::carrotconx::wire;
+        use crate::xparsnip::wire;
         let Some(a) = self.atoms.borrow().clone() else { return };
         if self.delete_window.get() {
             let ev = wire::encode_client_message(
@@ -185,16 +185,16 @@ impl XWindow {
                 32,
                 &[a.wm_delete_window, 0, 0, 0, 0],
             );
-            self.xcon.send(|b| wire::send_event(b, false, self.xid, 0, &ev));
+            self.parsnip.send(|b| wire::send_event(b, false, self.xid, 0, &ev));
         } else {
-            self.xcon.send(|b| wire::kill_client(b, self.xid));
+            self.parsnip.send(|b| wire::kill_client(b, self.xid));
         }
     }
 
     // icccm focus: WM_TAKE_FOCUS always, real input focus only when the
     // hints ask for it; the root learns the active window either way
     pub fn take_focus(&self) {
-        use crate::carrotconx::wire;
+        use crate::xparsnip::wire;
         let Some(a) = self.atoms.borrow().clone() else { return };
         let mask = if self.input_hint.get() { SUBSTRUCTURE_REDIRECT } else { 0 };
         let ev = wire::encode_client_message(
@@ -203,16 +203,16 @@ impl XWindow {
             32,
             &[a.wm_take_focus, 0, 0, 0, 0],
         );
-        self.xcon.send(|b| wire::send_event(b, false, self.xid, mask, &ev));
+        self.parsnip.send(|b| wire::send_event(b, false, self.xid, mask, &ev));
         if self.input_hint.get() {
-            self.xcon
+            self.parsnip
                 .send(|b| wire::set_input_focus(b, REVERT_TO_POINTER_ROOT, self.xid, 0));
         }
-        self.xcon.send(|b| {
+        self.parsnip.send(|b| {
             wire::change_property(
                 b,
                 0,
-                self.xcon.root,
+                self.parsnip.root,
                 a.net_active_window,
                 XA_WINDOW,
                 32,
@@ -296,7 +296,7 @@ pub async fn run(state: Rc<State>) {
     };
     let xw = Rc::new(Xwayland {
         display: claim.n,
-        xcon: RefCell::new(None),
+        parsnip: RefCell::new(None),
         serials: RefCell::new(HashMap::new()),
         queue: crate::util::AsyncQueue::default(),
         client: RefCell::new(None),
@@ -422,21 +422,21 @@ async fn run_one(state: &Rc<State>, xw: &Rc<Xwayland>, claim: &DisplayClaim) -> 
         }
     }
 
-    let xcon = Xcon::connect(&state.eng, &state.ring, wm_ours, b"", &[])
+    let parsnip = Parsnip::connect(&state.eng, &state.ring, wm_ours, b"", &[])
         .await
         .map_err(|e| format!("wm connect: {e}"))?;
-    *xw.xcon.borrow_mut() = Some(xcon.clone());
+    *xw.parsnip.borrow_mut() = Some(parsnip.clone());
     println!("carrot: xwayland up on :{}", xw.display);
 
     let xw2 = xw.clone();
-    let xc2 = xcon.clone();
+    let xc2 = parsnip.clone();
     let pump = state.eng.spawn("xwm pump", async move {
         loop {
             let ev = xc2.events.pop().await;
             xw2.queue.push(XwmEvent::X(ev));
         }
     });
-    let wm = state.eng.spawn("xwm", xwm::run(state.clone(), xw.clone(), xcon.clone()));
+    let wm = state.eng.spawn("xwm", xwm::run(state.clone(), xw.clone(), parsnip.clone()));
 
     // the pidfd turning readable is the death notice
     let _ = state.ring.readable(&pidfd).await;
@@ -455,7 +455,7 @@ async fn run_one(state: &Rc<State>, xw: &Rc<Xwayland>, claim: &DisplayClaim) -> 
             seat.primary.set_selection_source(state, None);
         }
     }
-    xcon.clear();
+    parsnip.clear();
     if let Some(id) = wl_client_id {
         state.clients.kill(id);
     }
@@ -613,9 +613,8 @@ struct XwaylandExt {
 }
 
 impl SurfaceExt for XwaylandExt {
-    // the serial association becomes real at commit, matching the wm side;
-    // every later commit re-pokes the wm so the map gate can follow the
-    // buffer coming and going
+    // serial pairing goes live at commit; every later commit re-pokes the
+    // wm so the map gate tracks the buffer coming and going
     fn after_apply(&self) {
         let xs = &self.xs;
         let Some(serial) = xs.serial.get() else { return };
