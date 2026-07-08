@@ -1527,8 +1527,9 @@ fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Ve
         Rect { x1: r.x1 - b, y1: r.y1, x2: r.x1, y2: r.y2 },
         Rect { x1: r.x2, y1: r.y1, x2: r.x2 + b, y2: r.y2 },
     ];
-    let fx = |v: i32| v as f32 / out.width as f32 * 2.0 - 1.0;
-    let fy = |v: i32| v as f32 / out.height as f32 * 2.0 - 1.0;
+    let (gx, gy) = out.pos.get();
+    let fx = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fy = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
     for s in sides {
         ops.push(RenderOp::Fill {
             pos: [fx(s.x1), fy(s.y1)],
