@@ -39,6 +39,8 @@ pub struct Connector {
     pub vblank: AsyncEvent,
     pub sequence: Cell<u32>,
     out_fence: Cell<Option<OwnedFd>>,
+    /// tearing is invisible in logs otherwise; announce the first async flip
+    async_announced: Cell<bool>,
     /// reused commit buffer; vecs keep capacity across frames
     change: RefCell<Change>,
 }
@@ -92,6 +94,7 @@ impl Connector {
             modes: RefCell::new(info.modes),
             pipe: RefCell::new(None),
             flip_pending: Cell::new(false),
+            async_announced: Cell::new(false),
             vblank: AsyncEvent::default(),
             sequence: Cell::new(0),
             out_fence: Cell::new(None),
@@ -378,6 +381,43 @@ impl Connector {
             return false;
         };
         pipe.crtc.props.vrr_enabled.is_some() && self.vrr_want.get() != self.vrr_cur.get()
+    }
+
+    /// tearing flip. the kernel only takes an async commit when FB_ID is the
+    /// sole change, so no fences and no cursor ride along - the caller has
+    /// already waited out the render, and cursor changes fall back to flip()
+    pub fn flip_async(&self, dev: &DrmDevice, fb: u32) -> Result<FlipResult, DrmError> {
+        let pipe = self.pipe.borrow();
+        let Some(pipe) = pipe.as_ref() else {
+            return Ok(FlipResult::NotPresented);
+        };
+        if self.flip_pending.get() {
+            return Ok(FlipResult::NotPresented);
+        }
+        let mut ch = self.change.borrow_mut();
+        ch.clear();
+        ch.set(pipe.primary.id, pipe.primary.props.fb_id, fb as u64);
+        let flags = atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT | atomic::PAGE_FLIP_ASYNC;
+        match ch.commit(dev.fd.as_fd(), flags, 0) {
+            Ok(()) => {
+                crate::trace!("async flip queued");
+                if !self.async_announced.replace(true) {
+                    eprintln!("carrot: tearing: async flips active");
+                }
+                self.flip_pending.set(true);
+                Ok(FlipResult::Queued)
+            }
+            Err(Errno::BUSY) => Ok(FlipResult::NotPresented),
+            Err(e) => Err(commit_error(e)),
+        }
+    }
+
+    /// pending cursor plane changes would disqualify an async commit
+    pub fn cursor_changed(&self) -> bool {
+        let pipe = self.pipe.borrow();
+        pipe.as_ref()
+            .and_then(|p| p.cursor.as_ref().map(|c| c.changed()))
+            .unwrap_or(false)
     }
 
     /// rip the cursor off the plane on vt-away while master is still held, so

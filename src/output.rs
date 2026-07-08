@@ -1074,13 +1074,26 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         buf.undefined.set(false);
 
         // render fence into the commit
-        let sync = frame.export_sync_file(&out.renderer).ok();
-        let res = out.conn.flip(
-            &out.dev,
-            buf.fb,
-            sync.as_ref().map(|fd| fd.as_raw_fd()),
-        );
+        let sync = frame.export_sync_file(&out.renderer).ok().map(Rc::new);
         out.conn.vrr_want.set(vrr_wanted(state, out));
+        let res = if tearing_wanted(state, out) && !out.conn.vrr_dirty() {
+            // async commits are FB-only - no fence rides along, so the render
+            // has to be finished before the kernel sees the buffer
+            if let Some(fd) = &sync {
+                let _ = state.ring.readable(fd).await;
+            }
+            match out.conn.flip_async(&out.dev, buf.fb) {
+                // the kernel can reject async for reasons of its own; the
+                // frame still has to land
+                Err(_) => out
+                    .conn
+                    .flip(&out.dev, buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd())),
+                res => res,
+            }
+        } else {
+            out.conn
+                .flip(&out.dev, buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd()))
+        };
         match res {
             Ok(FlipResult::Queued) => {
                 out.front.set(back);
@@ -1105,7 +1118,6 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         // fence fd doubles as the completion signal; drives cleanup + callbacks
         let completed = sync.is_some();
         if let Some(fd) = sync {
-            let fd = Rc::new(fd);
             let _ = state.ring.readable(&fd).await;
         }
         // this frame is done sampling: retired textures can go now (kept
@@ -1197,6 +1209,25 @@ fn vrr_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
             .borrow()
             .get(out.ws.get())
             .is_some_and(|ws| ws.fullscreen.borrow().is_some()),
+    }
+}
+
+/// tear only when the config allows it, the device can, and the fullscreen
+/// surface asked for async presentation; pending cursor changes ride the
+/// sync path so they aren't lost
+fn tearing_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
+    if !out.dev.supports_async_flip || !state.config.borrow().allow_tearing {
+        return false;
+    }
+    if out.conn.cursor_changed() {
+        return false;
+    }
+    let ws = state.workspaces.borrow().get(out.ws.get()).cloned();
+    let fs = ws.and_then(|ws| ws.fullscreen.borrow().clone());
+    match fs {
+        // the client's async hint or a window-rule immediate both qualify
+        Some(w) => w.surface().tearing.get() || w.rule_immediate.get(),
+        None => false,
     }
 }
 

@@ -167,6 +167,8 @@ impl Plane {
 pub struct DrmDevice {
     pub fd: Rc<OwnedFd>,
     pub cursor_size: (u32, u32),
+    /// kernel takes PAGE_FLIP_ASYNC on atomic commits (6.8+); tearing needs it
+    pub supports_async_flip: bool,
     pub crtcs: Vec<Rc<Crtc>>,
     pub planes: Vec<Rc<Plane>>,
     pub connectors: RefCell<Vec<Rc<Connector>>>,
@@ -192,6 +194,8 @@ impl DrmDevice {
             sys::get_cap(fd.as_fd(), sys::CAP_CURSOR_WIDTH).unwrap_or(64) as u32,
             sys::get_cap(fd.as_fd(), sys::CAP_CURSOR_HEIGHT).unwrap_or(64) as u32,
         );
+        let supports_async_flip =
+            sys::get_cap(fd.as_fd(), sys::CAP_ATOMIC_ASYNC_PAGE_FLIP).unwrap_or(0) == 1;
 
         let res = sys::resources(fd.as_fd()).map_err(|e| DrmError::Op("resources", e))?;
         let mut crtcs = Vec::new();
@@ -253,6 +257,7 @@ impl DrmDevice {
         let dev = Rc::new(DrmDevice {
             fd,
             cursor_size,
+            supports_async_flip,
             crtcs,
             planes,
             connectors: RefCell::new(Vec::new()),
