@@ -232,6 +232,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     }
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.apply_input_config(&state);
+    }
     let ipc = match ipc::start(&state, &sock.name) {
         Ok(i) => i,
         Err(e) => {

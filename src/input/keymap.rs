@@ -48,8 +48,25 @@ pub struct Mods {
 }
 
 impl Keymap {
-    /// env-driven (XKB_DEFAULT_*), kdl config later; "us" default
+    /// env-driven (XKB_DEFAULT_*); "us" default
     pub fn new_default() -> Result<Rc<Keymap>, String> {
+        Keymap::new(None)
+    }
+
+    /// a config layout replaces the env layout+variant pair wholesale
+    pub fn new(layout: Option<&str>) -> Result<Rc<Keymap>, String> {
+        let get = |k: &str| std::env::var(k).ok();
+        let rules = get("XKB_DEFAULT_RULES");
+        let model = get("XKB_DEFAULT_MODEL");
+        let options = get("XKB_DEFAULT_OPTIONS");
+        let (layout, variant) = match layout {
+            Some(l) => (l.to_string(), String::new()),
+            None => match get("XKB_DEFAULT_LAYOUT") {
+                Some(l) => (l, get("XKB_DEFAULT_VARIANT").unwrap_or_default()),
+                None => ("us".into(), get("XKB_DEFAULT_VARIANT").unwrap_or_default()),
+            },
+        };
+
         let mut builder = kbvm::xkb::Context::builder();
         let mut found = false;
         if let Ok(root) = std::env::var("XKB_CONFIG_ROOT") {
@@ -70,19 +87,12 @@ impl Keymap {
         }
         if !found {
             // degenerate keymap maps no modifiers; say why
-            return Err(
-                "no xkb data found - set XKB_CONFIG_ROOT (nix: ${xkeyboard-config}/share/X11/xkb)"
-                    .into(),
-            );
+            return Err(format!(
+                "layout \"{layout}\" needs xkb data files - set XKB_CONFIG_ROOT \
+                 (nix: ${{xkeyboard-config}}/share/X11/xkb)"
+            ));
         }
         let context = builder.build();
-
-        let get = |k: &str| std::env::var(k).ok();
-        let rules = get("XKB_DEFAULT_RULES");
-        let model = get("XKB_DEFAULT_MODEL");
-        let layout = get("XKB_DEFAULT_LAYOUT").unwrap_or_else(|| "us".into());
-        let variant = get("XKB_DEFAULT_VARIANT").unwrap_or_default();
-        let options = get("XKB_DEFAULT_OPTIONS");
 
         let groups: Vec<Group<'_>> = Group::from_layouts_and_variants(&layout, &variant).collect();
         let options_vec: Option<Vec<&str>> = options.as_deref().map(|o| o.split(',').collect());
@@ -93,7 +103,10 @@ impl Keymap {
             Some(&groups),
             options_vec.as_deref(),
         );
+        Self::from_keymap(&keymap)
+    }
 
+    fn from_keymap(keymap: &kbvm::xkb::Keymap) -> Result<Rc<Keymap>, String> {
         let mut bytes = keymap.format().to_string().into_bytes();
         bytes.push(0);
         let size = bytes.len() as u32;

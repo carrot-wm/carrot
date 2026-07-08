@@ -25,7 +25,10 @@ const XKB_V1: u32 = 1;
 const REPEATED_SINCE: u32 = 10;
 
 pub struct SeatGlobal {
-    pub keymap: Rc<Keymap>,
+    pub keymap: RefCell<Rc<Keymap>>,
+    /// applied input.layout; None means the env-built boot keymap
+    kb_layout: RefCell<Option<String>>,
+    numlock_done: Cell<bool>,
     pub kb_state: RefCell<KbState>,
     bindings: RefCell<HashMap<ClientId, Vec<Rc<WlSeat>>>>,
     pub kb_focus: RefCell<Option<Rc<WlSurface>>>,
@@ -85,7 +88,9 @@ impl SeatGlobal {
         let keymap = Keymap::new_default()?;
         let kb_state = RefCell::new(keymap.create_state());
         Ok(Rc::new(SeatGlobal {
-            keymap,
+            keymap: RefCell::new(keymap),
+            kb_layout: RefCell::new(None),
+            numlock_done: Cell::new(false),
             kb_state,
             bindings: RefCell::new(HashMap::new()),
             kb_focus: RefCell::new(None),
@@ -111,6 +116,58 @@ impl SeatGlobal {
             relative: RefCell::new(HashMap::new()),
             constraints: RefCell::new(Vec::new()),
         }))
+    }
+
+    /// startup and reload: rebuild for input.layout, latch numlock once,
+    /// push the new keymap to every bound keyboard
+    pub fn apply_input_config(&self, state: &Rc<State>) {
+        let cfg = state.config.borrow().clone();
+        let mut rebuilt = false;
+        if cfg.input.layout != *self.kb_layout.borrow() {
+            match Keymap::new(cfg.input.layout.as_deref()) {
+                Ok(map) => {
+                    *self.kb_state.borrow_mut() = map.create_state();
+                    *self.keymap.borrow_mut() = map;
+                    *self.kb_layout.borrow_mut() = cfg.input.layout.clone();
+                    self.mods.set(Mods::default());
+                    rebuilt = true;
+                }
+                // a bad layout keeps the working keymap; never a dead keyboard
+                Err(e) => eprintln!("carrot: keymap: {e}"),
+            }
+        }
+        if cfg.input.numlock && (rebuilt || !self.numlock_done.get()) {
+            self.latch_numlock();
+        }
+        self.numlock_done.set(true);
+        if rebuilt {
+            self.resend_keymap();
+        }
+    }
+
+    /// one simulated numlock tap on the fresh xkb state locks the modifier
+    fn latch_numlock(&self) {
+        const KEY_NUMLOCK: u32 = 69;
+        let map = self.keymap.borrow().clone();
+        let mut st = self.kb_state.borrow_mut();
+        st.process(&map, KEY_NUMLOCK, true);
+        st.process(&map, KEY_NUMLOCK, false);
+        self.mods.set(st.mods());
+    }
+
+    /// every bound keyboard gets the new fd, then modifiers to resync
+    fn resend_keymap(&self) {
+        let map = self.keymap.borrow().clone();
+        let mods = self.mods.get();
+        for seats in self.bindings.borrow().values() {
+            for seat in seats {
+                for kb in seat.keyboards.borrow().iter() {
+                    kb.send_keymap(&map);
+                    let serial = kb.client.state.next_serial(Some(&kb.client)) as u32;
+                    kb.send_modifiers(serial, mods);
+                }
+            }
+        }
     }
 
     pub fn cancel_repeat(&self) {
@@ -311,7 +368,7 @@ impl wl_seat::Handler for WlSeat {
             version: self.version,
         });
         self.client.add_client_obj(kb.clone())?;
-        kb.send_keymap(&self.global.keymap);
+        kb.send_keymap(&self.global.keymap.borrow());
         if self.version >= wl_keyboard::repeat_info::SINCE {
             // zero rate tells v10+ the server sends Repeated; don't repeat locally
             let (rate, delay) = if self.version >= REPEATED_SINCE {
@@ -545,7 +602,7 @@ impl SeatGlobal {
         let changed = self
             .kb_state
             .borrow_mut()
-            .process(&self.keymap, key, pressed);
+            .process(&self.keymap.borrow(), key, pressed);
         if let Some(mods) = changed {
             self.mods.set(mods);
         }
@@ -646,7 +703,7 @@ impl SeatGlobal {
                 }
             });
             let group = self.mods.get().group;
-            if pressed && self.keymap.repeats(key, group) {
+            if pressed && self.keymap.borrow().repeats(key, group) {
                 self.arm_repeat(key);
             } else if !pressed && self.repeat_key.get() == Some(key) {
                 self.cancel_repeat();

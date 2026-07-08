@@ -500,9 +500,9 @@ impl Conn {
                 self.push(
                     MsgBuilder::new(kbd, 1)
                         .u32(KEYMAP_XKB)
-                        .u32(seat.keymap.size),
+                        .u32(seat.keymap.borrow().size),
                 );
-                self.out_fds.borrow_mut().push(seat.keymap.fd.clone());
+                self.out_fds.borrow_mut().push(seat.keymap.borrow().fd.clone());
             }
         }
         self.push(MsgBuilder::new(dev, 6));
