@@ -174,6 +174,8 @@ pub struct Output {
     /// implicit-sync fences of the dmabufs drawn this frame; the render
     /// submit waits them so client work lands before we sample
     frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
+    /// a vrr config on an incapable panel complains once, not per frame
+    vrr_warned: Cell<bool>,
 }
 
 impl Output {
@@ -249,12 +251,13 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                         .map(|p| p.mode.vrefresh)
                         .unwrap_or(0);
                     eprintln!(
-                        "carrot: output {}: {}x{}@{} at {:?}",
+                        "carrot: output {}: {}x{}@{} at {:?} vrr_capable={}",
                         out.conn.name,
                         out.width,
                         out.height,
                         refresh,
-                        out.pos.get()
+                        out.pos.get(),
+                        out.conn.vrr_capable
                     );
                     outputs.push(out);
                 }
@@ -1013,6 +1016,7 @@ fn init_output(
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
         frame_fences: RefCell::new(Vec::new()),
+        vrr_warned: Cell::new(false),
     })
 }
 
@@ -1076,6 +1080,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             buf.fb,
             sync.as_ref().map(|fd| fd.as_raw_fd()),
         );
+        out.conn.vrr_want.set(vrr_wanted(state, out));
         match res {
             Ok(FlipResult::Queued) => {
                 out.front.set(back);
@@ -1159,6 +1164,40 @@ pub fn clamp_pointer(state: &Rc<State>, x: f64, y: f64) -> (f64, f64) {
         x.clamp(0.0, (w.max(1) - 1) as f64),
         y.clamp(0.0, (h.max(1) - 1) as f64),
     )
+}
+
+/// per-output vrr policy: off unless configured; "always" holds it on,
+/// "automatic" follows a fullscreen window on the active workspace
+fn vrr_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
+    let cfg = state.config.borrow().clone();
+    let mode = cfg
+        .outputs
+        .iter()
+        .find(|o| o.name == out.conn.name)
+        .and_then(|o| o.vrr.as_deref())
+        .unwrap_or("off")
+        .to_string();
+    if mode == "off" {
+        return false;
+    }
+    if !out.conn.vrr_capable {
+        if !out.vrr_warned.replace(true) {
+            eprintln!(
+                "carrot: {}: vrr \"{mode}\" configured but the panel is not vrr capable",
+                out.conn.name
+            );
+        }
+        return false;
+    }
+    match mode.as_str() {
+        "always" => true,
+        // automatic: a fullscreen window is what's on glass
+        _ => state
+            .workspaces
+            .borrow()
+            .get(out.ws.get())
+            .is_some_and(|ws| ws.fullscreen.borrow().is_some()),
+    }
 }
 
 /// paint order tiled, fullscreen, floats; each window drawn as its surface

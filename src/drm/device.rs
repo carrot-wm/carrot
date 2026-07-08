@@ -101,6 +101,8 @@ pub struct CrtcProps {
     pub active: PropId,
     pub mode_id: PropId,
     pub out_fence_ptr: PropId,
+    /// not all drivers expose it; vrr silently stays off without it
+    pub vrr_enabled: Option<PropId>,
 }
 
 pub struct Crtc {
@@ -203,6 +205,7 @@ impl DrmDevice {
                     active: props.require("ACTIVE", id)?,
                     mode_id: props.require("MODE_ID", id)?,
                     out_fence_ptr: props.require("OUT_FENCE_PTR", id)?,
+                    vrr_enabled: props.id("VRR_ENABLED"),
                 },
                 connector: Cell::new(ObjId(0)),
             }));

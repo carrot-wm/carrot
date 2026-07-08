@@ -28,6 +28,10 @@ pub struct Connector {
     pub connected: Cell<bool>,
     /// kernel-style name, "DP-1"; what output config blocks match on
     pub name: String,
+    pub vrr_capable: bool,
+    /// desired vs programmed VRR_ENABLED; flips converge them
+    pub vrr_want: Cell<bool>,
+    vrr_cur: Cell<bool>,
     pub modes: RefCell<Vec<ModeInfo>>,
     pub pipe: RefCell<Option<Pipe>>,
     pub flip_pending: Cell<bool>,
@@ -82,6 +86,9 @@ impl Connector {
             link_status,
             connected: Cell::new(info.connection == 1),
             name,
+            vrr_capable: props.value("vrr_capable") == Some(1),
+            vrr_want: Cell::new(false),
+            vrr_cur: Cell::new(false),
             modes: RefCell::new(info.modes),
             pipe: RefCell::new(None),
             flip_pending: Cell::new(false),
@@ -169,6 +176,9 @@ impl Connector {
         }
         ch.set(pipe.crtc.id, pipe.crtc.props.active, 1);
         ch.set(pipe.crtc.id, pipe.crtc.props.mode_id, blob as u64);
+        if let Some(prop) = pipe.crtc.props.vrr_enabled {
+            ch.set(pipe.crtc.id, prop, self.vrr_want.get() as u64);
+        }
         set_plane(ch, &pipe.primary, pipe.crtc.id, fb, &pipe.mode);
         if let Some(cur) = &pipe.cursor {
             cur.apply(ch, pipe.crtc.id);
@@ -187,6 +197,7 @@ impl Connector {
         if let Some(cur) = &pipe.cursor {
             cur.commit_done();
         }
+        self.vrr_cur.set(self.vrr_want.get());
         pipe.active.set(true);
     }
 
@@ -306,26 +317,51 @@ impl Connector {
         if self.flip_pending.get() {
             return Ok(FlipResult::NotPresented);
         }
+        let build = |out_fd: &mut i32, ch: &mut Change, with_vrr: Option<bool>| {
+            ch.clear();
+            ch.set(
+                pipe.crtc.id,
+                pipe.crtc.props.out_fence_ptr,
+                (out_fd as *mut i32) as usize as u64,
+            );
+            // full plane state every flip: partial updates tickle driver
+            // bugs whose symptom is exactly stripe-corrupted scanout
+            set_plane(ch, &pipe.primary, pipe.crtc.id, fb, &pipe.mode);
+            if let (Some(prop), Some(fence)) = (pipe.primary.props.in_fence_fd, in_fence) {
+                ch.set(pipe.primary.id, prop, fence as u64);
+            }
+            if let Some(cur) = &pipe.cursor {
+                cur.apply(ch, pipe.crtc.id);
+            }
+            if let (Some(prop), Some(on)) = (pipe.crtc.props.vrr_enabled, with_vrr) {
+                ch.set(pipe.crtc.id, prop, on as u64);
+            }
+        };
+        // vrr rides the flip where drivers allow it; if they call it a
+        // modeset instead, retry once without so the frame still lands
+        let vrr = self.vrr_dirty().then(|| self.vrr_want.get());
         let mut out_fd: i32 = -1;
         let mut ch = self.change.borrow_mut();
-        ch.clear();
-        ch.set(
-            pipe.crtc.id,
-            pipe.crtc.props.out_fence_ptr,
-            (&raw mut out_fd) as usize as u64,
-        );
-        ch.set(pipe.primary.id, pipe.primary.props.fb_id, fb as u64);
-        if let (Some(prop), Some(fence)) = (pipe.primary.props.in_fence_fd, in_fence) {
-            ch.set(pipe.primary.id, prop, fence as u64);
+        build(&mut out_fd, &mut ch, vrr);
+        let mut res = ch.commit(dev.fd.as_fd(), atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT, 0);
+        let mut vrr_applied = vrr;
+        if res.is_err() && vrr.is_some() && !matches!(res, Err(Errno::BUSY)) {
+            build(&mut out_fd, &mut ch, None);
+            res = ch.commit(dev.fd.as_fd(), atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT, 0);
+            vrr_applied = None;
+            if res.is_ok() {
+                eprintln!("carrot: {}: vrr change needs a modeset on this driver", self.name);
+            }
         }
-        if let Some(cur) = &pipe.cursor {
-            cur.apply(&mut ch, pipe.crtc.id);
-        }
-        match ch.commit(dev.fd.as_fd(), atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT, 0) {
+        match res {
             Ok(()) => {
                 self.take_out_fence(out_fd);
                 if let Some(cur) = &pipe.cursor {
                     cur.commit_done();
+                }
+                if let Some(on) = vrr_applied {
+                    self.vrr_cur.set(on);
+                    eprintln!("carrot: {}: vrr {}", self.name, if on { "on" } else { "off" });
                 }
                 self.flip_pending.set(true);
                 Ok(FlipResult::Queued)
@@ -333,6 +369,15 @@ impl Connector {
             Err(Errno::BUSY) => Ok(FlipResult::NotPresented),
             Err(e) => Err(commit_error(e)),
         }
+    }
+
+    /// the next flip must carry a VRR_ENABLED change (so it can't be async)
+    pub fn vrr_dirty(&self) -> bool {
+        let pipe = self.pipe.borrow();
+        let Some(pipe) = pipe.as_ref() else {
+            return false;
+        };
+        pipe.crtc.props.vrr_enabled.is_some() && self.vrr_want.get() != self.vrr_cur.get()
     }
 
     /// rip the cursor off the plane on vt-away while master is still held, so
