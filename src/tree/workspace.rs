@@ -1,11 +1,13 @@
 // workspaces own their tree and float stack; switching goes through set_focus.
 
 use super::{Window, dwindle};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[derive(Default)]
 pub struct Workspace {
+    /// the output slot this workspace lives on
+    pub output: Cell<usize>,
     pub tiling: dwindle::Tree,
     /// z order: last is topmost
     pub floats: RefCell<Vec<Rc<Window>>>,

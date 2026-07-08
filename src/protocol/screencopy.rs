@@ -48,8 +48,8 @@ impl ScreencopyManager {
         region: Option<(i32, i32, i32, i32)>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let c = &self.client;
-        let _ = output;
-        let geo = crate::output::output_geometry(&c.state);
+        let name = c.objects.output(output).map(|o| o.name.clone());
+        let geo = name.and_then(|n| crate::output::output_geometry(&c.state, &n));
         let frame = Rc::new(ScreencopyFrame {
             id,
             client: c.clone(),

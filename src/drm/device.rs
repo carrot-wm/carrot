@@ -50,7 +50,7 @@ impl std::error::Error for DrmError {}
 // -- properties --
 
 pub struct PropSet {
-    map: HashMap<String, (u32, u64)>,
+    map: HashMap<String, (u32, u64, Vec<u64>, Vec<sys::PropertyEnum>)>,
 }
 
 impl PropSet {
@@ -61,17 +61,32 @@ impl PropSet {
         for (prop, value) in raw {
             let meta = sys::property_meta(fd, prop)
                 .map_err(|e| DrmError::ObjOp("property meta", prop, e))?;
-            map.insert(meta.name, (prop, value));
+            map.insert(meta.name, (prop, value, meta.values, meta.enums));
         }
         Ok(PropSet { map })
     }
 
     pub fn id(&self, name: &str) -> Option<PropId> {
-        self.map.get(name).map(|(id, _)| PropId(*id))
+        self.map.get(name).map(|(id, ..)| PropId(*id))
     }
 
     pub fn value(&self, name: &str) -> Option<u64> {
-        self.map.get(name).map(|(_, v)| *v)
+        self.map.get(name).map(|(_, v, ..)| *v)
+    }
+
+    /// [min, max] of a RANGE property
+    pub fn range(&self, name: &str) -> Option<(u64, u64)> {
+        self.map.get(name).and_then(|(_, _, vals, _)| match vals.as_slice() {
+            [min, max, ..] => Some((*min, *max)),
+            _ => None,
+        })
+    }
+
+    /// numeric value of an ENUM entry, by name
+    pub fn enum_value(&self, prop: &str, entry: &str) -> Option<u64> {
+        self.map.get(prop).and_then(|(.., enums)| {
+            enums.iter().find(|e| e.name() == entry).map(|e| e.value())
+        })
     }
 
     pub fn require(&self, name: &str, obj: ObjId) -> Result<PropId, DrmError> {
@@ -254,11 +269,124 @@ impl DrmDevice {
 
     /// greedy first-fit over every connected, unassigned connector; errors on
     /// the first that can't be satisfied - no partial silent skips
-    pub fn assign_pipes(&self) -> Result<(), DrmError> {
+    pub fn assign_pipes(
+        &self,
+        prefer: &dyn Fn(&str) -> Option<(u32, u32, Option<u32>)>,
+    ) -> Result<(), DrmError> {
         for conn in self.connectors.borrow().iter() {
-            conn.assign_pipe(self)?;
+            conn.assign_pipe(self, prefer(&conn.name))?;
         }
         Ok(())
+    }
+
+    /// bring every staged head up in ONE commit so the driver validates the
+    /// combined bandwidth; on rejection, walk refresh rates down on the
+    /// newest heads until it fits (the dual-head FIFO-underrun fix)
+    pub fn modeset_heads(&self, heads: &[(Rc<Connector>, u32)]) -> Result<(), DrmError> {
+        if heads.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let mut ch = crate::drm::atomic::Change::default();
+            // disables ride the same commit, never a follow-up: connectors we
+            // don't drive detach, foreign crtcs go inactive, and every plane we
+            // don't own clears
+            let mut used_crtcs = Vec::new();
+            let mut used_planes = Vec::new();
+            for (conn, _) in heads {
+                if let Some(p) = conn.pipe.borrow().as_ref() {
+                    used_crtcs.push(p.crtc.id);
+                    used_planes.push(p.primary.id);
+                    if let Some(cur) = &p.cursor {
+                        used_planes.push(cur.plane.id);
+                    }
+                }
+            }
+            for conn in self.connectors.borrow().iter() {
+                if !heads.iter().any(|(c, _)| Rc::ptr_eq(c, conn)) {
+                    conn.clear_routing(&mut ch);
+                }
+            }
+            // reserved joiner slaves belong to the kernel: staging ANY prop
+            // on the slave crtc OR its planes fights the join (the cursor
+            // smudge). collect their pipe bits and steer around them.
+            let mut slave_mask = 0u32;
+            for crtc in &self.crtcs {
+                let reserved =
+                    crtc.connector.get() != ObjId(0) && !used_crtcs.contains(&crtc.id);
+                if reserved {
+                    slave_mask |= 1 << crtc.idx;
+                    continue;
+                }
+                if !used_crtcs.contains(&crtc.id) && crtc.connector.get() == ObjId(0) {
+                    ch.set(crtc.id, crtc.props.active, 0);
+                    ch.set(crtc.id, crtc.props.mode_id, 0);
+                }
+            }
+            for plane in &self.planes {
+                if used_planes.contains(&plane.id) {
+                    continue;
+                }
+                if plane.possible_crtcs & slave_mask != 0 {
+                    continue;
+                }
+                ch.set(plane.id, plane.props.fb_id, 0);
+                ch.set(plane.id, plane.props.crtc_id, 0);
+            }
+            let mut blobs = Vec::with_capacity(heads.len());
+            let mut stage_err = None;
+            for (conn, fb) in heads {
+                match conn.stage_modeset(self, *fb, &mut ch) {
+                    Ok(b) => blobs.push(b),
+                    Err(e) => {
+                        stage_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = stage_err {
+                for b in blobs {
+                    if b != 0 {
+                        let _ = sys::destroy_blob(self.fd.as_fd(), b);
+                    }
+                }
+                return Err(e);
+            }
+            match ch.commit(self.fd.as_fd(), crate::drm::atomic::ALLOW_MODESET, 0) {
+                Ok(()) => {
+                    for ((conn, _), blob) in heads.iter().zip(blobs) {
+                        conn.modeset_done(self, blob);
+                        if let Some(p) = conn.pipe.borrow().as_ref() {
+                            eprintln!(
+                                "carrot: modeset ok: {} {}x{}@{} on crtc idx {} (pipe {})",
+                                conn.name,
+                                p.mode.hdisplay,
+                                p.mode.vdisplay,
+                                p.mode.vrefresh,
+                                p.crtc.idx,
+                                (b'A' + p.crtc.idx as u8) as char
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    for b in blobs {
+                        if b != 0 {
+                            let _ = sys::destroy_blob(self.fd.as_fd(), b);
+                        }
+                    }
+                    // only a validation rejection means "doesn't fit";
+                    // anything else (lost master, dead device) is fatal
+                    let bandwidth = matches!(e, Errno::INVAL | Errno::NOSPC | Errno::RANGE);
+                    // newest head steps down first; primaries degrade last
+                    let stepped = bandwidth && heads.iter().rev().any(|(c, _)| c.step_down_mode());
+                    if !stepped {
+                        return Err(DrmError::Op("modeset", e));
+                    }
+                }
+            }
+        }
     }
 
     /// one task per card: read flip completions off the drm fd and route them
@@ -341,7 +469,7 @@ pub fn probe_dump() -> i32 {
             dev.cursor_size.0,
             dev.cursor_size.1
         );
-        if let Err(e) = dev.assign_pipes() {
+        if let Err(e) = dev.assign_pipes(&|_| None) {
             println!("FAIL: pipe assignment: {e}");
             failed = true;
             continue;

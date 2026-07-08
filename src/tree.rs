@@ -16,12 +16,123 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use workspace::Workspace;
 
-/// gaps/borders; config keys later
 // gaps, borders, colors and binds all live in state.config now
 
 pub fn output_extent(state: &State) -> (i32, i32) {
     let (w, h) = state.output_size.get();
     (w as i32, h as i32)
+}
+
+/// global rect of the output holding this workspace, or output_extent when headless
+pub fn workspace_output_rect(state: &State, ws: &Workspace) -> Rect {
+    if let Some(d) = state.display.borrow().as_ref() {
+        if let Some(out) = d.outputs.borrow().get(ws.output.get()) {
+            return out.rect();
+        }
+    }
+    let (w, h) = output_extent(state);
+    Rect::new_sized_saturating(0, 0, w.max(1), h.max(1))
+}
+
+/// every workspace currently on glass: one per output, else the active one
+pub fn visible_workspaces(state: &Rc<State>) -> Vec<Rc<Workspace>> {
+    if let Some(d) = state.display.borrow().as_ref() {
+        let outs = d.outputs.borrow();
+        if !outs.is_empty() {
+            let list = state.workspaces.borrow();
+            let mut seen = Vec::new();
+            for o in outs.iter() {
+                if let Some(ws) = list.get(o.ws.get()) {
+                    if !seen.iter().any(|w: &Rc<Workspace>| Rc::ptr_eq(w, ws)) {
+                        seen.push(ws.clone());
+                    }
+                }
+            }
+            if !seen.is_empty() {
+                return seen;
+            }
+        }
+    }
+    vec![active(state)]
+}
+
+/// the workspace shown at a global point, else the active one
+pub fn workspace_at(state: &Rc<State>, x: i32, y: i32) -> Rc<Workspace> {
+    if let Some(d) = state.display.borrow().as_ref() {
+        if let Some(out) = d.output_at(x, y) {
+            if let Some(ws) = state.workspaces.borrow().get(out.ws.get()) {
+                return ws.clone();
+            }
+        }
+    }
+    active(state)
+}
+
+/// tell the client which output its surface is on; wl_output objects are
+/// per bind, matched by connector name
+pub fn send_surface_output(state: &Rc<State>, surface: &crate::surface::WlSurface, slot: usize, enter: bool) {
+    let name = {
+        let d = state.display.borrow();
+        let Some(d) = d.as_ref() else { return };
+        let outs = d.outputs.borrow();
+        let Some(o) = outs.get(slot) else { return };
+        o.conn.name.clone()
+    };
+    send_surface_output_named(surface, &name, enter);
+}
+
+/// same, addressed by connector name: bound wl_output objects outlive the
+/// global, so an output that already left the layout is still reachable
+pub fn send_surface_output_named(surface: &crate::surface::WlSurface, name: &str, enter: bool) {
+    use crate::protocol::interfaces::wl_surface;
+    surface.client.objects.for_each_output(|o| {
+        if o.name == name {
+            let sid = surface.id;
+            let oid = o.id;
+            surface.client.event(|w| {
+                if enter {
+                    wl_surface::enter::send(w, sid, oid);
+                } else {
+                    wl_surface::leave::send(w, sid, oid);
+                }
+            });
+        }
+    });
+}
+
+/// keybind-driven focus onto another output lands the cursor there too:
+/// center of the workspace's focused-most window, else the output center
+fn warp_to_workspace(state: &Rc<State>, ws: &Workspace) {
+    let r = ws
+        .fullscreen
+        .borrow()
+        .as_ref()
+        .map(|w| w.rect.get())
+        .or_else(|| ws.tiling.first().map(|w| w.rect.get()))
+        .or_else(|| ws.top_float().map(|w| w.rect.get()))
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| workspace_output_rect(state, ws));
+    let (cx, cy) = ((r.x1 + r.x2) / 2, (r.y1 + r.y2) / 2);
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.warp(state, cx as f64, cy as f64);
+    }
+    if let Some(d) = state.display.borrow().as_ref() {
+        d.move_cursor(cx, cy);
+    }
+}
+
+/// pointer crossed onto another output: focus follows, and the active
+/// workspace becomes whatever that output is showing
+pub fn note_pointer_output(state: &Rc<State>, x: f64, y: f64) {
+    let hit = {
+        let d = state.display.borrow();
+        let Some(d) = d.as_ref() else { return };
+        let Some(out) = d.output_at(x as i32, y as i32) else { return };
+        (out.index.get(), out.ws.get())
+    };
+    if state.focused_output.replace(hit.0) != hit.0 {
+        state.active_ws.set(hit.1);
+    }
 }
 
 pub enum WindowKind {
@@ -38,9 +149,9 @@ pub struct Window {
     pub node: RefCell<Weak<dwindle::Node>>,
     pub floating: Cell<bool>,
     pub fullscreen: Cell<bool>,
-    /// a rule ORed tearing on for this window
+    /// window-rule `immediate`: tearing without the client's async hint
     pub rule_immediate: Cell<bool>,
-    /// a rule set per-window opacity; None means fully opaque
+    /// window-rule `opacity`, multiplied into every sampled quad
     pub rule_opacity: Cell<Option<f32>>,
 }
 
@@ -121,8 +232,7 @@ impl Window {
     /// where this window paints
     pub fn draw_rect(&self, state: &State) -> Rect {
         if self.fullscreen.get() {
-            let (w, h) = output_extent(state);
-            Rect::new_sized_saturating(0, 0, w, h)
+            fullscreen_rect(state, self)
         } else {
             self.rect.get()
         }
@@ -162,12 +272,32 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     {
         let mut list = state.workspaces.borrow_mut();
         while list.len() <= idx {
-            list.push(Rc::new(Workspace::default()));
+            let w = Workspace::default();
+            w.output.set(state.focused_output.get());
+            list.push(Rc::new(w));
         }
     }
+    let prev_out = state.focused_output.get();
     state.active_ws.set(idx);
     let ws = active(state);
+    if let Some(d) = state.display.borrow().as_ref() {
+        if let Some(out) = d.outputs.borrow().get(ws.output.get()) {
+            out.ws.set(idx);
+            state.focused_output.set(ws.output.get());
+        }
+    }
     relayout(state, &ws);
+    // crossing outputs by keybind drags the cursor along -
+    // unless the pointer is already sitting on the target output
+    if state.focused_output.get() != prev_out {
+        let already_there = {
+            let (cx, cy) = cursor_pos(state);
+            workspace_output_rect(state, &ws).contains(cx, cy)
+        };
+        if !already_there {
+            warp_to_workspace(state, &ws);
+        }
+    }
     // focus lands on whatever is under the cursor, else the first tile
     let target = {
         let (cx, cy) = cursor_pos(state);
@@ -197,8 +327,7 @@ pub fn focused_window(state: &Rc<State>) -> Option<Rc<Window>> {
     window_for_surface(state, &focus)
 }
 
-// move the focused window to workspace n and follow it there; the moved
-// window keeps the keyboard
+// move the focused window to workspace n; with follow, switch there and keep it focused
 pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
     if n == state.active_ws.get() {
         return;
@@ -221,14 +350,20 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
     {
         let mut list = state.workspaces.borrow_mut();
         while list.len() <= n {
-            list.push(Rc::new(Workspace::default()));
+            let w = Workspace::default();
+            w.output.set(state.focused_output.get());
+            list.push(Rc::new(w));
         }
     }
     let target = state.workspaces.borrow()[n].clone();
-    let area = tiling_area(state);
+    let area = tiling_area_for(state, &target);
     target
         .tiling
         .insert(&win, (area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2);
+    if ws.output.get() != target.output.get() {
+        send_surface_output(state, &win.surface(), ws.output.get(), false);
+        send_surface_output(state, &win.surface(), target.output.get(), true);
+    }
     if follow {
         switch_workspace(state, n);
         focus_window(state, Some(&win));
@@ -416,7 +551,11 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
         .workspace
         .and_then(|n| state.workspaces.borrow().get(n).cloned())
         .unwrap_or_else(|| active(state));
-    let visible = Rc::ptr_eq(&ws, &active(state));
+    let visible = {
+        let a = active(state);
+        Rc::ptr_eq(&ws, &a)
+    };
+    send_surface_output(state, &win.surface(), ws.output.get(), true);
     // untile any fullscreen first; splitting behind it helps nobody
     let fs = ws.fullscreen.borrow().clone();
     if let Some(fs) = fs {
@@ -436,6 +575,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     if visible {
         focus_window(state, Some(win));
     }
+    crate::protocol::foreign_toplevel::window_mapped(state, win);
     crate::ipc::emit(
         state,
         &serde_json::json!({ "window-opened": {
@@ -443,7 +583,6 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
             "app-id": win.app_id(),
         }}),
     );
-    crate::protocol::foreign_toplevel::window_mapped(state, win);
     state.damage.trigger();
 }
 
@@ -515,14 +654,30 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
             .or_else(|| ws.top_float());
         focus_window(state, next.as_ref());
     }
+    crate::protocol::foreign_toplevel::window_unmapped(state, &win);
     crate::ipc::emit(
         state,
         &serde_json::json!({ "window-closed": {
             "title": win.title(),
         }}),
     );
-    crate::protocol::foreign_toplevel::window_unmapped(state, win);
     state.damage.trigger();
+}
+
+/// a fullscreen window fills the output of the workspace holding it
+fn fullscreen_rect(state: &State, win: &Window) -> Rect {
+    for ws in state.workspaces.borrow().iter() {
+        let holds = ws
+            .fullscreen
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| std::ptr::eq(&**w, win));
+        if holds {
+            return workspace_output_rect(state, ws);
+        }
+    }
+    let (w, h) = output_extent(state);
+    Rect::new_sized_saturating(0, 0, w, h)
 }
 
 pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
@@ -534,11 +689,11 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
         }
         *slot = Some(win.clone());
         win.fullscreen.set(true);
-        let (w, h) = output_extent(state);
+        let r = workspace_output_rect(state, &ws);
         match &win.kind {
-            WindowKind::Xdg(tl) => tl.configure_size(w, h),
+            WindowKind::Xdg(tl) => tl.configure_size(r.width(), r.height()),
             WindowKind::X11(xw) => {
-                xw.configure_to(Rect::new_sized_saturating(0, 0, w, h));
+                xw.configure_to(r);
             }
         }
     } else {
@@ -556,17 +711,28 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
 
 // -- layout --
 
-/// screen-flush edges get the outer gap, inner edges the inner gap, then the
-/// border insets all four sides; nothing shrinks below 1px
 // the tiling area: whatever the layer-shell arranger left over, else the
 // whole output
 pub fn tiling_area(state: &Rc<State>) -> Rect {
+    tiling_area_for(state, &active(state))
+}
+
+pub fn tiling_area_for(state: &Rc<State>, ws: &Workspace) -> Rect {
+    if let Some(d) = state.display.borrow().as_ref() {
+        if let Some(out) = d.outputs.borrow().get(ws.output.get()) {
+            let usable = out.usable.get();
+            let full = out.rect();
+            return if usable.is_empty() { full } else { usable.intersect(full) };
+        }
+    }
     let (sw, sh) = output_extent(state);
     let full = Rect::new_sized_saturating(0, 0, sw.max(1), sh.max(1));
     let usable = state.usable.get();
     if usable.is_empty() { full } else { usable.intersect(full) }
 }
 
+// outer gap on screen-flush edges, inner gap on shared edges, then the border
+// insets all four sides; never below 1px
 fn apply_gaps(r: Rect, area: Rect, cfg: &crate::config::Config) -> Rect {
     let left = if r.x1 <= area.x1 { cfg.gaps_out } else { cfg.gaps_in };
     let top = if r.y1 <= area.y1 { cfg.gaps_out } else { cfg.gaps_in };
@@ -584,7 +750,7 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
     if sw <= 0 || sh <= 0 {
         return;
     }
-    let area = tiling_area(state);
+    let area = tiling_area_for(state, ws);
     let cfg = state.config.borrow().clone();
     ws.tiling.recalculate(area);
     ws.tiling.for_each(|win| {
@@ -605,7 +771,7 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
 
 /// deepest surface under the point; z order fullscreen, floats top-down, tiled
 pub fn window_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<Window>, Rc<WlSurface>, i32, i32)> {
-    let ws = active(state);
+    let ws = workspace_at(state, x, y);
     let fs = ws.fullscreen.borrow().clone();
     let check_floats = |list: &Workspace| -> Option<(Rc<Window>, Rc<WlSurface>, i32, i32)> {
         for win in list.floats.borrow().iter().rev() {
@@ -695,7 +861,7 @@ fn popups_hit(
 // background. fullscreen hides top and everything below the windows.
 pub fn surface_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<WlSurface>, i32, i32)> {
     use crate::shell::layer;
-    let fs_active = active(state).fullscreen.borrow().is_some();
+    let fs_active = workspace_at(state, x, y).fullscreen.borrow().is_some();
     for l in [layer::OVERLAY, layer::TOP] {
         if l == layer::TOP && fs_active {
             continue;
@@ -740,4 +906,59 @@ fn layer_hit(state: &Rc<State>, layer: u32, x: i32, y: i32) -> Option<(Rc<WlSurf
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_workspace_wraps_both_ways() {
+        assert_eq!(rel_wrap(0, 1, 3), 1);
+        assert_eq!(rel_wrap(2, 1, 3), 0, "past the end wraps to the first");
+        assert_eq!(rel_wrap(0, -1, 3), 2, "before the first wraps to the last");
+        assert_eq!(rel_wrap(1, -4, 3), 0);
+        assert_eq!(rel_wrap(1, 7, 3), 2);
+        // a single workspace absorbs every jump
+        assert_eq!(rel_wrap(0, 1, 1), 0);
+        assert_eq!(rel_wrap(0, -5, 0), 0, "empty list never divides by zero");
+    }
+
+    #[test]
+    fn dir_pick_takes_the_facing_neighbor() {
+        // 2x2 grid: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
+        let r = |x1, y1, x2, y2| Rect { x1, y1, x2, y2 };
+        let grid = [
+            r(0, 0, 400, 300),
+            r(400, 0, 800, 300),
+            r(0, 300, 400, 600),
+            r(400, 300, 800, 600),
+        ];
+        let from = grid[0];
+        let others = [grid[1], grid[2], grid[3]];
+        assert_eq!(dir_pick(from, &others, Dir::Right), Some(0));
+        assert_eq!(dir_pick(from, &others, Dir::Down), Some(1));
+        // the diagonal never wins: no perpendicular overlap leftward or upward
+        assert_eq!(dir_pick(from, &others, Dir::Left), None);
+        assert_eq!(dir_pick(from, &others, Dir::Up), None);
+        // from the bottom-right corner both axes resolve
+        let others = [grid[0], grid[1], grid[2]];
+        assert_eq!(dir_pick(grid[3], &others, Dir::Left), Some(2));
+        assert_eq!(dir_pick(grid[3], &others, Dir::Up), Some(1));
+    }
+
+    #[test]
+    fn dir_pick_prefers_near_then_overlap() {
+        let r = |x1, y1, x2, y2| Rect { x1, y1, x2, y2 };
+        let from = r(400, 0, 800, 600);
+        // a nearer column beats a farther one even with less overlap
+        let cands = [r(0, 0, 200, 600), r(200, 0, 400, 100)];
+        assert_eq!(dir_pick(from, &cands, Dir::Left), Some(1));
+        // equal distance: the taller shared edge wins
+        let cands = [r(0, 0, 400, 100), r(0, 100, 400, 600)];
+        assert_eq!(dir_pick(from, &cands, Dir::Left), Some(1));
+        // behind or overlapping rects are never neighbors
+        let cands = [r(500, 0, 900, 600)];
+        assert_eq!(dir_pick(from, &cands, Dir::Left), None);
+    }
 }

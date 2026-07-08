@@ -207,6 +207,7 @@ pub struct ConnectorInfo {
     /// 1 = connected
     pub connection: u32,
     pub connector_type: u32,
+    pub connector_type_id: u32,
     pub encoders: Vec<u32>,
     pub modes: Vec<ModeInfo>,
 }
@@ -253,6 +254,7 @@ pub fn connector(fd: BorrowedFd<'_>, id: u32, force_probe: bool) -> Result<Conne
                 id,
                 connection: d.connection,
                 connector_type: d.connector_type,
+                connector_type_id: d.connector_type_id,
                 encoders,
                 modes,
             });
@@ -413,12 +415,18 @@ pub struct PropertyEnum {
 pub struct PropertyMeta {
     pub name: String,
     pub flags: u32,
+    /// for RANGE props: [min, max]
+    pub values: Vec<u64>,
     pub enums: Vec<PropertyEnum>,
 }
 
 impl PropertyEnum {
     pub fn name(&self) -> String {
         fixed_name(&self.name)
+    }
+
+    pub fn value(&self) -> u64 {
+        self.value
     }
 }
 
@@ -445,6 +453,7 @@ pub fn property_meta(fd: BorrowedFd<'_>, prop_id: u32) -> Result<PropertyMeta, E
             return Ok(PropertyMeta {
                 name: fixed_name(&d.name),
                 flags: d.flags,
+                values,
                 enums,
             });
         }

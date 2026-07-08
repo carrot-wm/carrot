@@ -145,8 +145,7 @@ impl output_source_mgr_v1::Handler for OutputSourceManager {
             return Ok(());
         };
         // liveness is the consumer's problem at session creation
-        let _ = out;
-        add_source(c, req.source, SourceKind::Output(String::new()))?;
+        add_source(c, req.source, SourceKind::Output(out.name.clone()))?;
         Ok(())
     }
 
@@ -411,7 +410,7 @@ impl IccSession {
     fn current_size(&self, state: &Rc<State>) -> Option<(u32, u32)> {
         match &self.source {
             SourceKind::Output(name) => {
-                crate::output::output_geometry(state).map(|(_, w, h)| (w, h))
+                crate::output::output_geometry(state, name).map(|(_, w, h)| (w, h))
             }
             SourceKind::Toplevel(weak) => {
                 let win = weak.borrow().upgrade()?;
@@ -488,7 +487,7 @@ fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
     }
     let (src, cur_w, cur_h) = match &sess.source {
         SourceKind::Output(name) => {
-            let Some((slot, w, h)) = crate::output::output_geometry(state) else {
+            let Some((slot, w, h)) = crate::output::output_geometry(state, name) else {
                 stop_session(state, sess);
                 return;
             };

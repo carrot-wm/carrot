@@ -16,7 +16,18 @@ use std::rc::Rc;
 pub struct Connector {
     pub id: ObjId,
     prop_crtc_id: PropId,
+    /// crtc the kernel had us on at probe; adopting it keeps the
+    /// firmware-validated pipe pairing (480Hz modes may join pipes)
+    live_crtc: Cell<ObjId>,
+    /// clamp to the fb depth; deep color inflates link bandwidth for
+    /// nothing when we render xrgb8888
+    max_bpc: Option<(PropId, u64)>,
+    /// stage GOOD every modeset; BAD after failed link training keeps the
+    /// head dark until userspace re-commits
+    link_status: Option<(PropId, u64)>,
     pub connected: Cell<bool>,
+    /// kernel-style name, "DP-1"; what output config blocks match on
+    pub name: String,
     pub modes: RefCell<Vec<ModeInfo>>,
     pub pipe: RefCell<Option<Pipe>>,
     pub flip_pending: Cell<bool>,
@@ -51,10 +62,26 @@ impl Connector {
         let info = sys::connector(dev.fd.as_fd(), raw_id, true)
             .map_err(|e| DrmError::ObjOp("connector probe", raw_id, e))?;
         let props = PropSet::of(dev.fd.as_fd(), id, sys::OBJECT_CONNECTOR)?;
+        let name = format!(
+            "{}-{}",
+            connector_type_name(info.connector_type),
+            info.connector_type_id
+        );
+        let max_bpc = props.id("max bpc").and_then(|p| {
+            let (min, max) = props.range("max bpc")?;
+            Some((p, 8u64.clamp(min, max)))
+        });
+        let link_status = props.id("link-status").map(|p| {
+            (p, props.enum_value("link-status", "Good").unwrap_or(0))
+        });
         Ok(Rc::new(Connector {
             id,
             prop_crtc_id: props.require("CRTC_ID", id)?,
+            live_crtc: Cell::new(ObjId(props.value("CRTC_ID").unwrap_or(0) as u32)),
+            max_bpc,
+            link_status,
             connected: Cell::new(info.connection == 1),
+            name,
             modes: RefCell::new(info.modes),
             pipe: RefCell::new(None),
             flip_pending: Cell::new(false),
@@ -65,13 +92,118 @@ impl Connector {
         }))
     }
 
-    /// greedy first-fit: crtc + primary plane + cursor plane if available.
-    /// an unsatisfiable connector fails bring-up rather than coming up headless
-    pub fn assign_pipe(self: &Rc<Self>, dev: &DrmDevice) -> Result<(), DrmError> {
+    /// configured mode if it matches something advertised, else the panel's
+    /// preferred (first) mode
+    fn pick_mode(&self, prefer: Option<(u32, u32, Option<u32>)>) -> Option<ModeInfo> {
+        let modes = self.modes.borrow();
+        if let Some((w, h, hz)) = prefer {
+            let mut best: Option<&ModeInfo> = None;
+            for m in modes.iter() {
+                if m.hdisplay as u32 != w || m.vdisplay as u32 != h {
+                    continue;
+                }
+                best = match (best, hz) {
+                    (None, _) => Some(m),
+                    (Some(b), Some(hz)) => {
+                        let d_new = (m.vrefresh as i64 - hz as i64).abs();
+                        let d_old = (b.vrefresh as i64 - hz as i64).abs();
+                        Some(if d_new < d_old { m } else { b })
+                    }
+                    // no refresh asked: the first (highest) match wins
+                    (Some(b), None) => Some(b),
+                };
+            }
+            if let Some(m) = best {
+                return Some(*m);
+            }
+            eprintln!(
+                "carrot: {}: no advertised mode matches {w}x{h}{}; using preferred",
+                self.name,
+                hz.map(|z| format!("@{z}")).unwrap_or_default()
+            );
+        }
+        modes.first().copied()
+    }
+
+    /// next lower refresh at the same resolution, for the bandwidth ladder
+    pub fn step_down_mode(&self) -> bool {
+        let cur = match self.pipe.borrow().as_ref() {
+            Some(p) => p.mode,
+            None => return false,
+        };
+        let modes = self.modes.borrow();
+        let next = modes
+            .iter()
+            .filter(|m| {
+                m.hdisplay == cur.hdisplay
+                    && m.vdisplay == cur.vdisplay
+                    && m.vrefresh < cur.vrefresh
+            })
+            .max_by_key(|m| m.vrefresh)
+            .copied();
+        drop(modes);
+        let Some(next) = next else { return false };
+        if let Some(p) = self.pipe.borrow_mut().as_mut() {
+            p.mode = next;
+        }
+        eprintln!(
+            "carrot: {}: stepping down to {}x{}@{}",
+            self.name, next.hdisplay, next.vdisplay, next.vrefresh
+        );
+        true
+    }
+
+    /// stage this head's full bring-up into a shared commit
+    pub fn stage_modeset(&self, dev: &DrmDevice, fb: u32, ch: &mut Change) -> Result<u32, DrmError> {
+        let pipe = self.pipe.borrow();
+        let Some(pipe) = pipe.as_ref() else {
+            return Ok(0);
+        };
+        let blob = create_mode_blob(dev, &pipe.mode)?;
+        ch.set(self.id, self.prop_crtc_id, pipe.crtc.id.0 as u64);
+        if let Some((prop, bpc)) = self.max_bpc {
+            ch.set(self.id, prop, bpc);
+        }
+        if let Some((prop, good)) = self.link_status {
+            ch.set(self.id, prop, good);
+        }
+        ch.set(pipe.crtc.id, pipe.crtc.props.active, 1);
+        ch.set(pipe.crtc.id, pipe.crtc.props.mode_id, blob as u64);
+        set_plane(ch, &pipe.primary, pipe.crtc.id, fb, &pipe.mode);
+        if let Some(cur) = &pipe.cursor {
+            cur.apply(ch, pipe.crtc.id);
+        }
+        Ok(blob)
+    }
+
+    /// bookkeeping after a shared commit landed for this head
+    pub fn modeset_done(&self, dev: &DrmDevice, blob: u32) {
+        let pipe = self.pipe.borrow();
+        let Some(pipe) = pipe.as_ref() else { return };
+        let old = pipe.mode_blob.replace(blob);
+        if old != 0 {
+            let _ = sys::destroy_blob(dev.fd.as_fd(), old);
+        }
+        if let Some(cur) = &pipe.cursor {
+            cur.commit_done();
+        }
+        pipe.active.set(true);
+    }
+
+    /// detach from whatever crtc firmware or a previous session left us on
+    pub fn clear_routing(&self, ch: &mut Change) {
+        ch.set(self.id, self.prop_crtc_id, 0);
+    }
+
+    pub fn assign_pipe(
+        self: &Rc<Self>,
+        dev: &DrmDevice,
+        prefer: Option<(u32, u32, Option<u32>)>,
+    ) -> Result<(), DrmError> {
         if !self.connected.get() || self.pipe.borrow().is_some() {
             return Ok(());
         }
-        let Some(&mode) = self.modes.borrow().first() else {
+        let Some(mode) = self.pick_mode(prefer) else {
             // connected but modeless; treat like disconnected
             return Ok(());
         };
@@ -83,10 +215,18 @@ impl Connector {
             crtc_mask |= sys::encoder_possible_crtcs(dev.fd.as_fd(), enc)
                 .map_err(|e| DrmError::ObjOp("encoder", enc, e))?;
         }
+        // the kernel's current routing first: firmware already proved that
+        // pairing works, and high-refresh modes may gang adjacent pipes
+        let live = self.live_crtc.get();
         let crtc = dev
             .crtcs
             .iter()
-            .find(|c| crtc_mask & (1 << c.idx) != 0 && c.connector.get() == ObjId(0))
+            .find(|c| c.id == live && live != ObjId(0) && c.connector.get() == ObjId(0))
+            .or_else(|| {
+                dev.crtcs
+                    .iter()
+                    .find(|c| crtc_mask & (1 << c.idx) != 0 && c.connector.get() == ObjId(0))
+            })
             .cloned()
             .ok_or(DrmError::NoCrtc(self.id))?;
 
@@ -117,6 +257,28 @@ impl Connector {
             }
         });
 
+        if prefer.is_some() {
+            eprintln!(
+                "carrot: {}: mode {}x{}@{}",
+                self.name, mode.hdisplay, mode.vdisplay, mode.vrefresh
+            );
+        }
+        // pixel clocks past one pipe's reach make the kernel gang the NEXT
+        // pipe as an invisible joiner slave; hand that pipe to another head
+        // and both starve mid-scanline (the dual-head 480Hz failure)
+        if mode_needs_joiner(&mode) {
+            if let Some(slave) = dev.crtcs.iter().find(|c| c.idx == crtc.idx + 1) {
+                if slave.connector.get() == ObjId(0) {
+                    slave.connector.set(self.id);
+                    eprintln!(
+                        "carrot: {}: {}MHz mode joins pipes; reserving pipe {}",
+                        self.name,
+                        mode.clock / 1000,
+                        (b'A' + slave.idx as u8) as char
+                    );
+                }
+            }
+        }
         crtc.connector.set(self.id);
         *self.pipe.borrow_mut() = Some(Pipe {
             crtc,
@@ -127,51 +289,6 @@ impl Connector {
             active: Cell::new(false),
         });
         Ok(())
-    }
-
-    /// full modeset onto `fb`; blocking commit, ALLOW_MODESET
-    pub fn modeset(&self, dev: &DrmDevice, fb: u32) -> Result<(), DrmError> {
-        let pipe = self.pipe.borrow();
-        let Some(pipe) = pipe.as_ref() else {
-            return Ok(());
-        };
-        let old_blob = pipe.mode_blob.get();
-        let blob = create_mode_blob(dev, &pipe.mode)?;
-        pipe.mode_blob.set(blob);
-
-        let mut out_fd: i32 = -1;
-        let mut ch = self.change.borrow_mut();
-        ch.clear();
-        ch.set(self.id, self.prop_crtc_id, pipe.crtc.id.0 as u64);
-        ch.set(pipe.crtc.id, pipe.crtc.props.active, 1);
-        ch.set(pipe.crtc.id, pipe.crtc.props.mode_id, blob as u64);
-        ch.set(
-            pipe.crtc.id,
-            pipe.crtc.props.out_fence_ptr,
-            (&raw mut out_fd) as usize as u64,
-        );
-        set_plane(&mut ch, &pipe.primary, pipe.crtc.id, fb, &pipe.mode);
-        if let Some(cur) = &pipe.cursor {
-            cur.apply(&mut ch, pipe.crtc.id);
-        }
-        match ch.commit(dev.fd.as_fd(), atomic::ALLOW_MODESET, 0) {
-            Ok(()) => {
-                self.take_out_fence(out_fd);
-                if let Some(cur) = &pipe.cursor {
-                    cur.commit_done();
-                }
-                pipe.active.set(true);
-                if old_blob != 0 {
-                    let _ = sys::destroy_blob(dev.fd.as_fd(), old_blob);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                pipe.mode_blob.set(old_blob);
-                let _ = sys::destroy_blob(dev.fd.as_fd(), blob);
-                Err(commit_error(e))
-            }
-        }
     }
 
     /// steady-state page flip, one attempt. EBUSY is not-presented; the next
@@ -410,8 +527,13 @@ impl CursorPlane {
         })
     }
 
-    /// copy tightly-packed ARGB rows into the back buffer, cleared first so a
-    /// smaller cursor never shows stale edges
+    /// drop off the crtc entirely (head teardown)
+    pub fn clear_routing(&self, ch: &mut Change) {
+        ch.set(self.plane.id, self.plane.props.fb_id, 0);
+        ch.set(self.plane.id, self.plane.props.crtc_id, 0);
+    }
+
+    /// cleared first so a smaller cursor never leaves stale edges behind
     pub fn write(&self, pixels: &[u8], w: u32, h: u32) {
         let w = w.min(self.width);
         let h = h.min(self.height);
@@ -494,5 +616,38 @@ impl Drop for CursorBuf {
         }
         let _ = sys::rmfb(self.fd.as_fd(), self.fb);
         let _ = sys::destroy_dumb(self.fd.as_fd(), self.handle);
+    }
+}
+
+/// past ~1GHz one display pipe can't clock the mode alone; the exact
+/// driver threshold varies, erring low only over-reserves a pipe
+pub fn mode_needs_joiner(mode: &ModeInfo) -> bool {
+    mode.clock > 1_000_000
+}
+
+/// kernel connector-type names, drm_connector_enum_list verbatim
+fn connector_type_name(ty: u32) -> &'static str {
+    match ty {
+        1 => "VGA",
+        2 => "DVI-I",
+        3 => "DVI-D",
+        4 => "DVI-A",
+        5 => "Composite",
+        6 => "SVIDEO",
+        7 => "LVDS",
+        8 => "Component",
+        9 => "DIN",
+        10 => "DP",
+        11 => "HDMI-A",
+        12 => "HDMI-B",
+        13 => "TV",
+        14 => "eDP",
+        15 => "Virtual",
+        16 => "DSI",
+        17 => "DPI",
+        18 => "Writeback",
+        19 => "SPI",
+        20 => "USB",
+        _ => "Unknown",
     }
 }

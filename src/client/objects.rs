@@ -36,6 +36,7 @@ pub struct Objects {
     toplevels: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgToplevel>>>,
     popups: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPopup>>>,
     outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::WlOutput>>>,
+    xdg_outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::XdgOutput>>>,
     capture_sources:
         RefCell<HashMap<ObjectId, Rc<crate::protocol::image_copy_capture::CaptureSource>>>,
 }
@@ -108,6 +109,8 @@ impl Objects {
         self.toplevels.borrow_mut().clear();
         self.popups.borrow_mut().clear();
         self.outputs.borrow_mut().clear();
+        self.xdg_outputs.borrow_mut().clear();
+        self.capture_sources.borrow_mut().clear();
         let objs: Vec<_> = self.map.borrow_mut().drain().map(|(_, o)| o).collect();
         for obj in &objs {
             obj.break_loops();
@@ -152,26 +155,14 @@ impl Objects {
         self.popups.borrow_mut().remove(&id);
     }
 
-    pub fn track_capture_source(
-        &self,
-        s: Rc<crate::protocol::image_copy_capture::CaptureSource>,
-    ) {
-        self.capture_sources.borrow_mut().insert(s.id, s);
-    }
-
-    pub fn capture_source(
-        &self,
-        id: ObjectId,
-    ) -> Option<Rc<crate::protocol::image_copy_capture::CaptureSource>> {
-        self.capture_sources.borrow().get(&id).cloned()
-    }
-
-    pub fn forget_capture_source(&self, id: ObjectId) {
-        self.capture_sources.borrow_mut().remove(&id);
-    }
-
     pub fn track_output(&self, o: Rc<crate::protocol::output::WlOutput>) {
         self.outputs.borrow_mut().insert(o.id, o);
+    }
+
+    pub fn for_each_output(&self, mut f: impl FnMut(&Rc<crate::protocol::output::WlOutput>)) {
+        for o in self.outputs.borrow().values() {
+            f(o);
+        }
     }
 
     pub fn output(&self, id: ObjectId) -> Option<Rc<crate::protocol::output::WlOutput>> {
@@ -180,6 +171,20 @@ impl Objects {
 
     pub fn forget_output(&self, id: ObjectId) {
         self.outputs.borrow_mut().remove(&id);
+    }
+
+    pub fn track_xdg_output(&self, o: Rc<crate::protocol::output::XdgOutput>) {
+        self.xdg_outputs.borrow_mut().insert(o.id, o);
+    }
+
+    pub fn for_each_xdg_output(&self, mut f: impl FnMut(&Rc<crate::protocol::output::XdgOutput>)) {
+        for o in self.xdg_outputs.borrow().values() {
+            f(o);
+        }
+    }
+
+    pub fn forget_xdg_output(&self, id: ObjectId) {
+        self.xdg_outputs.borrow_mut().remove(&id);
     }
 
     pub fn for_each_surface(&self, mut f: impl FnMut(&Rc<crate::surface::WlSurface>)) {
@@ -210,5 +215,23 @@ impl Objects {
 
     pub fn forget_buffer(&self, id: ObjectId) {
         self.buffers.borrow_mut().remove(&id);
+    }
+
+    pub fn track_capture_source(
+        &self,
+        s: Rc<crate::protocol::image_copy_capture::CaptureSource>,
+    ) {
+        self.capture_sources.borrow_mut().insert(s.id, s);
+    }
+
+    pub fn capture_source(
+        &self,
+        id: ObjectId,
+    ) -> Option<Rc<crate::protocol::image_copy_capture::CaptureSource>> {
+        self.capture_sources.borrow().get(&id).cloned()
+    }
+
+    pub fn forget_capture_source(&self, id: ObjectId) {
+        self.capture_sources.borrow_mut().remove(&id);
     }
 }

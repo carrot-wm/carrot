@@ -237,7 +237,18 @@ fn workspaces_json(state: &Rc<State>) -> Value {
         .map(|(i, w)| {
             let mut count = 0;
             w.for_each(|_| count += 1);
-            json!({ "index": i + 1, "windows": count, "active": i == state.active_ws.get() })
+            let output = state.display.borrow().as_ref().and_then(|d| {
+                d.outputs
+                    .borrow()
+                    .get(w.output.get())
+                    .map(|o| o.conn.name.clone())
+            });
+            json!({
+                "index": i + 1,
+                "windows": count,
+                "active": i == state.active_ws.get(),
+                "output": output,
+            })
         })
         .collect();
     json!(ws)

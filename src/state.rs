@@ -29,6 +29,8 @@ pub struct State {
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
     pub active_ws: std::cell::Cell<usize>,
+    /// which output has focus; follows the pointer and workspace switches
+    pub focused_output: std::cell::Cell<usize>,
     /// shell surfaces with a scheduled configure; drained by an engine task
     pub configures: RefCell<Vec<Rc<dyn crate::shell::Configurable>>>,
     pub configure_event: AsyncEvent,
@@ -41,18 +43,25 @@ pub struct State {
     pub xwayland: RefCell<Option<Rc<crate::xwayland::Xwayland>>>,
     /// ipc connections that asked for the event stream
     pub ipc_subs: RefCell<Vec<Rc<crate::ipc::Subscriber>>>,
+    /// foreign-toplevel watchers (taskbars/overviews), announce fan-out
+    pub ftl_managers: RefCell<Vec<Rc<crate::protocol::foreign_toplevel::FtlManager>>>,
+    /// ext-foreign-toplevel-list watchers; same fan-out, fewer verbs
+    pub ext_toplevel_lists:
+        RefCell<Vec<Rc<crate::protocol::foreign_toplevel_list::ExtToplevelList>>>,
+    /// live image-copy-capture sessions, serviced from present/commit
+    pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
+    /// idle notifications + inhibitors; the pump task ticks deadlines
+    pub idle: crate::protocol::idle::IdleState,
+    /// replaced dmabuf attachments; released after the next present's fence
+    pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
+    /// frames between render submit and fence; gates the retired drain
+    pub frames_in_flight: std::cell::Cell<u32>,
+    /// the render device + (fourcc, modifier) set the dmabuf global speaks
+    /// for; filled when the display comes up
+    pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
     serial: NumCell<u64>,
     /// identity for cache keys: wire ids get reused, uids never do
     obj_uid: NumCell<u64>,
-    /// dmabuf attachments sampled in place; released once the frame does
-    pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
-    /// advertised drm formats + modifiers, filled once the renderer is up
-    pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
-    pub ftl_managers: RefCell<Vec<Rc<crate::protocol::foreign_toplevel::FtlManager>>>,
-    pub ext_toplevel_lists:
-        RefCell<Vec<Rc<crate::protocol::foreign_toplevel_list::ExtToplevelList>>>,
-    pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
-    pub idle: crate::protocol::idle::IdleState,
 }
 
 impl State {
@@ -73,6 +82,7 @@ impl State {
             output_size: std::cell::Cell::new((0, 0)),
             workspaces: RefCell::new(Vec::new()),
             active_ws: std::cell::Cell::new(0),
+            focused_output: std::cell::Cell::new(0),
             configures: RefCell::new(Vec::new()),
             configure_event: AsyncEvent::default(),
             layers: RefCell::new(Vec::new()),
@@ -80,15 +90,20 @@ impl State {
             config: RefCell::new(Rc::new(crate::config::Config::default())),
             xwayland: RefCell::new(None),
             ipc_subs: RefCell::new(Vec::new()),
-            serial: NumCell::new(0),
-            obj_uid: NumCell::new(0),
-            retired: RefCell::new(Vec::new()),
-            dmabuf_info: RefCell::new(None),
             ftl_managers: RefCell::new(Vec::new()),
             ext_toplevel_lists: RefCell::new(Vec::new()),
             icc_sessions: RefCell::new(Vec::new()),
             idle: Default::default(),
+            retired: RefCell::new(Vec::new()),
+            frames_in_flight: std::cell::Cell::new(0),
+            dmabuf_info: RefCell::new(None),
+            serial: NumCell::new(0),
+            obj_uid: NumCell::new(0),
         })
+    }
+
+    pub fn next_uid(&self) -> u64 {
+        self.obj_uid.fetch_add(1) + 1
     }
 
     pub fn next_serial(&self, client: Option<&Client>) -> u64 {
@@ -99,10 +114,6 @@ impl State {
         s
     }
 
-    pub fn next_uid(&self) -> u64 {
-        self.obj_uid.fetch_add(1) + 1
-    }
-
     /// break the Rc cycles so everything frees. called once, after ring stop.
     pub fn clear(&self) {
         self.clients.clear();
@@ -111,8 +122,10 @@ impl State {
         self.configures.borrow_mut().clear();
         self.layers.borrow_mut().clear();
         self.ipc_subs.borrow_mut().clear();
+        self.ext_toplevel_lists.borrow_mut().clear();
+        self.icc_sessions.borrow_mut().clear();
+        self.idle.clear();
         self.retired.borrow_mut().clear();
-        self.ftl_managers.borrow_mut().clear();
         self.wheel.clear();
         self.run_toplevel.clear();
         self.display.borrow_mut().take();
@@ -122,6 +135,8 @@ impl State {
             seat.primary.clear();
             seat.popup_grab.borrow_mut().clear();
             seat.grab_prev_focus.borrow_mut().take();
+            seat.relative.borrow_mut().clear();
+            seat.constraints.borrow_mut().clear();
         }
         if let Some(x) = self.xwayland.borrow_mut().take() {
             x.clear();

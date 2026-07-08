@@ -12,13 +12,12 @@ use crate::drm::device::DrmDevice;
 use crate::drm::sys;
 use crate::engine::SpawnedFuture;
 use crate::format::XRGB8888;
-use crate::protocol::ObjectId;
 use crate::rect::Rect;
 use crate::render::renderer::{FrameTarget, RenderOp, Renderer, Texture};
 use crate::render::vulkan::VkCore;
 use crate::state::State;
 use crate::surface::WlSurface;
-use crate::util::{EitherEvent, Time};
+use crate::util::{AsyncEvent, EitherEvent, Time};
 use ash::vk;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -26,17 +25,21 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::rc::Rc;
 
 pub struct Display {
-    out: Rc<Output>,
+    pub outputs: RefCell<Vec<Rc<Output>>>,
+    dev: Rc<DrmDevice>,
+    core: Rc<VkCore>,
+    renderer: Rc<Renderer>,
+    devnum: u64,
     _pump: SpawnedFuture<()>,
-    _present: SpawnedFuture<()>,
+    _presents: RefCell<Vec<SpawnedFuture<()>>>,
+    _fanout: SpawnedFuture<()>,
     /// armed once the display lands in state; watches netlink for hotplug
     pub hotplug: RefCell<Option<SpawnedFuture<()>>>,
 }
 
 impl Display {
-    pub fn output_global(&self) -> crate::protocol::output::WlOutputGlobal {
-        let refresh = self
-            .out
+    pub fn output_global(&self, out: &Rc<Output>) -> crate::protocol::output::WlOutputGlobal {
+        let refresh = out
             .conn
             .pipe
             .borrow()
@@ -44,11 +47,24 @@ impl Display {
             .map(|p| p.mode.vrefresh)
             .unwrap_or(60) as i32
             * 1000;
+        let (x, y) = out.pos.get();
         crate::protocol::output::WlOutputGlobal {
-            width: self.out.width as i32,
-            height: self.out.height as i32,
+            name: out.conn.name.clone(),
+            x,
+            y,
+            width: out.width as i32,
+            height: out.height as i32,
             refresh_mhz: refresh,
         }
+    }
+
+    /// the output whose rect contains the global point
+    pub fn output_at(&self, x: i32, y: i32) -> Option<Rc<Output>> {
+        self.outputs
+            .borrow()
+            .iter()
+            .find(|o| o.rect().contains(x, y))
+            .cloned()
     }
 }
 
@@ -57,23 +73,33 @@ impl Display {
     /// still hold master. logind drops master before signaling PauseDevice,
     /// so the pause path is too late.
     pub fn hide_cursor(&self) {
-        self.out.cursor_locked.set(true);
-        self.out.conn.cursor_hide(&self.out.dev);
+        for out in self.outputs.borrow().iter() {
+            out.cursor_locked.set(true);
+            out.conn.cursor_hide(&out.dev);
+        }
     }
 
     /// hardware cursor moves bypass rendering
     pub fn move_cursor(&self, x: i32, y: i32) {
-        if self.out.cursor_locked.get() {
-            return;
+        for out in self.outputs.borrow().iter() {
+            if out.cursor_locked.get() {
+                continue;
+            }
+            let (ox, oy) = out.pos.get();
+            let inside = out.rect().contains(x, y);
+            let pipe = out.conn.pipe.borrow();
+            let Some(p) = pipe.as_ref() else { continue };
+            let Some(cur) = &p.cursor else { continue };
+            if inside {
+                let (hx, hy) = cur.hotspot.get();
+                cur.set_enabled(true);
+                cur.set_position(x - ox - hx, y - oy - hy);
+            } else {
+                cur.set_enabled(false);
+            }
+            drop(pipe);
+            out.conn.cursor_commit(&out.dev);
         }
-        let pipe = self.out.conn.pipe.borrow();
-        let Some(p) = pipe.as_ref() else { return };
-        let Some(cur) = &p.cursor else { return };
-        let (hx, hy) = cur.hotspot.get();
-        cur.set_enabled(true);
-        cur.set_position(x - hx, y - hy);
-        drop(pipe);
-        self.out.conn.cursor_commit(&self.out.dev);
     }
 }
 
@@ -112,26 +138,49 @@ struct OutBuf {
     dumb: Option<u32>,
 }
 
-struct Output {
+pub struct Output {
     dev: Rc<DrmDevice>,
-    conn: Rc<Connector>,
+    pub conn: Rc<Connector>,
     renderer: Rc<Renderer>,
     bufs: [OutBuf; 2],
     front: Cell<usize>,
-    width: u32,
-    height: u32,
-    /// keyed by surface uid; the u64 is the content_gen the texture holds
+    pub width: u32,
+    pub height: u32,
+    /// slot in the display's output list
+    pub index: Cell<usize>,
+    /// registry name of this output's wl_output global
+    pub global_name: Cell<u32>,
+    /// per-output wake; the fan-out task mirrors state.damage into these
+    pub damage: AsyncEvent,
+    /// global origin; outputs tile left to right
+    pub pos: Cell<(i32, i32)>,
+    /// the workspace this output currently shows
+    pub ws: Cell<usize>,
+    /// global-space tiling box: our rect minus exclusive zones
+    pub usable: Cell<Rect>,
+    /// texture + the content generation it was uploaded at, keyed by uid
+    /// (surface uid for shm shadows, buffer uid for dmabufs - wire ids
+    /// get reused, uids never); shm skips the re-upload while gen holds
     textures: RefCell<HashMap<(ClientId, u64), (Texture, u64)>>,
-    /// evicted textures still in a submitted frame; drained past the fence
+    /// textures pulled from the cache this frame; destroyed only after
+    /// the frame fence proves the last sampler is done
     retired_tex: RefCell<Vec<Texture>>,
-    /// client dmabuf read fences to wait on before this frame samples them
-    frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
     /// card's dev_t, matches logind pause/resume signals
     devnum: u64,
     /// vt elsewhere; render but never commit until resume
     paused: Cell<bool>,
     /// queued motion must not re-arm the cursor while the vt is leaving
     cursor_locked: Cell<bool>,
+    /// implicit-sync fences of the dmabufs drawn this frame; the render
+    /// submit waits them so client work lands before we sample
+    frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
+}
+
+impl Output {
+    pub fn rect(&self) -> Rect {
+        let (x, y) = self.pos.get();
+        Rect::new_sized_saturating(x, y, self.width as i32, self.height as i32)
+    }
 }
 
 /// bring up a display if a card is reachable, else run headless
@@ -150,32 +199,169 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
         Err(_) => Vec::new(),
     };
     cards.sort();
+    let cfg_state = state.clone();
+    let prefer = move |name: &str| -> Option<(u32, u32, Option<u32>)> {
+        cfg_state
+            .config
+            .borrow()
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .and_then(|o| o.mode)
+    };
     for path in cards {
-        match init_card(state, &path, session).await {
-            Ok(out) => {
-                println!(
-                    "carrot: output up on {} ({}x{})",
-                    path.display(),
-                    out.width,
-                    out.height
+        let (dev, core, renderer, devnum) = match init_card(&path, session, &prefer).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("carrot: {}: {e} - trying next card", path.display());
+                continue;
+            }
+        };
+        // every connected connector with a pipe becomes an output,
+        // tiled left to right in global space
+        let conns: Vec<Rc<Connector>> = dev
+            .connectors
+            .borrow()
+            .iter()
+            .filter(|c| c.pipe.borrow().is_some())
+            .cloned()
+            .collect();
+        if conns.is_empty() {
+            eprintln!("carrot: {}: no connected display - trying next card", path.display());
+            continue;
+        }
+        let mut outputs: Vec<Rc<Output>> = Vec::new();
+        let mut x = 0i32;
+        for conn in conns {
+            let name = conn.name.clone();
+            match init_output(&dev, &core, &renderer, conn, devnum) {
+                Ok(out) => {
+                    let out = Rc::new(out);
+                    out.pos.set((x, 0));
+                    out.usable.set(out.rect());
+                    out.ws.set(outputs.len().min(8));
+                    x += out.width as i32;
+                    let refresh = out
+                        .conn
+                        .pipe
+                        .borrow()
+                        .as_ref()
+                        .map(|p| p.mode.vrefresh)
+                        .unwrap_or(0);
+                    eprintln!(
+                        "carrot: output {}: {}x{}@{} at {:?}",
+                        out.conn.name,
+                        out.width,
+                        out.height,
+                        refresh,
+                        out.pos.get()
+                    );
+                    outputs.push(out);
+                }
+                Err(e) => eprintln!("carrot: {name}: {e} - skipping connector"),
+            }
+        }
+        if outputs.is_empty() {
+            continue;
+        }
+        // every head in one commit: the driver validates the combined
+        // bandwidth, the ladder steps refreshes down until it fits, and a
+        // head that can't fit at all is dropped rather than flashing
+        // linear dumb-buffer scanout is the display engine's worst case;
+        // two high-refresh heads of it starve the FIFO on intel even though
+        // the kernel accepts the config. cap unconfigured secondaries.
+        if outputs.len() > 1 && outputs.iter().any(|o| o.bufs[0].dumb.is_some()) {
+            for o in outputs.iter().skip(1) {
+                if prefer(&o.conn.name).is_some() {
+                    continue; // explicit config wins, whatever it costs
+                }
+                let mut hz = o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh).unwrap_or(0);
+                while hz > 144 && o.conn.step_down_mode() {
+                    hz = o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh).unwrap_or(0);
+                }
+            }
+            let hot = outputs
+                .first()
+                .and_then(|o| o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh))
+                .unwrap_or(0);
+            if hot > 240 {
+                eprintln!(
+                    "carrot: linear scanout at {hot}Hz plus a second head may underrun; set output {{ mode }} to cap one if the screen flashes"
                 );
-                let out = Rc::new(out);
-                let pump = out.dev.spawn_flip_pump(&state.eng, &state.ring);
-                let st = state.clone();
-                let o = out.clone();
-                let present = state.eng.spawn("present", async move {
-                    present_loop(&st, &o).await;
-                });
-                // logind pauses the card around vt switches
-                if let Some(s) = session {
-                    let o = out.clone();
-                    let st = state.clone();
-                    s.on_device(
-                        out.devnum,
-                        Rc::new(move |ev| match ev {
-                            // no KMS work: logind already revoked master
-                            DeviceEvent::Pause { .. } => o.paused.set(true),
-                            DeviceEvent::Resume { .. } => {
+            }
+        }
+        let mut card_dead = false;
+        loop {
+            let heads: Vec<(Rc<Connector>, u32)> = outputs
+                .iter()
+                .map(|o| (o.conn.clone(), o.bufs[0].fb))
+                .collect();
+            match dev.modeset_heads(&heads) {
+                Ok(()) => break,
+                Err(e) => {
+                    // out of refresh steps: dropping the newest head only
+                    // helps when the kernel rejected the combination
+                    let bandwidth = matches!(
+                        e,
+                        crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::INVAL)
+                            | crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::NOSPC)
+                            | crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::RANGE)
+                    );
+                    if !bandwidth {
+                        eprintln!("carrot: {}: modeset failed: {e} - trying next card", path.display());
+                        card_dead = true;
+                        break;
+                    }
+                    match outputs.pop() {
+                        Some(o) => eprintln!(
+                            "carrot: {}: no mode fits alongside the other heads; head dropped",
+                            o.conn.name
+                        ),
+                        None => break,
+                    }
+                }
+            }
+        }
+        if card_dead || outputs.is_empty() {
+            continue;
+        }
+        for (i, out) in outputs.iter().enumerate() {
+            out.index.set(i);
+        }
+        // a workspace per output up front, bound to it
+        {
+            let mut list = state.workspaces.borrow_mut();
+            while list.len() < outputs.len().min(9) {
+                list.push(Rc::new(crate::tree::workspace::Workspace::default()));
+            }
+            for i in 0..outputs.len().min(9) {
+                list[i].output.set(i);
+            }
+        }
+        let pump = dev.spawn_flip_pump(&state.eng, &state.ring);
+        // one logind pause/resume handler per card; it walks the live output
+        // list so hotplugged outputs are covered too. the boot set rides
+        // along until the display lands in state.
+        if let Some(s) = session {
+            let boot = outputs.clone();
+            let st = state.clone();
+            s.on_device(
+                devnum,
+                Rc::new(move |ev| {
+                    let outs: Vec<Rc<Output>> = match st.display.borrow().as_ref() {
+                        Some(d) => d.outputs.borrow().clone(),
+                        None => boot.clone(),
+                    };
+                    match ev {
+                        // no KMS work: logind already revoked master
+                        DeviceEvent::Pause { .. } => {
+                            for o in &outs {
+                                o.paused.set(true);
+                            }
+                        }
+                        DeviceEvent::Resume { .. } => {
+                            let mut heads = Vec::new();
+                            for o in &outs {
                                 o.paused.set(false);
                                 o.cursor_locked.set(false);
                                 // an in-flight flip never completes when the
@@ -186,58 +372,203 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                                         cur.set_enabled(true);
                                     }
                                 }
-                                let fb = o.bufs[o.front.get()].fb;
-                                if let Err(e) = o.conn.modeset(&o.dev, fb) {
+                                heads.push((o.conn.clone(), o.bufs[o.front.get()].fb));
+                            }
+                            if let Some(o) = outs.first() {
+                                if let Err(e) = o.dev.modeset_heads(&heads) {
                                     eprintln!("carrot: resume modeset: {e}");
                                 }
-                                st.damage.trigger();
                             }
-                            DeviceEvent::Gone { .. } => o.paused.set(true),
-                        }),
-                    );
-                }
-                // seed the cursor plane: system theme, else built-in arrow
-                if let Some(p) = out.conn.pipe.borrow().as_ref() {
-                    if let Some(cur) = &p.cursor {
-                        match crate::input::cursor_theme::load("left_ptr") {
-                            Some(img) => {
-                                cur.write(&img.pixels, img.width, img.height);
-                                cur.hotspot.set(img.hotspot);
-                            }
-                            None => {
-                                eprintln!(
-                                    "carrot: no xcursor theme found, using the built-in arrow"
-                                );
-                                let (px, w, h) = default_cursor();
-                                cur.write(&px, w, h);
+                            st.damage.trigger();
+                        }
+                        DeviceEvent::Gone { .. } => {
+                            for o in &outs {
+                                o.paused.set(true);
                             }
                         }
                     }
-                }
-                state.output_size.set((out.width, out.height));
-                // paint over the modeset's uninitialized first buffer
-                state.damage.trigger();
-                return Some(Display {
-                    out,
-                    _pump: pump,
-                    _present: present,
-                    hotplug: RefCell::new(None),
-                });
-            }
-            Err(e) => {
-                eprintln!("carrot: {}: {e} - trying next card", path.display());
-            }
+                }),
+            );
         }
+        let presents: Vec<SpawnedFuture<()>> = outputs
+            .iter()
+            .map(|out| {
+                let st = state.clone();
+                let o = out.clone();
+                state.eng.spawn("present", async move {
+                    present_loop(&st, &o).await;
+                })
+            })
+            .collect();
+        // the dmabuf global speaks for this device from here on
+        {
+            let rdev = rustix::fs::fstat(dev.fd.as_fd())
+                .map(|st| st.st_rdev)
+                .unwrap_or(0);
+            let mut formats = Vec::new();
+            match core.sample_modifiers(vk::Format::B8G8R8A8_UNORM) {
+                Ok(mods) => {
+                    for &m in &mods {
+                        formats.push((crate::format::XRGB8888.drm, m));
+                        formats.push((crate::format::ARGB8888.drm, m));
+                    }
+                }
+                Err(e) => eprintln!("carrot: dmabuf modifier probe failed: {e}"),
+            }
+            if formats.is_empty() {
+                formats.push((crate::format::XRGB8888.drm, 0));
+                formats.push((crate::format::ARGB8888.drm, 0));
+            }
+            eprintln!(
+                "carrot: dmabuf: {} format+modifier pairs, main device {rdev:#x}",
+                formats.len()
+            );
+            *state.dmabuf_info.borrow_mut() = Some(crate::protocol::dmabuf::DmabufInfo {
+                main_device: rdev,
+                formats,
+            });
+        }
+        // one consumer per AsyncEvent: mirror global damage into each output.
+        // the boot set covers the window before the display lands in state;
+        // after that the live list picks up hotplugged outputs.
+        let fan_outs = outputs.clone();
+        let st = state.clone();
+        let fanout = state.eng.spawn("damage fanout", async move {
+            loop {
+                st.damage.triggered().await;
+                for o in &fan_outs {
+                    o.damage.trigger();
+                }
+                if let Some(d) = st.display.borrow().as_ref() {
+                    for o in d.outputs.borrow().iter().skip(fan_outs.len()) {
+                        o.damage.trigger();
+                    }
+                }
+            }
+        });
+        // union extent: pointer clamping + xdg_output fall back to it
+        let uw = outputs.iter().map(|o| o.pos.get().0 + o.width as i32).max().unwrap_or(0);
+        let uh = outputs.iter().map(|o| o.pos.get().1 + o.height as i32).max().unwrap_or(0);
+        state.output_size.set((uw as u32, uh as u32));
+        let display = Display {
+            outputs: RefCell::new(outputs),
+            dev,
+            core,
+            renderer,
+            devnum,
+            _pump: pump,
+            _presents: RefCell::new(presents),
+            _fanout: fanout,
+            hotplug: RefCell::new(None),
+        };
+        for out in display.outputs.borrow().iter() {
+            register_output_global(state, &display, out);
+        }
+        // paint over the modesets' uninitialized first buffers
+        state.damage.trigger();
+        return Some(display);
     }
     eprintln!("carrot: no usable output, running headless");
     None
 }
 
+/// screenshot capture: compose the output like a present would, render
+/// offscreen, read back, crop to the output-local region. rows come back
+/// tightly packed (stride = width * 4).
+pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect) -> Option<Vec<u8>> {
+    let d = state.display.borrow();
+    let out = d.as_ref()?.outputs.borrow().get(out_index)?.clone();
+    drop(d);
+    let ops = compose(state, &out);
+    let mut waits = Vec::new();
+    for fence in out.frame_fences.borrow_mut().drain(..) {
+        if let Ok(sem) = out.renderer.import_wait(fence) {
+            waits.push(sem);
+        }
+    }
+    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+        Ok(px) => px,
+        Err(e) => {
+            eprintln!("carrot: screencopy render failed: {e}");
+            return None;
+        }
+    };
+    let (rw, rh) = (region.width() as usize, region.height() as usize);
+    let (ox, oy) = (region.x1 as usize, region.y1 as usize);
+    let src_stride = out.width as usize * 4;
+    let mut px = vec![0u8; rw * rh * 4];
+    for row in 0..rh {
+        let s0 = (oy + row) * src_stride + ox * 4;
+        px[row * rw * 4..][..rw * 4].copy_from_slice(&full[s0..s0 + rw * 4]);
+    }
+    Some(px)
+}
+
+/// window capture: compose only the toplevel's surface tree - subsurfaces
+/// included, popups/borders/opacity rules not - then read back and crop to
+/// its rect. rows come back tightly packed (stride = rect width * 4).
+pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Option<Vec<u8>> {
+    let surface = win.surface();
+    if !surface.mapped.get() {
+        return None;
+    }
+    let ws = crate::tree::workspace_of(state, win)?;
+    let out = {
+        let d = state.display.borrow();
+        let d = d.as_ref()?;
+        let outs = d.outputs.borrow();
+        outs.get(ws.output.get()).cloned().or_else(|| outs.first().cloned())?
+    };
+    let rect = win.draw_rect(state);
+    if rect.is_empty() {
+        return None;
+    }
+    let geo = win.geometry();
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, &mut ops, &mut live);
+    let mut waits = Vec::new();
+    for fence in out.frame_fences.borrow_mut().drain(..) {
+        if let Ok(sem) = out.renderer.import_wait(fence) {
+            waits.push(sem);
+        }
+    }
+    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+        Ok(px) => px,
+        Err(e) => {
+            eprintln!("carrot: window capture render failed: {e}");
+            return None;
+        }
+    };
+    let (rw, rh) = (rect.width() as usize, rect.height() as usize);
+    let mut px = vec![0u8; rw * rh * 4];
+    // a float can hang off the screen; rows outside the output stay black
+    let vis = rect.intersect(out.rect());
+    let (gx, gy) = out.pos.get();
+    let src_stride = out.width as usize * 4;
+    let n = vis.width() as usize * 4;
+    for row in vis.y1..vis.y2 {
+        let s0 = (row - gy) as usize * src_stride + (vis.x1 - gx) as usize * 4;
+        let d0 = (row - rect.y1) as usize * rw * 4 + (vis.x1 - rect.x1) as usize * 4;
+        px[d0..d0 + n].copy_from_slice(&full[s0..s0 + n]);
+    }
+    Some(px)
+}
+
+/// output-local full rect + size lookup for the screencopy protocol
+pub fn output_geometry(state: &Rc<State>, name: &str) -> Option<(usize, u32, u32)> {
+    let d = state.display.borrow();
+    let outs = d.as_ref()?.outputs.borrow().clone();
+    outs.iter()
+        .find(|o| o.conn.name == name)
+        .map(|o| (o.index.get(), o.width, o.height))
+}
+
 async fn init_card(
-    state: &Rc<State>,
     path: &std::path::Path,
     session: Option<&Rc<LogindSession>>,
-) -> Result<Output, String> {
+    prefer: &dyn Fn(&str) -> Option<(u32, u32, Option<u32>)>,
+) -> Result<(Rc<DrmDevice>, Rc<VkCore>, Rc<Renderer>, u64), String> {
     let devnum = rustix::fs::stat(path)
         .map_err(|e| format!("stat: {e}"))?
         .st_rdev;
@@ -251,14 +582,308 @@ async fn init_card(
         }
         None => DrmDevice::open(path).map_err(|e| format!("open: {e}"))?,
     };
-    dev.assign_pipes().map_err(|e| format!("pipes: {e}"))?;
-    let conn = dev
-        .connectors
+    dev.assign_pipes(prefer).map_err(|e| format!("pipes: {e}"))?;
+    let core = Rc::new(VkCore::new(dev.fd.as_fd()).map_err(|e| format!("vulkan: {e}"))?);
+    println!("carrot: rendering on {}", core.device_name);
+    let renderer = Rc::new(
+        Renderer::new(&core, vk::Format::B8G8R8A8_UNORM).map_err(|e| format!("renderer: {e}"))?,
+    );
+    Ok((dev, core, renderer, devnum))
+}
+
+/// register (or re-register) an output's wl_output global
+fn register_output_global(state: &Rc<State>, d: &Display, out: &Rc<Output>) {
+    let name = state.globals.add(Rc::new(d.output_global(out)));
+    out.global_name.set(name);
+}
+
+/// arm the netlink watcher; called once the display is stored in state
+pub fn start_hotplug(state: &Rc<State>) {
+    if state.display.borrow().is_none() {
+        return;
+    }
+    let st = state.clone();
+    let task = state.eng.spawn("drm hotplug", async move {
+        let fd = match crate::drm::uevent::open() {
+            Ok(fd) => Rc::new(fd),
+            Err(e) => {
+                eprintln!("carrot: hotplug disabled: {e}");
+                return;
+            }
+        };
+        // fresh event nodes lag their uevent: udev hasn't applied
+        // permissions yet and logind can refuse the take. a worker delays
+        // each add a beat and serializes them so duplicates can't race
+        let adds: Rc<crate::util::AsyncQueue<String>> = Rc::new(Default::default());
+        let aq = adds.clone();
+        let ast = st.clone();
+        let _adder = st.eng.spawn("input hotplug", async move {
+            loop {
+                let devname = aq.pop().await;
+                let deadline = Time::from_nsec(Time::now().nsec() + 250_000_000);
+                let _ = ast.ring.timeout(deadline).await;
+                let session = ast.session.borrow().clone();
+                let mgr = ast.input.borrow().as_ref().map(|i| i.mgr.clone());
+                let (Some(session), Some(mgr)) = (session, mgr) else {
+                    continue;
+                };
+                let path = std::path::PathBuf::from(format!("/dev/{devname}"));
+                if let Some(dev) = mgr.add_device(&ast, &session, &path).await {
+                    println!("carrot: input: {} added", dev.name);
+                }
+            }
+        });
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (b, n) = match st.ring.read(&fd, buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("carrot: hotplug read failed: {e:?}");
+                    return;
+                }
+            };
+            buf = b;
+            let msg = &buf[..n];
+            if crate::drm::uevent::is_drm_change(msg) {
+                rescan(&st);
+            } else if let Some((added, devname)) = crate::drm::uevent::input_change(msg) {
+                if added {
+                    adds.push(devname);
+                } else if let Some(devnum) = crate::drm::uevent::devnum(msg) {
+                    let session = st.session.borrow().clone();
+                    let mgr = st.input.borrow().as_ref().map(|i| i.mgr.clone());
+                    if let (Some(session), Some(mgr)) = (session, mgr) {
+                        mgr.remove_device(&session, devnum);
+                    }
+                }
+            }
+        }
+    });
+    if let Some(d) = state.display.borrow().as_ref() {
+        *d.hotplug.borrow_mut() = Some(task);
+    }
+}
+
+/// something changed on the card: re-probe every connector, tear down what
+/// left, bring up what arrived, then rebuild the global layout
+fn rescan(state: &Rc<State>) {
+    let dref = state.display.borrow();
+    let Some(d) = dref.as_ref() else { return };
+    let old: Vec<Rc<Output>> = d.outputs.borrow().clone();
+
+    for conn in d.dev.connectors.borrow().iter() {
+        let Ok(info) = sys::connector(d.dev.fd.as_fd(), conn.id.0, true) else {
+            continue;
+        };
+        let now = info.connection == 1;
+        conn.connected.set(now);
+        if now {
+            *conn.modes.borrow_mut() = info.modes;
+        }
+    }
+
+    // removals first: their crtcs free up for arrivals
+    let gone: Vec<usize> = d
+        .outputs
         .borrow()
         .iter()
-        .find(|c| c.pipe.borrow().is_some())
-        .cloned()
-        .ok_or("no connected display")?;
+        .enumerate()
+        .filter(|(_, o)| !o.conn.connected.get())
+        .map(|(i, _)| i)
+        .collect();
+    for &i in gone.iter().rev() {
+        let out = d.outputs.borrow_mut().remove(i);
+        // the present loop dies with its output: dropping the task cancels
+        // it, outside the borrow in case teardown lands back here
+        let present = d._presents.borrow_mut().remove(i);
+        drop(present);
+        state.globals.remove(out.global_name.get());
+        crate::protocol::image_copy_capture::output_removed(state, &out.conn.name);
+        if let Some(p) = out.conn.pipe.borrow_mut().take() {
+            // stop the kernel scanning a dead head before freeing the crtc
+            let mut ch = crate::drm::atomic::Change::default();
+            out.conn.clear_routing(&mut ch);
+            ch.set(p.crtc.id, p.crtc.props.active, 0);
+            ch.set(p.crtc.id, p.crtc.props.mode_id, 0);
+            ch.set(p.primary.id, p.primary.props.fb_id, 0);
+            ch.set(p.primary.id, p.primary.props.crtc_id, 0);
+            if let Some(cur) = &p.cursor {
+                cur.clear_routing(&mut ch);
+            }
+            if let Err(e) = ch.commit(
+                d.dev.fd.as_fd(),
+                crate::drm::atomic::ALLOW_MODESET,
+                0,
+            ) {
+                eprintln!("carrot: head disable failed: {e}");
+            }
+            p.crtc.connector.set(crate::drm::ObjId(0));
+            // free a joiner-slave reservation held next door
+            for c in d.dev.crtcs.iter() {
+                if c.connector.get() == out.conn.id && c.id != p.crtc.id {
+                    c.connector.set(crate::drm::ObjId(0));
+                }
+            }
+        }
+        for (_, (t, _)) in out.textures.borrow_mut().drain() {
+            out.renderer.destroy_texture(&t);
+        }
+        for t in out.retired_tex.borrow_mut().drain(..) {
+            out.renderer.destroy_texture(&t);
+        }
+        eprintln!("carrot: output {} disconnected", out.conn.name);
+    }
+
+    {
+        let cfg = state.config.borrow().clone();
+        let prefer = |name: &str| -> Option<(u32, u32, Option<u32>)> {
+            cfg.outputs.iter().find(|o| o.name == name).and_then(|o| o.mode)
+        };
+        if let Err(e) = d.dev.assign_pipes(&prefer) {
+            eprintln!("carrot: hotplug pipe assignment: {e}");
+        }
+    }
+    let known: Vec<Rc<Connector>> = d.dev.connectors.borrow().clone();
+    for conn in known {
+        if conn.pipe.borrow().is_none() {
+            continue;
+        }
+        let exists = d.outputs.borrow().iter().any(|o| Rc::ptr_eq(&o.conn, &conn));
+        if exists {
+            continue;
+        }
+        let name = conn.name.clone();
+        match init_output(&d.dev, &d.core, &d.renderer, conn, d.devnum) {
+            Ok(out) => {
+                let out = Rc::new(out);
+                register_output_global(state, d, &out);
+                let st = state.clone();
+                let o = out.clone();
+                d._presents.borrow_mut().push(state.eng.spawn("present", async move {
+                    present_loop(&st, &o).await;
+                }));
+                eprintln!("carrot: output {} connected ({}x{})", out.conn.name, out.width, out.height);
+                d.outputs.borrow_mut().push(out);
+            }
+            Err(e) => eprintln!("carrot: {name}: {e} - connector skipped"),
+        }
+    }
+    // one commit over the full head set; the ladder steps the newest down
+    {
+        let heads: Vec<(Rc<Connector>, u32)> = d
+            .outputs
+            .borrow()
+            .iter()
+            .map(|o| (o.conn.clone(), o.bufs[o.front.get()].fb))
+            .collect();
+        if let Err(e) = d.dev.modeset_heads(&heads) {
+            eprintln!("carrot: hotplug modeset: {e}");
+        }
+    }
+
+    finish_topology(state, d, &old);
+}
+
+/// re-tile positions and indexes, remap every index-keyed binding through
+/// the identity of the outputs that survived, and re-arm the world
+fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
+    let outs = d.outputs.borrow();
+    let mut x = 0i32;
+    for (i, o) in outs.iter().enumerate() {
+        o.index.set(i);
+        o.pos.set((x, 0));
+        o.usable.set(o.rect());
+        x += o.width as i32;
+    }
+    let uw = outs.iter().map(|o| o.rect().x2).max().unwrap_or(1);
+    let uh = outs.iter().map(|o| o.rect().y2).max().unwrap_or(1);
+    state.output_size.set((uw as u32, uh as u32));
+
+    // old slot -> new slot by identity; the fallen map to slot 0
+    let map: Vec<usize> = old
+        .iter()
+        .map(|o| outs.iter().position(|n| Rc::ptr_eq(n, o)).unwrap_or(0))
+        .collect();
+    let remap = |slot: usize| map.get(slot).copied().unwrap_or(0);
+    for ws in state.workspaces.borrow().iter() {
+        ws.output.set(remap(ws.output.get()));
+    }
+    // layer surfaces stay pinned: the ones whose output left are closed,
+    // not remapped (the surface will no longer be shown)
+    let layers: Vec<Rc<crate::shell::layer::LayerSurface>> = state.layers.borrow().clone();
+    for ls in layers {
+        let slot = ls.output.get();
+        let survivor = old.get(slot).and_then(|o| outs.iter().position(|n| Rc::ptr_eq(n, o)));
+        let Some(new) = survivor else {
+            ls.send_closed();
+            continue;
+        };
+        ls.output.set(new);
+        // moved bars re-learn their screen
+        if new != slot && !ls.surface.destroyed.get() && ls.surface.mapped.get() {
+            crate::tree::send_surface_output(state, &ls.surface, new, true);
+        }
+    }
+    state.focused_output.set(remap(state.focused_output.get()).min(outs.len().saturating_sub(1)));
+
+    // every output shows a workspace bound to it; make one when none is
+    for o in outs.iter() {
+        let ok = state
+            .workspaces
+            .borrow()
+            .get(o.ws.get())
+            .is_some_and(|w| w.output.get() == o.index.get());
+        if ok {
+            continue;
+        }
+        let mut list = state.workspaces.borrow_mut();
+        let found = list.iter().position(|w| w.output.get() == o.index.get());
+        let idx = match found {
+            Some(i) => i,
+            None => {
+                let w = crate::tree::workspace::Workspace::default();
+                w.output.set(o.index.get());
+                list.push(Rc::new(w));
+                list.len() - 1
+            }
+        };
+        o.ws.set(idx);
+    }
+    let active_of_focus = outs
+        .get(state.focused_output.get())
+        .map(|o| o.ws.get())
+        .unwrap_or(0);
+    drop(outs);
+    state.active_ws.set(active_of_focus);
+
+    crate::shell::layer::arrange(state);
+    for ws in crate::tree::visible_workspaces(state) {
+        crate::tree::relayout(state, &ws);
+    }
+    // pull the pointer back onto glass if its output vanished
+    if let Some(seat) = state.seat.borrow().clone() {
+        let (px, py) = (seat.ptr_x.get(), seat.ptr_y.get());
+        let (cx, cy) = clamp_pointer(state, px, py);
+        if (cx, cy) != (px, py) {
+            seat.warp(state, cx, cy);
+        }
+    }
+    // surviving outputs may have new positions; bound objects re-learn them
+    crate::protocol::output::resend_output_state(state);
+    state.damage.trigger();
+}
+
+/// scanout buffers + modeset for one connector
+fn init_output(
+    dev: &Rc<DrmDevice>,
+    core: &Rc<VkCore>,
+    renderer: &Rc<Renderer>,
+    conn: Rc<Connector>,
+    devnum: u64,
+) -> Result<Output, String> {
+    let dev = dev.clone();
+    let core = core.clone();
+    let renderer = renderer.clone();
     let (width, height, primary) = {
         let pipe = conn.pipe.borrow();
         let p = pipe.as_ref().unwrap();
@@ -268,41 +893,6 @@ async fn init_card(
             p.primary.clone(),
         )
     };
-
-    let core = Rc::new(VkCore::new(dev.fd.as_fd()).map_err(|e| format!("vulkan: {e}"))?);
-    println!("carrot: rendering on {}", core.device_name);
-    let renderer = Rc::new(
-        Renderer::new(&core, vk::Format::B8G8R8A8_UNORM).map_err(|e| format!("renderer: {e}"))?,
-    );
-
-    // the dmabuf global speaks for this device from here on
-    {
-        let rdev = rustix::fs::fstat(dev.fd.as_fd())
-            .map(|st| st.st_rdev)
-            .unwrap_or(0);
-        let mut formats = Vec::new();
-        match core.sample_modifiers(vk::Format::B8G8R8A8_UNORM) {
-            Ok(mods) => {
-                for &m in &mods {
-                    formats.push((XRGB8888.drm, m));
-                    formats.push((crate::format::ARGB8888.drm, m));
-                }
-            }
-            Err(e) => eprintln!("carrot: dmabuf modifier probe failed: {e}"),
-        }
-        if formats.is_empty() {
-            formats.push((XRGB8888.drm, 0));
-            formats.push((crate::format::ARGB8888.drm, 0));
-        }
-        eprintln!(
-            "carrot: dmabuf: {} format+modifier pairs, main device {rdev:#x}",
-            formats.len()
-        );
-        *state.dmabuf_info.borrow_mut() = Some(crate::protocol::dmabuf::DmabufInfo {
-            main_device: rdev,
-            formats,
-        });
-    }
 
     let mk_buf = || -> Result<OutBuf, String> {
         // tier 1: vulkan-native, addfb2 arbitrates
@@ -403,10 +993,6 @@ async fn init_card(
         }
     );
 
-    // light up with buffer 0; render catches up on first damage
-    conn.modeset(&dev, bufs[0].fb)
-        .map_err(|e| format!("modeset: {e}"))?;
-
     Ok(Output {
         dev,
         conn,
@@ -415,21 +1001,27 @@ async fn init_card(
         front: Cell::new(0),
         width,
         height,
+        index: Cell::new(0),
+        global_name: Cell::new(0),
+        damage: AsyncEvent::default(),
+        pos: Cell::new((0, 0)),
+        ws: Cell::new(0),
+        usable: Cell::new(Rect::default()),
         textures: RefCell::new(HashMap::new()),
         retired_tex: RefCell::new(Vec::new()),
-        frame_fences: RefCell::new(Vec::new()),
         devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
+        frame_fences: RefCell::new(Vec::new()),
     })
 }
 
 async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
     let mut dirty = false;
     loop {
-        EitherEvent(&state.damage, &out.conn.vblank).await;
+        EitherEvent(&out.damage, &out.conn.vblank).await;
         let _ = out.conn.vblank.take();
-        dirty |= state.damage.take();
+        dirty |= out.damage.take();
         // render only when dirty AND the pipe is free
         if !dirty || out.conn.flip_pending.get() || out.paused.get() {
             continue;
@@ -474,6 +1066,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 continue;
             }
         };
+        state.frames_in_flight.set(state.frames_in_flight.get() + 1);
         buf.undefined.set(false);
 
         // render fence into the commit
@@ -498,26 +1091,33 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 dirty = true;
             }
             Err(e) => {
-                eprintln!("carrot: flip failed: {e} - display stops, compositor continues");
-                out.renderer.recycle_frame(frame);
-                return;
+                // a flip error isn't fatal: log, full damage, retry next trigger
+                eprintln!("carrot: {}: flip failed: {e}; retrying", out.conn.name);
+                dirty = true;
             }
         }
 
         // fence fd doubles as the completion signal; drives cleanup + callbacks
+        let completed = sync.is_some();
         if let Some(fd) = sync {
             let fd = Rc::new(fd);
             let _ = state.ring.readable(&fd).await;
         }
-        out.renderer.recycle_frame(frame);
-        // the frame that referenced these has now scanned out
-        for t in out.retired_tex.borrow_mut().drain(..) {
-            out.renderer.destroy_texture(&t);
+        // this frame is done sampling: retired textures can go now (kept
+        // for the next round if the fence export failed)
+        if completed {
+            for t in out.retired_tex.borrow_mut().drain(..) {
+                out.renderer.destroy_texture(&t);
+            }
         }
-        // parked dmabufs are free now the sampling frame is done; drop sends release
-        state.retired.borrow_mut().clear();
-        // output copy-capture sessions get their frame from the composed output
-        crate::protocol::image_copy_capture::output_presented(state, "");
+        // frame done: parked dmabuf attachments release once NO output still
+        // has a frame in flight that might sample them
+        let inflight = state.frames_in_flight.get().saturating_sub(1);
+        state.frames_in_flight.set(inflight);
+        if inflight == 0 {
+            state.retired.borrow_mut().clear();
+        }
+        out.renderer.recycle_frame(frame);
         let ms = (Time::now().nsec() / 1_000_000) as u32;
         state.clients.for_each(|c| {
             c.objects.for_each_surface(|s| {
@@ -526,24 +1126,61 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 }
             });
         });
+        // this present only ran because content changed: pending output
+        // captures complete against the frame just shown
+        crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
     }
 }
 
-/// border colors; config keys once the config layer exists
+/// clamp a global pointer position: x into the union of outputs, y into
+/// the output column under x. headless keeps the plain union clamp.
+pub fn clamp_pointer(state: &Rc<State>, x: f64, y: f64) -> (f64, f64) {
+    let d = state.display.borrow();
+    if let Some(d) = d.as_ref() {
+        let outs = d.outputs.borrow();
+        if !outs.is_empty() {
+            let min_x = outs.iter().map(|o| o.rect().x1).min().unwrap_or(0);
+            let max_x = outs.iter().map(|o| o.rect().x2).max().unwrap_or(1);
+            let x = x.clamp(min_x as f64, (max_x - 1).max(min_x) as f64);
+            let col = outs
+                .iter()
+                .find(|o| {
+                    let r = o.rect();
+                    (x as i32) >= r.x1 && (x as i32) < r.x2
+                })
+                .unwrap_or(&outs[0]);
+            let r = col.rect();
+            let y = y.clamp(r.y1 as f64, (r.y2 - 1).max(r.y1) as f64);
+            return (x, y);
+        }
+    }
+    let (w, h) = state.output_size.get();
+    (
+        x.clamp(0.0, (w.max(1) - 1) as f64),
+        y.clamp(0.0, (h.max(1) - 1) as f64),
+    )
+}
+
 /// paint order tiled, fullscreen, floats; each window drawn as its surface
 /// stack, clipped to the window box so CSD can't leak past the tile. popups
 /// sit above their window.
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     let mut ops = Vec::new();
     let mut live: Vec<(ClientId, u64)> = Vec::new();
-    let ws = crate::tree::active(state);
+    let ws = {
+        let list = state.workspaces.borrow();
+        match list.get(out.ws.get()) {
+            Some(w) => w.clone(),
+            None => return ops,
+        }
+    };
     let focused = state
         .seat
         .borrow()
         .as_ref()
         .and_then(|s| s.kb_focus.borrow().clone());
     let fs = ws.fullscreen.borrow().clone();
-    let screen = Rect::new_sized_saturating(0, 0, out.width as i32, out.height as i32);
+    let screen = out.rect();
     let cfg = state.config.borrow().clone();
 
     let draw = |win: &Rc<crate::tree::Window>, ops: &mut Vec<RenderOp>, live: &mut Vec<(ClientId, u64)>| {
@@ -569,7 +1206,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         let alpha = win.rule_opacity.get().unwrap_or(1.0);
         draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, ops, live);
         if let Some(tl) = win.xdg_opt() {
-            draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, alpha, ops, live);
+            draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
         }
     };
 
@@ -592,9 +1229,18 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live);
     }
     draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
+    // a drag icon rides the pointer, above everything but the cursor
+    if let Some(seat) = state.seat.borrow().clone() {
+        if let Some(drag) = seat.data.drag() {
+            if let Some(icon) = drag.icon.borrow().clone() {
+                let (dx, dy) = drag.icon_off.get();
+                let (px, py) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
+                draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, &mut ops, &mut live);
+            }
+        }
+    }
 
-    // a surface gone from the scene keeps its texture until the frame
-    // that referenced it clears the fence
+    // textures for gone buffers don't outlive the frame
     let mut textures = out.textures.borrow_mut();
     let stale: Vec<_> = textures
         .keys()
@@ -603,6 +1249,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         .collect();
     for k in stale {
         if let Some((t, _)) = textures.remove(&k) {
+            // the frame in flight may still sample it; destroy after fence
             out.retired_tex.borrow_mut().push(t);
         }
     }
@@ -656,7 +1303,6 @@ fn draw_popup(
     ox: i32,
     oy: i32,
     screen: Rect,
-    alpha: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
@@ -666,8 +1312,8 @@ fn draw_popup(
     let (rx, ry) = p.rel.get();
     let (px, py) = (ox + rx, oy + ry);
     let geo = p.xdg.geometry();
-    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, alpha, ops, live);
-    draw_popups(state, out, &p.xdg, px, py, screen, alpha, ops, live);
+    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, 1.0, ops, live);
+    draw_popups(state, out, &p.xdg, px, py, screen, ops, live);
 }
 
 fn draw_popups(
@@ -677,11 +1323,10 @@ fn draw_popups(
     ox: i32,
     oy: i32,
     screen: Rect,
-    alpha: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
-    xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, alpha, ops, live));
+    xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
 }
 
 // one shell layer, mapping order = z within it, popups on top of each
@@ -695,12 +1340,14 @@ fn draw_layer(
 ) {
     let layers = state.layers.borrow().clone();
     for ls in layers.iter() {
-        if ls.current.get().layer != layer || !ls.mapped() {
+        if ls.current.get().layer != layer
+            || !ls.mapped()
+            || ls.output.get() != out.index.get()
+        {
             continue;
         }
         let r = ls.rect.get();
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, ops, live);
-        ls.for_each_popup(|p| draw_popup(state, out, p, r.x1, r.y1, screen, 1.0, ops, live));
     }
 }
 
@@ -731,8 +1378,8 @@ fn draw_buffer(
     };
     let opaque = !buf.format.has_alpha();
     if let Some(img) = buf.dmabuf() {
-        // gpu buffers import once and sample in place - the client's renders
-        // never round-trip through the cpu
+        // gpu buffers import once and are sampled in place - the client's
+        // renders never round-trip through the cpu
         let mut textures = out.textures.borrow_mut();
         let need_new = match textures.get(&key) {
             Some((t, _)) => t.width != bw || t.height != bh,
@@ -771,7 +1418,7 @@ fn draw_buffer(
             }
             match out.renderer.create_texture(bw, bh, opaque) {
                 Ok(t) => {
-                    // gen behind the surface's so the first pass uploads
+                    // gen behind the surface's: the first pass uploads
                     textures.insert(key, (t, s.content_gen.get().wrapping_sub(1)));
                 }
                 Err(e) => {
@@ -780,22 +1427,22 @@ fn draw_buffer(
                 }
             }
         }
-        // the pixels only move on commit; a compose over an unchanged
-        // surface just re-samples the texture it already has
+        // the pixels only move on commit; a compose pass over an
+        // unchanged surface samples the texture it already has
         let cur = s.content_gen.get();
         let entry = textures.get_mut(&key).unwrap();
         if entry.1 != cur {
             let shadow = s.shm_shadow.borrow();
             let row = (bw * 4) as usize;
             let need = row * bh as usize;
-            let stride = buf.stride as usize;
             let res = if let Some(px) = shadow.as_ref().filter(|p| p.len() >= need) {
                 // the commit-time shadow is the source of truth
                 out.renderer
                     .upload_texture(&entry.0, |dst| dst[..need].copy_from_slice(&px[..need]))
             } else {
-                // shadow missing (capture failed): fall back to the client
-                // buffer, zero-filling short rows instead of leaking staging
+                // no shadow (capture failed): read the client buffer,
+                // zero-filling any short row instead of leaking staging
+                let stride = buf.stride as usize;
                 let access = match buf.shm_access() {
                     Some(a) => a,
                     None => return,
@@ -849,8 +1496,9 @@ fn draw_buffer(
     }
     let textures = out.textures.borrow();
     let (tex, _) = textures.get(&key).unwrap();
-    let fx = |v: i32| v as f32 / out.width as f32 * 2.0 - 1.0;
-    let fy = |v: i32| v as f32 / out.height as f32 * 2.0 - 1.0;
+    let (gx, gy) = out.pos.get();
+    let fx = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fy = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
     ops.push(RenderOp::Tex {
         view: tex.view,
         pos: [fx(vis.x1), fy(vis.y1)],
@@ -869,89 +1517,6 @@ fn draw_buffer(
         mul: alpha,
         opaque: opaque && alpha >= 1.0,
     });
-}
-
-/// (slot, width, height) of the output a capture targets; single output
-/// for now, so the wl_output argument is resolved to slot 0
-pub fn output_geometry(state: &Rc<State>) -> Option<(usize, u32, u32)> {
-    let d = state.display.borrow();
-    let out = &d.as_ref()?.out;
-    Some((0, out.width, out.height))
-}
-
-/// compose the output and read the pixels back, then crop to the region.
-/// rows come back tightly packed (stride = region width * 4)
-pub fn screencopy(state: &Rc<State>, _out_index: usize, region: Rect) -> Option<Vec<u8>> {
-    let out = {
-        let d = state.display.borrow();
-        d.as_ref()?.out.clone()
-    };
-    let ops = compose(state, &out);
-    let mut waits = Vec::new();
-    for fence in out.frame_fences.borrow_mut().drain(..) {
-        if let Ok(sem) = out.renderer.import_wait(fence) {
-            waits.push(sem);
-        }
-    }
-    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
-        Ok(px) => px,
-        Err(e) => {
-            eprintln!("carrot: screencopy render failed: {e}");
-            return None;
-        }
-    };
-    let (rw, rh) = (region.width() as usize, region.height() as usize);
-    let (ox, oy) = (region.x1 as usize, region.y1 as usize);
-    let src_stride = out.width as usize * 4;
-    let mut px = vec![0u8; rw * rh * 4];
-    for row in 0..rh {
-        let s0 = (oy + row) * src_stride + ox * 4;
-        px[row * rw * 4..][..rw * 4].copy_from_slice(&full[s0..s0 + rw * 4]);
-    }
-    Some(px)
-}
-
-/// compose only a toplevel's surface tree - subsurfaces included, popups
-/// and borders not - then read back and crop to its rect. tightly packed.
-pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Option<Vec<u8>> {
-    let surface = win.surface();
-    if !surface.mapped.get() {
-        return None;
-    }
-    let out = {
-        let d = state.display.borrow();
-        d.as_ref()?.out.clone()
-    };
-    let rect = win.draw_rect(state);
-    if rect.is_empty() {
-        return None;
-    }
-    let geo = win.geometry();
-    let mut ops = Vec::new();
-    let mut live = Vec::new();
-    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, &mut ops, &mut live);
-    let mut waits = Vec::new();
-    for fence in out.frame_fences.borrow_mut().drain(..) {
-        if let Ok(sem) = out.renderer.import_wait(fence) {
-            waits.push(sem);
-        }
-    }
-    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
-        Ok(px) => px,
-        Err(e) => {
-            eprintln!("carrot: window capture render failed: {e}");
-            return None;
-        }
-    };
-    let (rw, rh) = (rect.width() as usize, rect.height() as usize);
-    let src_stride = out.width as usize * 4;
-    let mut px = vec![0u8; rw * rh * 4];
-    for row in 0..rh {
-        let sy = rect.y1 as usize + row;
-        let s0 = sy * src_stride + rect.x1 as usize * 4;
-        px[row * rw * 4..][..rw * 4].copy_from_slice(&full[s0..s0 + rw * 4]);
-    }
-    Some(px)
 }
 
 /// four fills just outside the window box
@@ -973,69 +1538,5 @@ fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Ve
             ],
             color,
         });
-    }
-}
-
-/// watch netlink for input device add/remove and keep the evdev manager in
-/// sync. fresh event nodes lag their uevent, so adds go through a worker that
-/// delays each a beat and serializes them, closing the duplicate-uevent race
-pub fn start_hotplug(state: &Rc<State>) {
-    if state.display.borrow().is_none() {
-        return;
-    }
-    let st = state.clone();
-    let task = state.eng.spawn("input hotplug", async move {
-        let fd = match crate::drm::uevent::open() {
-            Ok(fd) => Rc::new(fd),
-            Err(e) => {
-                eprintln!("carrot: hotplug disabled: {e}");
-                return;
-            }
-        };
-        let adds: Rc<crate::util::AsyncQueue<String>> = Rc::new(Default::default());
-        let aq = adds.clone();
-        let ast = st.clone();
-        let _adder = st.eng.spawn("input hotplug add", async move {
-            loop {
-                let devname = aq.pop().await;
-                let deadline = Time::from_nsec(Time::now().nsec() + 250_000_000);
-                let _ = ast.ring.timeout(deadline).await;
-                let session = ast.session.borrow().clone();
-                let mgr = ast.input.borrow().as_ref().map(|i| i.mgr.clone());
-                let (Some(session), Some(mgr)) = (session, mgr) else {
-                    continue;
-                };
-                let path = std::path::PathBuf::from(format!("/dev/{devname}"));
-                if let Some(dev) = mgr.add_device(&ast, &session, &path).await {
-                    println!("carrot: input: {} added", dev.name);
-                }
-            }
-        });
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let (b, n) = match st.ring.read(&fd, buf).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("carrot: hotplug read failed: {e:?}");
-                    return;
-                }
-            };
-            buf = b;
-            let msg = &buf[..n];
-            if let Some((added, devname)) = crate::drm::uevent::input_change(msg) {
-                if added {
-                    adds.push(devname);
-                } else if let Some(devnum) = crate::drm::uevent::devnum(msg) {
-                    let session = st.session.borrow().clone();
-                    let mgr = st.input.borrow().as_ref().map(|i| i.mgr.clone());
-                    if let (Some(session), Some(mgr)) = (session, mgr) {
-                        mgr.remove_device(&session, devnum);
-                    }
-                }
-            }
-        }
-    });
-    if let Some(d) = state.display.borrow().as_ref() {
-        *d.hotplug.borrow_mut() = Some(task);
     }
 }

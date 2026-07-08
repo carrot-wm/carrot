@@ -1,6 +1,6 @@
-// raw netlink uevent socket, kernel kobject broadcasts on group 1. input
-// event-node add/remove drives device hotplug; the initial set comes from
-// scanning /dev/input at startup.
+// raw netlink uevent socket. the kernel broadcasts kobject events on
+// group 1; drm hotplug arrives as a change event with HOTPLUG=1. we only
+// learn THAT something changed - the connector re-probe sorts out what.
 
 use rustix::net::netlink::{self, SocketAddrNetlink};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, bind, socket_with};
@@ -16,6 +16,20 @@ pub fn open() -> Result<OwnedFd, String> {
     .map_err(|e| format!("netlink socket: {e}"))?;
     bind(&fd, &SocketAddrNetlink::new(0, 1)).map_err(|e| format!("netlink bind: {e}"))?;
     Ok(fd)
+}
+
+/// datagram announces a drm hotplug?
+pub fn is_drm_change(buf: &[u8]) -> bool {
+    let mut drm = false;
+    let mut hotplug = false;
+    for part in buf.split(|&b| b == 0) {
+        match part {
+            b"SUBSYSTEM=drm" => drm = true,
+            b"HOTPLUG=1" => hotplug = true,
+            _ => {}
+        }
+    }
+    drm && hotplug
 }
 
 /// input event-node add/remove? -> (added, devname like "input/event5")
@@ -61,12 +75,22 @@ pub fn devnum(buf: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{devnum, input_change, open};
+    use super::{devnum, input_change, is_drm_change, open};
 
     // group 1 (kernel broadcasts) binds without privileges
     #[test]
     fn the_netlink_socket_opens() {
         open().unwrap();
+    }
+
+    #[test]
+    fn drm_hotplug_is_recognized() {
+        let ev = b"change@/devices/pci0/drm/card0\0ACTION=change\0SUBSYSTEM=drm\0HOTPLUG=1\0DEVNAME=dri/card0\0";
+        assert!(is_drm_change(ev));
+        let other = b"add@/devices/usb1\0ACTION=add\0SUBSYSTEM=usb\0";
+        assert!(!is_drm_change(other));
+        let nohp = b"change@/devices/pci0/drm/card0\0SUBSYSTEM=drm\0";
+        assert!(!is_drm_change(nohp));
     }
 
     #[test]

@@ -100,10 +100,21 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             c.protocol_error(self.id, ROLE, "the surface already has a committed buffer");
             return Ok(());
         }
-        // single output for now; a null output means "compositor picks"
-        // and a named one can only be ours
-        let _ = req.output;
+        // a named output pins the layer there; null means the focused one
+        let output = if req.output.0 == 0 {
+            c.state.focused_output.get()
+        } else {
+            let name = c.objects.output(req.output).map(|o| o.name.clone());
+            let slot = c.state.display.borrow().as_ref().and_then(|d| {
+                d.outputs
+                    .borrow()
+                    .iter()
+                    .position(|o| Some(&o.conn.name) == name.as_ref())
+            });
+            slot.unwrap_or_else(|| c.state.focused_output.get())
+        };
         let ls = Rc::new_cyclic(|me| LayerSurface {
+            output: Cell::new(output),
             id: req.id,
             client: c.clone(),
             version: self.version,
@@ -227,6 +238,8 @@ impl LayerState {
 }
 
 pub struct LayerSurface {
+    /// output slot this layer lives on, fixed at creation
+    pub output: Cell<usize>,
     pub id: ObjectId,
     pub client: Rc<Client>,
     pub version: u32,
@@ -274,7 +287,7 @@ impl LayerSurface {
 
     // configure carries the size the arranger would give the surface now
     fn send_configure_now(&self) {
-        let (w, h) = compute_size(&self.client.state, self.current.get());
+        let (w, h) = compute_size(&self.client.state, self, self.current.get());
         if self.last_cfg.get() == Some((w, h)) {
             return;
         }
@@ -321,6 +334,11 @@ impl LayerSurface {
             state.layers.borrow_mut().retain(|l| l.id != self.id || l.client.id != self.client.id);
             arrange(state);
             apply_kb_lock(state);
+            // a closed surface already left its (gone) output by name; the
+            // stored slot points at whatever holds that index now
+            if !self.surface.destroyed.get() && !self.closed.get() {
+                crate::tree::send_surface_output(state, &self.surface, self.output.get(), false);
+            }
             state.damage.trigger();
         }
     }
@@ -543,6 +561,8 @@ impl SurfaceExt for LayerExt {
             state.layers.borrow_mut().push(ls.clone());
             arrange(&state);
             apply_kb_lock(&state);
+            // the enter event tells the client which output shows it (scale, geometry)
+            crate::tree::send_surface_output(&state, &ls.surface, ls.output.get(), true);
             state.damage.trigger();
         } else if !mapped && ls.linked.get() {
             ls.unlink(&state);
@@ -558,7 +578,7 @@ impl SurfaceExt for LayerExt {
 // -- arrangement --
 
 // where a surface with this state gets placed inside `avail`
-fn place(s: LayerState, avail: Rect, out: Rect) -> Rect {
+fn place(s: LayerState, avail: Rect) -> Rect {
     let (mt, mr, mb, ml) = s.margin;
     let mut a = avail;
     if s.anchor & A_LEFT != 0 {
@@ -575,8 +595,9 @@ fn place(s: LayerState, avail: Rect, out: Rect) -> Rect {
     }
     let w = if s.size.0 > 0 { s.size.0 as i32 } else { a.width() };
     let h = if s.size.1 > 0 { s.size.1 as i32 } else { a.height() };
-    let w = w.clamp(1, out.width().max(1));
-    let h = h.clamp(1, out.height().max(1));
+    // negative margins may push the box past the output; drawing clips
+    let w = w.max(1);
+    let h = h.max(1);
     let lr = A_LEFT | A_RIGHT;
     let x = match s.anchor & lr {
         x if x == A_LEFT => a.x1,
@@ -596,55 +617,108 @@ fn place(s: LayerState, avail: Rect, out: Rect) -> Rect {
 // exclusive zones accumulate: overlay down to background, mapping order
 // within a layer; positives claim their edge and shrink what follows
 pub fn arrange(state: &Rc<State>) {
-    let (ow, oh) = crate::tree::output_extent(state);
-    let out = Rect::new_sized_saturating(0, 0, ow.max(1), oh.max(1));
-    let mut usable = out;
     let layers = state.layers.borrow().clone();
-    for layer in [OVERLAY, TOP, BOTTOM, BACKGROUND] {
-        for ls in layers.iter().filter(|l| l.current.get().layer == layer) {
+    let slots: usize = state
+        .display
+        .borrow()
+        .as_ref()
+        .map(|d| d.outputs.borrow().len())
+        .unwrap_or(1)
+        .max(1);
+    let mut changed = false;
+    for slot in 0..slots {
+        let out = slot_rect(state, slot);
+        let mut usable = out;
+        let on_slot = |l: &&Rc<LayerSurface>| l.output.get() == slot;
+        for layer in [OVERLAY, TOP, BOTTOM, BACKGROUND] {
+            for ls in layers
+                .iter()
+                .filter(on_slot)
+                .filter(|l| l.current.get().layer == layer)
+            {
+                let s = ls.current.get();
+                let Some(edge) = s.exclusive_edge() else { continue };
+                ls.rect.set(place(s, usable));
+                let zone = s.exclusive;
+                let (mt, mr, mb, ml) = s.margin;
+                match edge {
+                    A_TOP => usable.y1 += zone + mt,
+                    A_BOTTOM => usable.y2 -= zone + mb,
+                    A_LEFT => usable.x1 += zone + ml,
+                    _ => usable.x2 -= zone + mr,
+                }
+            }
+        }
+        if usable.width() < 1 || usable.height() < 1 {
+            usable = out;
+        }
+        for ls in layers.iter().filter(on_slot) {
             let s = ls.current.get();
-            let Some(edge) = s.exclusive_edge() else { continue };
-            ls.rect.set(place(s, usable, out));
-            let zone = s.exclusive;
-            let (mt, mr, mb, ml) = s.margin;
-            match edge {
-                A_TOP => usable.y1 += zone + mt,
-                A_BOTTOM => usable.y2 -= zone + mb,
-                A_LEFT => usable.x1 += zone + ml,
-                _ => usable.x2 -= zone + mr,
+            if s.exclusive_edge().is_some() {
+                continue;
+            }
+            // zone >= 0 respects the claimed edges (a positive zone without
+            // a single anchored edge counts as zero); -1 ignores them
+            let base = if s.exclusive >= 0 { usable } else { out };
+            ls.rect.set(place(s, base));
+        }
+        if slot == 0 {
+            changed |= state.usable.replace(usable) != usable;
+        }
+        if let Some(d) = state.display.borrow().as_ref() {
+            if let Some(o) = d.outputs.borrow().get(slot) {
+                changed |= o.usable.replace(usable) != usable;
             }
         }
     }
-    if usable.width() < 1 || usable.height() < 1 {
-        usable = out;
-    }
-    for ls in layers.iter() {
-        let s = ls.current.get();
-        if s.exclusive_edge().is_some() {
-            continue;
-        }
-        // zone 0 respects the claimed edges, -1 ignores them
-        let base = if s.exclusive == 0 { usable } else { out };
-        ls.rect.set(place(s, base, out));
-    }
-    let old = state.usable.replace(usable);
     for ls in layers.iter() {
         ls.schedule_configure();
     }
-    if old != usable {
-        let ws = crate::tree::active(state);
-        crate::tree::relayout(state, &ws);
+    if changed {
+        for ws in crate::tree::visible_workspaces(state) {
+            crate::tree::relayout(state, &ws);
+        }
         state.damage.trigger();
     }
 }
 
-// the size a configure should carry right now
-fn compute_size(state: &Rc<State>, s: LayerState) -> (u32, u32) {
+/// the global rect of an output slot; the union extent when headless
+pub(crate) fn slot_rect(state: &Rc<State>, slot: usize) -> Rect {
+    if let Some(d) = state.display.borrow().as_ref() {
+        if let Some(o) = d.outputs.borrow().get(slot) {
+            return o.rect();
+        }
+    }
     let (ow, oh) = crate::tree::output_extent(state);
-    let out = Rect::new_sized_saturating(0, 0, ow.max(1), oh.max(1));
-    let base = if s.exclusive == 0 { state.usable.get() } else { out };
-    let base = if base.is_empty() { out } else { base };
-    let r = place(s, base, out);
+    Rect::new_sized_saturating(0, 0, ow.max(1), oh.max(1))
+}
+
+/// what the arranger left over on a slot; state.usable mirrors slot 0 for
+/// the headless test path
+fn usable_of(state: &Rc<State>, slot: usize) -> Rect {
+    if let Some(d) = state.display.borrow().as_ref() {
+        if let Some(o) = d.outputs.borrow().get(slot) {
+            return o.usable.get();
+        }
+    }
+    state.usable.get()
+}
+
+// the size a configure should carry right now
+fn compute_size(state: &Rc<State>, ls: &LayerSurface, s: LayerState) -> (u32, u32) {
+    // an arranged surface's configure echoes the placement it already has
+    if ls.linked.get() {
+        let r = ls.rect.get();
+        return (r.width() as u32, r.height() as u32);
+    }
+    let out = slot_rect(state, ls.output.get());
+    let base = if s.exclusive >= 0 {
+        let u = usable_of(state, ls.output.get());
+        if u.is_empty() { out } else { u }
+    } else {
+        out
+    };
+    let r = place(s, base);
     (r.width() as u32, r.height() as u32)
 }
 

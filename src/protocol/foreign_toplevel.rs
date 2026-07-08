@@ -137,10 +137,22 @@ impl FtlHandle {
         out
     }
 
-    /// enter/leave against the client's wl_output binds, by connector name.
-    /// output tracking arrives with the multi-output work; a taskbar reads
-    /// title/app_id/state without it
-    fn each_output(&self, _state: &Rc<State>, _slot: usize, _f: impl Fn(ObjectId, ObjectId)) {}
+    /// enter/leave against the client's wl_output binds, by connector name
+    fn each_output(&self, state: &Rc<State>, slot: usize, f: impl Fn(ObjectId, ObjectId)) {
+        let name = {
+            let d = state.display.borrow();
+            let Some(d) = d.as_ref() else { return };
+            let Some(o) = d.outputs.borrow().get(slot).map(|o| o.conn.name.clone()) else {
+                return;
+            };
+            o
+        };
+        self.client.objects.for_each_output(|o| {
+            if o.name == name {
+                f(self.id, o.id);
+            }
+        });
+    }
 
     fn send_full(&self, state: &Rc<State>, win: &Rc<Window>) {
         let title = win.title();
@@ -161,8 +173,10 @@ impl FtlHandle {
     }
 }
 
-fn out_slot_of(_state: &Rc<State>, _win: &Rc<Window>) -> usize {
-    0
+fn out_slot_of(state: &Rc<State>, win: &Rc<Window>) -> usize {
+    crate::tree::workspace_of(state, win)
+        .map(|w| w.output.get())
+        .unwrap_or(0)
 }
 
 fn publish(state: &Rc<State>, mgr: &Rc<FtlManager>, win: &Rc<Window>) {
@@ -292,14 +306,16 @@ fn for_window(state: &Rc<State>, win: &Rc<Window>, f: impl Fn(&Rc<FtlHandle>)) {
 }
 
 pub fn window_mapped(state: &Rc<State>, win: &Rc<Window>) {
+    crate::protocol::foreign_toplevel_list::window_mapped(state, win);
     let managers = state.ftl_managers.borrow().clone();
     for mgr in managers {
         publish(state, &mgr, win);
     }
-    crate::protocol::foreign_toplevel_list::window_mapped(state, win);
 }
 
 pub fn window_unmapped(state: &Rc<State>, win: &Rc<Window>) {
+    crate::protocol::foreign_toplevel_list::window_unmapped(state, win);
+    crate::protocol::image_copy_capture::window_unmapped(state, win);
     let managers = state.ftl_managers.borrow().clone();
     for mgr in managers {
         let handles = mgr.handles.borrow().clone();
@@ -311,11 +327,10 @@ pub fn window_unmapped(state: &Rc<State>, win: &Rc<Window>) {
         }
         mgr.handles.borrow_mut().retain(|h| h.win().is_some());
     }
-    crate::protocol::foreign_toplevel_list::window_unmapped(state, win);
-    crate::protocol::image_copy_capture::window_unmapped(state, win);
 }
 
 pub fn title_changed(state: &Rc<State>, win: &Rc<Window>) {
+    crate::protocol::foreign_toplevel_list::title_changed(state, win);
     let title = win.title();
     for_window(state, win, |h| {
         h.client.event(|o| {
@@ -323,10 +338,10 @@ pub fn title_changed(state: &Rc<State>, win: &Rc<Window>) {
             handle_v1::done::send(o, h.id);
         });
     });
-    crate::protocol::foreign_toplevel_list::title_changed(state, win);
 }
 
 pub fn app_id_changed(state: &Rc<State>, win: &Rc<Window>) {
+    crate::protocol::foreign_toplevel_list::app_id_changed(state, win);
     let app_id = win.app_id();
     for_window(state, win, |h| {
         h.client.event(|o| {
@@ -334,7 +349,6 @@ pub fn app_id_changed(state: &Rc<State>, win: &Rc<Window>) {
             handle_v1::done::send(o, h.id);
         });
     });
-    crate::protocol::foreign_toplevel_list::app_id_changed(state, win);
 }
 
 pub fn state_changed(state: &Rc<State>, win: &Rc<Window>) {
@@ -383,7 +397,7 @@ pub fn output_changed(state: &Rc<State>, win: &Rc<Window>) {
 }
 
 pub fn drop_client(state: &Rc<State>, id: ClientId) {
-    state.ftl_managers.borrow_mut().retain(|m| m.client.id != id);
     crate::protocol::foreign_toplevel_list::drop_client(state, id);
     crate::protocol::image_copy_capture::drop_client(state, id);
+    state.ftl_managers.borrow_mut().retain(|m| m.client.id != id);
 }
