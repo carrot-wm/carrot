@@ -57,8 +57,27 @@ pub struct SeatGlobal {
     // full dismissal
     pub popup_grab: RefCell<Vec<Rc<crate::shell::xdg::XdgPopup>>>,
     pub grab_prev_focus: RefCell<Option<Rc<WlSurface>>>,
+    /// interactive move/resize riding the implicit grab, like the dnd slot
+    grab: RefCell<Option<PointerGrab>>,
     pub relative: RefCell<HashMap<ClientId, Vec<Rc<RelativePointer>>>>,
     pub constraints: RefCell<Vec<Rc<Constraint>>>,
+}
+
+/// an interactive move or resize; deltas apply against the start geometry
+enum PointerGrab {
+    Move {
+        win: Rc<crate::tree::Window>,
+        start: (f64, f64),
+        rect: crate::rect::Rect,
+    },
+    Resize {
+        win: Rc<crate::tree::Window>,
+        edges: u32,
+        start: (f64, f64),
+        rect: crate::rect::Rect,
+        /// tiled resizes step split ratios incrementally
+        last: (f64, f64),
+    },
 }
 
 impl SeatGlobal {
@@ -88,6 +107,7 @@ impl SeatGlobal {
             data_control: Default::default(),
             popup_grab: RefCell::new(Vec::new()),
             grab_prev_focus: RefCell::new(None),
+            grab: RefCell::new(None),
             relative: RefCell::new(HashMap::new()),
             constraints: RefCell::new(Vec::new()),
         }))
@@ -491,7 +511,16 @@ impl SeatGlobal {
         let Some(win) = focus.and_then(|s| crate::tree::window_for_surface(state, &s)) else {
             return key;
         };
-        let ws = state.active_ws.get() + 1;
+        let ws = crate::tree::workspace_of(state, &win)
+            .and_then(|w| {
+                state
+                    .workspaces
+                    .borrow()
+                    .iter()
+                    .position(|x| Rc::ptr_eq(x, &w))
+            })
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let to = crate::config::resolve_remap(
             &cfg,
             &win.app_id(),
@@ -838,6 +867,12 @@ impl SeatGlobal {
             return;
         }
 
+        // so does a move/resize session: motion becomes window geometry
+        if self.grab.borrow().is_some() {
+            self.grab_motion(state, x, y);
+            return;
+        }
+
         let grabbed = !self.ptr_buttons.borrow().is_empty();
         if !grabbed {
             let hit = self.surface_at(state, x, y);
@@ -997,6 +1032,13 @@ impl SeatGlobal {
             }
             return;
         }
+        // same for a move/resize session: the last release ends it
+        if self.grab.borrow().is_some() {
+            if !pressed && self.ptr_buttons.borrow().is_empty() {
+                self.end_grab(state);
+            }
+            return;
+        }
         let focus = self.ptr_focus.borrow().clone();
         // a press outside the popup grab chain dismisses it; the click
         // then continues to whoever it landed on
@@ -1054,6 +1096,113 @@ impl SeatGlobal {
             });
         });
         self.ptr_frame(surface.client.id);
+    }
+
+    // -- interactive move/resize --
+
+    /// move/resize is only honored for the client holding the implicit
+    /// grab, naming the press serial, from the surface under the pointer
+    pub fn move_resize_grab_valid(&self, origin: &Rc<WlSurface>, serial: u32) -> bool {
+        if self.ptr_buttons.borrow().is_empty()
+            || self.data.drag().is_some()
+            || self.grab.borrow().is_some()
+        {
+            return false;
+        }
+        if serial != self.last_press_serial.get() {
+            return false;
+        }
+        self.ptr_focus
+            .borrow()
+            .as_ref()
+            .is_some_and(|f| Rc::ptr_eq(&f.get_root(), &origin.get_root()))
+    }
+
+    pub fn start_move_grab(&self, win: Rc<crate::tree::Window>) {
+        // tiled windows have no free position; moving them wants a tree
+        // swap that does not exist yet
+        if !win.floating.get() || win.fullscreen.get() {
+            return;
+        }
+        let start = (self.ptr_x.get(), self.ptr_y.get());
+        let rect = win.rect.get();
+        *self.grab.borrow_mut() = Some(PointerGrab::Move { win, start, rect });
+    }
+
+    pub fn start_resize_grab(&self, win: Rc<crate::tree::Window>, edges: u32) {
+        if win.fullscreen.get() {
+            return;
+        }
+        let start = (self.ptr_x.get(), self.ptr_y.get());
+        let rect = win.rect.get();
+        *self.grab.borrow_mut() = Some(PointerGrab::Resize {
+            win,
+            edges,
+            start,
+            rect,
+            last: start,
+        });
+    }
+
+    fn grab_motion(self: &Rc<Self>, state: &Rc<State>, x: f64, y: f64) {
+        enum Op {
+            SetRect(Rc<crate::tree::Window>, crate::rect::Rect),
+            Ratio(Rc<crate::tree::Window>, u32, f64, f64),
+        }
+        let op = {
+            let mut slot = self.grab.borrow_mut();
+            match slot.as_mut() {
+                Some(PointerGrab::Move { win, start, rect }) => {
+                    let (sw, sh) = crate::tree::output_extent(state);
+                    let nx = ((rect.x1 as f64 + x - start.0) as i32)
+                        .min(sw - rect.width())
+                        .max(0);
+                    let ny = ((rect.y1 as f64 + y - start.1) as i32)
+                        .min(sh - rect.height())
+                        .max(0);
+                    Op::SetRect(win.clone(), rect.move_(nx - rect.x1, ny - rect.y1))
+                }
+                Some(PointerGrab::Resize { win, edges, start, rect, last }) => {
+                    if win.floating.get() {
+                        let r = resize_rect(*rect, *edges, x - start.0, y - start.1, 50);
+                        Op::SetRect(win.clone(), r)
+                    } else {
+                        let (dx, dy) = (x - last.0, y - last.1);
+                        *last = (x, y);
+                        Op::Ratio(win.clone(), *edges, dx, dy)
+                    }
+                }
+                None => return,
+            }
+        };
+        let win = match &op {
+            Op::SetRect(w, _) | Op::Ratio(w, ..) => w.clone(),
+        };
+        // the window left the tree mid-grab (unmap, workspace move)
+        let Some(ws) = crate::tree::workspace_of(state, &win) else {
+            self.grab.borrow_mut().take();
+            return;
+        };
+        match op {
+            Op::SetRect(_, r) => {
+                win.rect.set(r);
+                win.configure_rect();
+            }
+            Op::Ratio(_, edges, dx, dy) => {
+                if !crate::tree::dwindle::resize_by_edges(&win, edges, dx, dy) {
+                    return;
+                }
+            }
+        }
+        crate::tree::relayout(state, &ws);
+        state.damage.trigger();
+    }
+
+    fn end_grab(self: &Rc<Self>, state: &Rc<State>) {
+        self.grab.borrow_mut().take();
+        // the pointer re-enters whatever it is over
+        let usec = crate::util::Time::now().nsec() / 1_000;
+        self.pointer_motion(state, usec, 0.0, 0.0, 0.0, 0.0);
     }
 
     pub fn pointer_axis(&self, time_usec: u64, horizontal: bool, dist: i32) {
@@ -1116,4 +1265,22 @@ pub enum KeyAction {
     Handled,
     SwitchVt(u32),
     Act(crate::config::Action),
+}
+
+/// apply an edge drag to a floating rectangle; the opposite edges hold
+/// still and the dragged ones never pull the box below the minimum size
+fn resize_rect(r: crate::rect::Rect, edges: u32, dx: f64, dy: f64, min: i32) -> crate::rect::Rect {
+    use crate::tree::dwindle::{EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT, EDGE_TOP};
+    let mut out = r;
+    if edges & EDGE_LEFT != 0 {
+        out.x1 = ((r.x1 as f64 + dx) as i32).min(r.x2 - min);
+    } else if edges & EDGE_RIGHT != 0 {
+        out.x2 = ((r.x2 as f64 + dx) as i32).max(r.x1 + min);
+    }
+    if edges & EDGE_TOP != 0 {
+        out.y1 = ((r.y1 as f64 + dy) as i32).min(r.y2 - min);
+    } else if edges & EDGE_BOTTOM != 0 {
+        out.y2 = ((r.y2 as f64 + dy) as i32).max(r.y1 + min);
+    }
+    out
 }

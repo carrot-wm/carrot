@@ -14,9 +14,18 @@ pub struct Node {
     kind: RefCell<Kind>,
     pub rect: Cell<Rect>,
     split_top: Cell<bool>,
-    /// first child gets dim/2 * ratio; 1.0 is an even split
+    /// first child's share of the split span; 0.5 is even
     ratio: Cell<f64>,
 }
+
+const RATIO_MIN: f64 = 0.1;
+const RATIO_MAX: f64 = 0.9;
+
+// -- resize edges, the xdg_toplevel bitfield --
+pub const EDGE_TOP: u32 = 1;
+pub const EDGE_BOTTOM: u32 = 2;
+pub const EDGE_LEFT: u32 = 4;
+pub const EDGE_RIGHT: u32 = 8;
 
 enum Kind {
     Leaf(Rc<Window>),
@@ -30,7 +39,7 @@ impl Node {
             kind: RefCell::new(Kind::Leaf(win.clone())),
             rect: Cell::new(Rect::default()),
             split_top: Cell::new(false),
-            ratio: Cell::new(1.0),
+            ratio: Cell::new(0.5),
         })
     }
 
@@ -48,9 +57,9 @@ impl Node {
         };
         let r = self.rect.get();
         self.split_top.set(r.height() > r.width());
-        let ratio = self.ratio.get().clamp(0.1, 1.9);
+        let ratio = self.ratio.get().clamp(RATIO_MIN, RATIO_MAX);
         if self.split_top.get() {
-            let first = (r.height() as f64 / 2.0 * ratio) as i32;
+            let first = (r.height() as f64 * ratio) as i32;
             children[0]
                 .rect
                 .set(Rect { x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y1 + first });
@@ -58,7 +67,7 @@ impl Node {
                 .rect
                 .set(Rect { x1: r.x1, y1: r.y1 + first, x2: r.x2, y2: r.y2 });
         } else {
-            let first = (r.width() as f64 / 2.0 * ratio) as i32;
+            let first = (r.width() as f64 * ratio) as i32;
             children[0]
                 .rect
                 .set(Rect { x1: r.x1, y1: r.y1, x2: r.x1 + first, y2: r.y2 });
@@ -134,7 +143,7 @@ impl Tree {
             kind: RefCell::new(Kind::Branch(children)),
             rect: Cell::new(t_rect),
             split_top: Cell::new(!side_by_side),
-            ratio: Cell::new(1.0),
+            ratio: Cell::new(0.5),
         });
         self.replace_child(&target, &branch);
         *target.parent.borrow_mut() = Rc::downgrade(&branch);
@@ -213,5 +222,95 @@ impl Tree {
             };
             cur = next;
         }
+    }
+}
+
+// -- split ratio control --
+
+/// one boundary step: pointer delta over the split span, clamped
+fn ratio_step(ratio: f64, delta_px: f64, span: f64) -> f64 {
+    (ratio + delta_px / span.max(1.0)).clamp(RATIO_MIN, RATIO_MAX)
+}
+
+/// nearest ancestor split whose interior boundary is the dragged edge:
+/// a right/bottom drag moves the boundary after the window's subtree,
+/// a left/top drag the one before it. the axis must match the edge
+fn boundary_split(win: &Window, edges: u32, vertical: bool) -> Option<Rc<Node>> {
+    let (low, high) = if vertical {
+        (EDGE_TOP, EDGE_BOTTOM)
+    } else {
+        (EDGE_LEFT, EDGE_RIGHT)
+    };
+    let mut cur = win.node.borrow().upgrade()?;
+    loop {
+        let parent = cur.parent.borrow().upgrade()?;
+        let first = match &*parent.kind.borrow() {
+            Kind::Branch(c) => Rc::ptr_eq(&c[0], &cur),
+            Kind::Leaf(_) => unreachable!("a leaf cannot be a parent"),
+        };
+        if parent.split_top.get() == vertical
+            && ((edges & high != 0 && first) || (edges & low != 0 && !first))
+        {
+            return Some(parent);
+        }
+        cur = parent;
+    }
+}
+
+/// drag a tiled window's edge: the matching split boundary follows the pointer
+pub fn resize_by_edges(win: &Window, edges: u32, dx: f64, dy: f64) -> bool {
+    let mut changed = false;
+    for (vertical, delta) in [(false, dx), (true, dy)] {
+        if delta == 0.0 {
+            continue;
+        }
+        if let Some(split) = boundary_split(win, edges, vertical) {
+            let r = split.rect.get();
+            let span = if vertical { r.height() } else { r.width() } as f64;
+            let old = split.ratio.get();
+            let new = ratio_step(old, delta, span);
+            split.ratio.set(new);
+            changed |= new != old;
+        }
+    }
+    changed
+}
+
+/// keybind nudge: a positive delta grows the window's share of its
+/// immediate parent split
+pub fn adjust_parent_ratio(win: &Window, delta: f64) -> bool {
+    let Some(leaf) = win.node.borrow().upgrade() else {
+        return false;
+    };
+    let Some(parent) = leaf.parent.borrow().upgrade() else {
+        return false;
+    };
+    let first = match &*parent.kind.borrow() {
+        Kind::Branch(c) => Rc::ptr_eq(&c[0], &leaf),
+        Kind::Leaf(_) => unreachable!("a leaf cannot be a parent"),
+    };
+    let old = parent.ratio.get();
+    let new = (old + if first { delta } else { -delta }).clamp(RATIO_MIN, RATIO_MAX);
+    parent.ratio.set(new);
+    new != old
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ratio_steps_by_delta_over_span() {
+        assert_eq!(ratio_step(0.5, 100.0, 1000.0), 0.6);
+        assert_eq!(ratio_step(0.5, -100.0, 1000.0), 0.4);
+        // a zero span cannot divide by zero
+        assert_eq!(ratio_step(0.5, 1.0, 0.0), 0.9);
+    }
+
+    #[test]
+    fn ratio_clamps_to_its_band() {
+        assert_eq!(ratio_step(0.85, 500.0, 1000.0), RATIO_MAX);
+        assert_eq!(ratio_step(0.15, -500.0, 1000.0), RATIO_MIN);
+        assert_eq!(ratio_step(RATIO_MAX, 1.0, 10.0), RATIO_MAX);
     }
 }

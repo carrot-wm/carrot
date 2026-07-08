@@ -27,6 +27,18 @@ impl Workspace {
         }
     }
 
+    pub fn contains(&self, win: &Rc<Window>) -> bool {
+        if self.floats.borrow().iter().any(|w| Rc::ptr_eq(w, win)) {
+            return true;
+        }
+        if self.fullscreen.borrow().as_ref().is_some_and(|w| Rc::ptr_eq(w, win)) {
+            return true;
+        }
+        let mut hit = false;
+        self.tiling.for_each(|w| hit |= Rc::ptr_eq(w, win));
+        hit
+    }
+
     pub fn top_float(&self) -> Option<Rc<Window>> {
         self.floats.borrow().last().cloned()
     }

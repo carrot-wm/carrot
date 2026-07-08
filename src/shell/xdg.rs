@@ -977,13 +977,35 @@ impl xdg_toplevel::Handler for XdgToplevel {
         Ok(())
     }
 
-    fn r#move(&self, _req: xdg_toplevel::r#move::Request) -> Result<(), Box<dyn std::error::Error>> {
+    fn r#move(&self, req: xdg_toplevel::r#move::Request) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(seat) = self.client.state.seat.borrow().clone() else {
+            return Ok(());
+        };
+        let Some(win) = self.window.borrow().clone() else {
+            return Ok(());
+        };
+        if seat.move_resize_grab_valid(&self.xdg.surface, req.serial) {
+            seat.start_move_grab(win);
+        }
         Ok(())
     }
 
     fn resize(&self, req: xdg_toplevel::resize::Request) -> Result<(), Box<dyn std::error::Error>> {
         if req.edges > 10 || req.edges == 3 || req.edges == 7 {
             self.client.protocol_error(self.id, 0, "invalid resize edge");
+            return Ok(());
+        }
+        if req.edges == 0 {
+            return Ok(());
+        }
+        let Some(seat) = self.client.state.seat.borrow().clone() else {
+            return Ok(());
+        };
+        let Some(win) = self.window.borrow().clone() else {
+            return Ok(());
+        };
+        if seat.move_resize_grab_valid(&self.xdg.surface, req.serial) {
+            seat.start_resize_grab(win, req.edges);
         }
         Ok(())
     }

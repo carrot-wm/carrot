@@ -170,6 +170,19 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
         }
         Action::FocusNext => crate::tree::focus_cycle(state, 1),
         Action::FocusPrev => crate::tree::focus_cycle(state, -1),
+        Action::SplitRatio(d) => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                if !win.floating.get()
+                    && !win.fullscreen.get()
+                    && crate::tree::dwindle::adjust_parent_ratio(&win, *d)
+                {
+                    let ws = crate::tree::workspace_of(state, &win)
+                        .unwrap_or_else(|| crate::tree::active(state));
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
         Action::Spawn(cmd) => spawn(state, cmd),
         Action::Quit => state.ring.stop(),
     }

@@ -382,8 +382,20 @@ fn float_into(
     relayout(state, ws);
 }
 
+/// the workspace actually holding a window; "active" can be stale (the user or
+/// a pointer crossing moved on), and removing from the wrong list leaves a
+/// click-eating zombie
+pub(crate) fn workspace_of(state: &Rc<State>, win: &Rc<Window>) -> Option<Rc<Workspace>> {
+    state
+        .workspaces
+        .borrow()
+        .iter()
+        .find(|ws| ws.contains(win))
+        .cloned()
+}
+
 pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
-    let ws = active(state);
+    let ws = workspace_of(state, win).unwrap_or_else(|| active(state));
     if win.fullscreen.get() {
         win.fullscreen.set(false);
         let mut slot = ws.fullscreen.borrow_mut();

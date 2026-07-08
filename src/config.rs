@@ -17,6 +17,8 @@ pub enum Action {
     CloseWindow,
     FocusNext,
     FocusPrev,
+    /// nudge the focused window's parent split; signed fraction of the span
+    SplitRatio(f64),
     Spawn(String),
     Quit,
 }
@@ -990,9 +992,14 @@ fn parse_bind(node: &KdlNode, src: &str) -> Result<Option<Bind>, String> {
         "float" | "toggle-floating" => Action::ToggleFloating,
         "focus-next" => Action::FocusNext,
         "focus-prev" => Action::FocusPrev,
+        "split-ratio" => Action::SplitRatio(
+            args.get(3)
+                .and_then(|a| a.parse::<f64>().ok())
+                .ok_or_else(|| at(node, src, "split-ratio needs a signed delta like \"+0.1\""))?,
+        ),
         "quit" => Action::Quit,
         // the rest of the dispatcher set; recognized so configs keep parsing
-        known @ ("screenshot" | "focus" | "move" | "swap" | "resize" | "split-ratio"
+        known @ ("screenshot" | "focus" | "move" | "swap" | "resize"
         | "center" | "pin" | "toggle-group" | "group-next" | "group-prev"
         | "special" | "workspace-group" | "submap") => {
             eprintln!("carrot: config: bind action \"{known}\" not implemented yet, ignored");
@@ -1144,5 +1151,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), a);
         let j = serde_json::to_string(&Action::ToggleFullscreen).unwrap();
         assert_eq!(j, "\"toggle-fullscreen\"");
+        let j = serde_json::to_string(&Action::SplitRatio(-0.1)).unwrap();
+        assert_eq!(j, "{\"split-ratio\":-0.1}");
+    }
+
+    #[test]
+    fn split_ratio_binds_parse_signed_deltas() {
+        let cfg = parse(r##"bind "Meta" "r" "split-ratio" "+0.1""##).unwrap();
+        assert_eq!(cfg.binds[0].action, Action::SplitRatio(0.1));
+        let cfg = parse(r##"bind "Meta" "e" "split-ratio" "-0.1""##).unwrap();
+        assert_eq!(cfg.binds[0].action, Action::SplitRatio(-0.1));
+        assert!(parse(r##"bind "Meta" "r" "split-ratio""##).is_err());
     }
 }
