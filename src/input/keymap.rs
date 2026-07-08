@@ -63,10 +63,16 @@ impl Keymap {
             Some(l) => (l.to_string(), String::new()),
             None => match get("XKB_DEFAULT_LAYOUT") {
                 Some(l) => (l, get("XKB_DEFAULT_VARIANT").unwrap_or_default()),
+                // nothing asked for a specific map: the embedded default
+                // serves without any xkb data files on disk
+                None if rules.is_none() && model.is_none() && options.is_none() => {
+                    return Self::from_resolved(super::default_keymap::DEFAULT_KEYMAP);
+                }
                 None => ("us".into(), get("XKB_DEFAULT_VARIANT").unwrap_or_default()),
             },
         };
 
+        // resolving names needs the data files; only this path does
         let mut builder = kbvm::xkb::Context::builder();
         let mut found = false;
         if let Ok(root) = std::env::var("XKB_CONFIG_ROOT") {
@@ -103,6 +109,15 @@ impl Keymap {
             Some(&groups),
             options_vec.as_deref(),
         );
+        Self::from_keymap(&keymap)
+    }
+
+    /// an already-resolved keymap text (the embedded default)
+    fn from_resolved(text: &str) -> Result<Rc<Keymap>, String> {
+        let context = kbvm::xkb::Context::builder().build();
+        let keymap = context
+            .keymap_from_bytes(ErrorsOnly, None, text.as_bytes())
+            .map_err(|e| format!("embedded keymap: {e}"))?;
         Self::from_keymap(&keymap)
     }
 
@@ -218,5 +233,31 @@ mod tests {
         assert_eq!(mods.depressed, 0);
         assert!(map.repeats(KEY_A, 0));
         assert!(!map.repeats(KEY_LEFTSHIFT, 0));
+    }
+
+    #[test]
+    fn a_config_layout_builds_a_different_keymap() {
+        let us = Keymap::new(Some("us")).unwrap();
+        let de = Keymap::new(Some("de")).unwrap();
+        assert!(us.size > 0 && de.size > 0);
+        assert_ne!(us.size, de.size, "de keymap serializes differently");
+    }
+
+    #[test]
+    fn default_keymap_needs_no_disk_data() {
+        // the embedded text must parse standalone; a boot with no env and
+        // no xkb data installed rides on exactly this
+        let map = Keymap::from_resolved(super::super::default_keymap::DEFAULT_KEYMAP).unwrap();
+        assert!(map.size > 10_000);
+    }
+
+    #[test]
+    fn numlock_tap_locks_a_modifier() {
+        const KEY_NUMLOCK: u32 = 69;
+        let map = Keymap::new_default().unwrap();
+        let mut st = map.create_state();
+        st.process(&map, KEY_NUMLOCK, true);
+        st.process(&map, KEY_NUMLOCK, false);
+        assert_ne!(st.mods().locked, 0, "numlock latches a locked mod");
     }
 }

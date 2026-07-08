@@ -1,0 +1,14 @@
+[package]
+name = "gen-keymap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# the exact resolver the compositor uses, so the embedded text is what a
+# live rules resolution would have produced
+kbvm = "0.1.6"
+sha2 = "0.11"
+
+# standalone on purpose - carrot's build must never see this crate
+[workspace]

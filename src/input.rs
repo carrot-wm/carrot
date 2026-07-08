@@ -3,6 +3,7 @@
 // keyboard, pointer, wheel now; gestures, touch, tablets later.
 
 pub mod cursor_theme;
+pub mod default_keymap;
 pub mod evdev;
 pub mod focus;
 pub mod keymap;
