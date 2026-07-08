@@ -676,6 +676,18 @@ impl SeatGlobal {
             .cloned()
     }
 
+    /// jump the pointer and re-evaluate focus as a zero-delta motion.
+    /// a live lock owns the pointer; warps yield to it
+    pub fn warp(self: &Rc<Self>, state: &Rc<State>, x: f64, y: f64) {
+        if self.active_lock().is_some() {
+            return;
+        }
+        self.ptr_x.set(x);
+        self.ptr_y.set(y);
+        let usec = crate::util::Time::now().nsec() / 1_000;
+        self.pointer_motion(state, usec, 0.0, 0.0, 0.0, 0.0);
+    }
+
     /// clamp into the constrained surface, minus any client region
     fn confine_clamp(&self, con: &Constraint, x: f64, y: f64) -> (f64, f64) {
         let (ox, oy) = self.ptr_origin.get();

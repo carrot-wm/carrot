@@ -29,6 +29,7 @@ mod spike;
 mod carrotconx;
 mod config;
 mod dbus;
+mod ei;
 mod input;
 mod ipc;
 mod sighand;
@@ -129,6 +130,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // WAYLAND_DISPLAY is only sound single-threaded
     let sock = socket::WaylandSocket::new()?;
     println!("listening on {}", sock.name);
+    // input injection is optional; the session runs fine without it
+    let ei_sock = match ei::bind_socket() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("carrot: ei: {e}");
+            None
+        }
+    };
     let cpu = cpu_worker::CpuWorker::new(&engine, &ring)?;
     let state = state::State::new(&engine, &ring, wheel);
     let sig_task = sighand::run(&state, sig_fd);
@@ -232,6 +241,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     };
+    let ei = ei_sock.map(|s| ei::start(&state, s));
     // headless is supported; the display comes up when logind hands over a
     // card (or, without a session, via direct open)
     let st = state.clone();
@@ -294,6 +304,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(xwayland_task);
     drop(sig_task);
     drop(ipc);
+    drop(ei);
     state.clear();
     drop(cpu);
     engine.clear();
