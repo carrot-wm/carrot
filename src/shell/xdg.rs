@@ -1626,9 +1626,10 @@ mod tests {
         );
         let (r1, r2) = (w1.rect.get(), w2.rect.get());
         assert!(!r1.intersects(r2), "{r1:?} overlaps {r2:?}");
-        // side-by-side split of an 800x600 root: both tiles half wide
+        // side-by-side split of an 800x600 root: both tiles at most half
+        // wide (exactly half under the gapless neutral defaults)
         assert_eq!(r1.y1, r2.y1);
-        assert!(r1.width() < 800 / 2 && r2.width() < 800 / 2);
+        assert!(r1.width() <= 800 / 2 && r2.width() <= 800 / 2);
     }
 
     #[test]

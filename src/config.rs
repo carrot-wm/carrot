@@ -314,30 +314,17 @@ pub const M_CTRL: u32 = 1 << 2;
 pub const M_ALT: u32 = 1 << 3;
 pub const M_SUPER: u32 = 1 << 6;
 
+// neutral zeros only - carrot ships no opinions; every visible choice
+// comes from the user's file. kernel repeat timings are the one
+// exception (a keyboard that never repeats reads as broken, not unset)
 impl Default for Config {
     fn default() -> Config {
-        let mut binds = Vec::new();
-        for n in 0..9 {
-            binds.push(Bind {
-                mods: M_SUPER,
-                key: 2 + n as u32, // KEY_1..KEY_9
-                action: Action::Workspace(n),
-                kind: BindKind::Press,
-            });
-        }
-        for (mods, key, action) in [
-            (M_SUPER, 33, Action::ToggleFullscreen),
-            (M_SUPER, 47, Action::ToggleFloating),
-            (M_SUPER | M_SHIFT, 16, Action::CloseWindow),
-        ] {
-            binds.push(Bind { mods, key, action, kind: BindKind::Press });
-        }
         Config {
-            gaps_in: 6,
-            gaps_out: 12,
-            border: 2,
-            border_focused: [0.95, 0.55, 0.25, 1.0],
-            border_unfocused: [0.22, 0.22, 0.26, 1.0],
+            gaps_in: 0,
+            gaps_out: 0,
+            border: 0,
+            border_focused: [0.0; 4],
+            border_unfocused: [0.0; 4],
             repeat_rate: 25,
             repeat_delay: 600,
             float_above_fullscreen: false,
@@ -352,7 +339,7 @@ impl Default for Config {
             layer_rules: Vec::new(),
             outputs: Vec::new(),
             gpus: Vec::new(),
-            binds,
+            binds: Vec::new(),
             submaps: Vec::new(),
             specials: Vec::new(),
         }
@@ -1117,16 +1104,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_the_built_ins() {
+    fn defaults_are_neutral() {
+        // no hardcoded config ships with carrot: no binds, no visible
+        // choices; everything comes from the user's file
         let c = Config::default();
-        assert_eq!((c.gaps_in, c.gaps_out, c.border), (6, 12, 2));
+        assert_eq!((c.gaps_in, c.gaps_out, c.border), (0, 0, 0));
         assert_eq!(c.layout, "dwindle");
         assert!(!c.allow_tearing);
-        assert_eq!(c.binds.len(), 12);
-        assert_eq!(
-            c.binds[0],
-            Bind { mods: M_SUPER, key: 2, action: Action::Workspace(0), kind: BindKind::Press }
-        );
+        assert!(c.binds.is_empty());
+        assert!(c.rules.is_empty() && c.outputs.is_empty() && c.devices.is_empty());
+        assert!(c.remaps.is_empty());
     }
 
     #[test]
