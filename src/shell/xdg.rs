@@ -1269,6 +1269,8 @@ pub fn popup_closed(state: &Rc<State>, popup: &Rc<XdgPopup>) {
     };
     let target = target.filter(|s| !s.destroyed.get());
     crate::input::focus::set_keyboard_focus(state, &seat, target);
+    // the pointer may have been parked on the popup that just left
+    seat.repick(state);
 }
 
 // click outside the grab chain: every grabbing popup gets popup_done,
@@ -1838,5 +1840,133 @@ mod tests {
         // top-left corner, extending up-left
         let p = Positioned { anchor: 5, gravity: 5, offset: (0, 0), ..p };
         assert_eq!(p.place(), (-50, -30));
+    }
+
+    // -- interactive move/resize grabs --
+
+    /// two tiled windows side by side on 800x600, seat pointer over the second
+    fn grab_setup() -> (
+        Rc<State>,
+        Rc<Client>,
+        Rc<crate::input::seat::SeatGlobal>,
+        Rc<XdgToplevel>,
+        Rc<XdgToplevel>,
+    ) {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let base = mk_base(&client, 30);
+        let (s1, x1, tl1) = mk_toplevel(&client, &base, 10, 40, 50);
+        map(&state, &client, &s1, &x1, 20);
+        let (s2, x2, tl2) = mk_toplevel(&client, &base, 11, 41, 51);
+        map(&state, &client, &s2, &x2, 21);
+        // hit testing reads the surface extent; grow past the test buffer
+        s1.size.set((800, 600));
+        s2.size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        seat.pointer_motion(&state, 1_000, 600.0, 300.0, 600.0, 300.0);
+        (state, client, seat, tl1, tl2)
+    }
+
+    /// a button press followed by the serial it was delivered with
+    fn press(state: &Rc<State>, seat: &Rc<crate::input::seat::SeatGlobal>) -> u32 {
+        seat.pointer_button(state, 2_000, 0x110, true);
+        (state.next_serial(None) - 1) as u32
+    }
+
+    #[test]
+    fn a_tiled_resize_drag_steps_the_split_ratio() {
+        let (state, _client, seat, tl1, tl2) = grab_setup();
+        let win1 = tl1.window.borrow().clone().unwrap();
+        assert_eq!(win1.rect.get().x2, 400, "even split to start");
+        let serial = press(&state, &seat);
+        tl2.resize(xdg_toplevel::resize::Request {
+            seat: ObjectId(0),
+            serial,
+            edges: 4, // left
+        })
+        .unwrap();
+        // dragging the second tile's left edge 80px left grows it
+        seat.pointer_motion(&state, 3_000, -80.0, 0.0, -80.0, 0.0);
+        assert_eq!(win1.rect.get().x2, 320);
+        let win2 = tl2.window.borrow().clone().unwrap();
+        assert_eq!(win2.rect.get().x1, 320);
+        // release ends the session; further motion is plain motion
+        seat.pointer_button(&state, 4_000, 0x110, false);
+        seat.pointer_motion(&state, 5_000, -80.0, 0.0, -80.0, 0.0);
+        assert_eq!(win1.rect.get().x2, 320);
+    }
+
+    #[test]
+    fn a_resize_drag_needs_a_matching_split_axis() {
+        let (state, _client, seat, tl1, tl2) = grab_setup();
+        let win1 = tl1.window.borrow().clone().unwrap();
+        let serial = press(&state, &seat);
+        tl2.resize(xdg_toplevel::resize::Request {
+            seat: ObjectId(0),
+            serial,
+            edges: 1, // top, but the only split is side by side
+        })
+        .unwrap();
+        seat.pointer_motion(&state, 3_000, 0.0, -50.0, 0.0, -50.0);
+        assert_eq!(win1.rect.get(), Rect { x1: 0, y1: 0, x2: 400, y2: 600 });
+    }
+
+    #[test]
+    fn a_move_grab_drags_a_floating_window_within_the_output() {
+        let (state, _client, seat, _tl1, tl2) = grab_setup();
+        let win2 = tl2.window.borrow().clone().unwrap();
+        crate::tree::float::toggle_floating(&state, &win2);
+        assert_eq!(win2.rect.get(), Rect { x1: 200, y1: 150, x2: 600, y2: 450 });
+        seat.pointer_motion(&state, 1_500, -200.0, 0.0, -200.0, 0.0);
+        let serial = press(&state, &seat);
+        tl2.r#move(xdg_toplevel::r#move::Request { seat: ObjectId(0), serial })
+            .unwrap();
+        seat.pointer_motion(&state, 3_000, 50.0, -30.0, 50.0, -30.0);
+        assert_eq!(win2.rect.get(), Rect { x1: 250, y1: 120, x2: 650, y2: 420 });
+        // a huge delta pins the box to the output edge
+        seat.pointer_motion(&state, 4_000, 5000.0, 5000.0, 5000.0, 5000.0);
+        assert_eq!(win2.rect.get(), Rect { x1: 400, y1: 300, x2: 800, y2: 600 });
+        seat.pointer_button(&state, 5_000, 0x110, false);
+    }
+
+    #[test]
+    fn tiled_windows_do_not_move_grab() {
+        let (state, _client, seat, tl1, tl2) = grab_setup();
+        let win1 = tl1.window.borrow().clone().unwrap();
+        let serial = press(&state, &seat);
+        tl2.r#move(xdg_toplevel::r#move::Request { seat: ObjectId(0), serial })
+            .unwrap();
+        seat.pointer_motion(&state, 3_000, -300.0, 0.0, -300.0, 0.0);
+        assert_eq!(win1.rect.get().x2, 400, "layout untouched");
+    }
+
+    #[test]
+    fn a_stale_serial_starts_no_grab() {
+        let (state, _client, seat, tl1, tl2) = grab_setup();
+        let win1 = tl1.window.borrow().clone().unwrap();
+        let serial = press(&state, &seat);
+        tl2.resize(xdg_toplevel::resize::Request {
+            seat: ObjectId(0),
+            serial: serial + 1,
+            edges: 4,
+        })
+        .unwrap();
+        seat.pointer_motion(&state, 3_000, -80.0, 0.0, -80.0, 0.0);
+        assert_eq!(win1.rect.get().x2, 400);
+    }
+
+    #[test]
+    fn split_ratio_action_grows_the_focused_window() {
+        let (state, _client, seat, tl1, tl2) = grab_setup();
+        let win1 = tl1.window.borrow().clone().unwrap();
+        *seat.kb_focus.borrow_mut() = Some(tl2.xdg.surface.clone());
+        crate::ipc::dispatch_action(&state, &crate::config::Action::SplitRatio(0.2));
+        assert_eq!(win1.rect.get().x2, 240, "the second tile grew");
+        // the ratio bottoms out instead of collapsing the sibling
+        for _ in 0..5 {
+            crate::ipc::dispatch_action(&state, &crate::config::Action::SplitRatio(0.2));
+        }
+        assert_eq!(win1.rect.get().x2, 80);
     }
 }

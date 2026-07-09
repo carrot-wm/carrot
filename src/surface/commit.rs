@@ -308,6 +308,7 @@ impl WlSurface {
         self.size.set(size);
         // mapping follows the committed buffer; role hooks refine it
         // (a subsurface also needs its parent mapped)
+        let was_mapped = self.mapped.get();
         self.mapped.set(has_buffer);
         self.frame_callbacks
             .borrow_mut()
@@ -331,10 +332,23 @@ impl WlSurface {
             self.size.get()
         );
         self.client.state.damage.trigger();
-        // toplevel captures latch on commits, not presents, so windows on
-        // invisible workspaces keep delivering frames
+        // captures of a toplevel latch on its commits, not on presents, so
+        // windows on invisible workspaces keep delivering frames
         if content_changed {
             crate::protocol::image_copy_capture::content_changed(&self.client.state, self);
+        }
+        // a map/unmap under a stationary cursor changes what's hit; the
+        // pointer must not wait for the next motion to notice
+        if was_mapped != self.mapped.get() {
+            let role = self.role.get();
+            if role != crate::surface::SurfaceRole::Cursor
+                && role != crate::surface::SurfaceRole::DndIcon
+            {
+                let seat = self.client.state.seat.borrow().clone();
+                if let Some(seat) = seat {
+                    seat.repick(&self.client.state);
+                }
+            }
         }
         // recycle the box (the sync-subsurface stash path keeps its own)
         pending.reset();

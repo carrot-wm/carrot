@@ -680,6 +680,10 @@ pub fn arrange(state: &Rc<State>) {
         }
         state.damage.trigger();
     }
+    // surfaces moved under a stationary cursor
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.repick(state);
+    }
 }
 
 /// the global rect of an output slot; the union extent when headless
@@ -890,6 +894,29 @@ mod tests {
         assert!(!l1.mapped());
         assert_eq!(l1.current.get().anchor, 0);
         assert_eq!(state.usable.get(), Rect { x1: 0, y1: 24, x2: 800, y2: 600 });
+    }
+
+    #[test]
+    fn mapping_a_bar_under_the_cursor_repicks_pointer_focus() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        // park the pointer where the bar is about to appear (inside the
+        // 64x64 test buffer's extent)
+        seat.warp(&state, 30.0, 10.0);
+        assert!(seat.pointer_focus().is_none());
+        let (s1, l1) = mk_layer(&client, 10, 20, TOP);
+        map_bar(&state, &client, &s1, &l1, 30, 30, 40);
+        // no motion happened; the map alone must claim pointer focus
+        assert!(seat
+            .pointer_focus()
+            .is_some_and(|f| Rc::ptr_eq(&f, &s1)));
+        // and unmapping hands it back
+        s1.attach(wl_surface::attach::Request { buffer: ObjectId::NONE, x: 0, y: 0 })
+            .unwrap();
+        commit(&s1);
+        assert!(seat.pointer_focus().is_none());
     }
 
     #[test]
