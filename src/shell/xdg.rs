@@ -63,7 +63,6 @@ impl Global for XdgWmBaseGlobal {
             version,
             me: me.clone(),
             surfaces: RefCell::new(HashMap::new()),
-            positioners: RefCell::new(HashMap::new()),
         }))
     }
 }
@@ -74,7 +73,6 @@ pub struct XdgWmBase {
     pub version: u32,
     me: Weak<XdgWmBase>,
     surfaces: RefCell<HashMap<ObjectId, Rc<XdgSurface>>>,
-    positioners: RefCell<HashMap<ObjectId, Rc<XdgPositioner>>>,
 }
 
 impl xdg_wm_base::Handler for XdgWmBase {
@@ -87,7 +85,6 @@ impl xdg_wm_base::Handler for XdgWmBase {
                 .protocol_error(self.id, DEFUNCT_SURFACES, "xdg_surfaces still exist");
             return Ok(());
         }
-        self.positioners.borrow_mut().clear();
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -103,7 +100,9 @@ impl xdg_wm_base::Handler for XdgWmBase {
             v: Cell::new(Positioned::default()),
         });
         self.client.add_client_obj(p.clone())?;
-        self.positioners.borrow_mut().insert(req.id, p);
+        // client-scoped: a positioner is usable by popups from any
+        // xdg_wm_base bind, not just the one that created it
+        self.client.objects.track_positioner(p);
         Ok(())
     }
 
@@ -174,7 +173,6 @@ impl Object for XdgWmBase {
 
     fn break_loops(&self) {
         self.surfaces.borrow_mut().clear();
-        self.positioners.borrow_mut().clear();
     }
 }
 
@@ -323,6 +321,7 @@ impl xdg_positioner::Handler for XdgPositioner {
         &self,
         _req: xdg_positioner::destroy::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.client.objects.forget_positioner(self.id);
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -656,8 +655,7 @@ impl xdg_surface::Handler for XdgSurface {
                 }
             }
         };
-        let positioner = self.base.positioners.borrow().get(&req.positioner).cloned();
-        let Some(positioner) = positioner else {
+        let Some(positioner) = c.objects.positioner(req.positioner) else {
             c.invalid_object(req.positioner);
             return Ok(());
         };
@@ -690,7 +688,7 @@ impl xdg_surface::Handler for XdgSurface {
         &self,
         req: xdg_surface::set_window_geometry::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 0x0 is silently dropped: chromium sends it (crbug.com/1329214)
+        // ignore a 0x0 geometry rather than erroring; clients send it spuriously
         if req.width == 0 && req.height == 0 {
             return Ok(());
         }
@@ -1234,8 +1232,7 @@ impl xdg_popup::Handler for XdgPopup {
         &self,
         req: xdg_popup::reposition::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let positioner = self.xdg.base.positioners.borrow().get(&req.positioner).cloned();
-        let Some(positioner) = positioner else {
+        let Some(positioner) = self.client.objects.positioner(req.positioner) else {
             self.client.invalid_object(req.positioner);
             return Ok(());
         };
@@ -1502,7 +1499,6 @@ mod tests {
             version: 6,
             me: me.clone(),
             surfaces: RefCell::new(HashMap::new()),
-            positioners: RefCell::new(HashMap::new()),
         });
         client.add_client_obj(base.clone()).unwrap();
         base
@@ -1791,7 +1787,7 @@ mod tests {
         base.create_positioner(xdg_wm_base::create_positioner::Request { id: ObjectId(45) })
             .unwrap();
         {
-            let pos = base.positioners.borrow().get(&ObjectId(45)).cloned().unwrap();
+            let pos = client.objects.positioner(ObjectId(45)).unwrap();
             use xdg_positioner::Handler as _;
             pos.set_size(xdg_positioner::set_size::Request { width: 50, height: 30 })
                 .unwrap();
@@ -1823,6 +1819,68 @@ mod tests {
         assert_eq!(count_events(&client.queued_out_bytes(), popup.id, 1), 1);
         assert!(seat.kb_focus.borrow().as_ref().is_some_and(|s| Rc::ptr_eq(s, &s1)));
         assert!(seat.popup_grab.borrow().is_empty());
+    }
+
+    #[test]
+    fn positioners_work_across_wm_base_binds() {
+        // a client binds xdg_wm_base twice and repositions popups from
+        // one bind with positioners created on the other
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let base_a = mk_base(&client, 30);
+        let (_s1, _x1, _t1) = mk_toplevel(&client, &base_a, 10, 40, 50);
+        let ps = WlSurface::new(ObjectId(11), &client, 6);
+        client.add_client_obj(ps.clone()).unwrap();
+        client.objects.track_surface(ps.clone());
+        base_a
+            .get_xdg_surface(xdg_wm_base::get_xdg_surface::Request {
+                id: ObjectId(41),
+                surface: ObjectId(11),
+            })
+            .unwrap();
+        let px = base_a.surfaces.borrow().get(&ObjectId(41)).cloned().unwrap();
+        // the positioner comes from a SECOND bind
+        let base_b = mk_base(&client, 31);
+        base_b
+            .create_positioner(xdg_wm_base::create_positioner::Request { id: ObjectId(45) })
+            .unwrap();
+        {
+            let pos = client.objects.positioner(ObjectId(45)).unwrap();
+            use xdg_positioner::Handler as _;
+            pos.set_size(xdg_positioner::set_size::Request { width: 50, height: 30 })
+                .unwrap();
+            pos.set_anchor_rect(xdg_positioner::set_anchor_rect::Request {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            })
+            .unwrap();
+        }
+        px.get_popup(xdg_surface::get_popup::Request {
+            id: ObjectId(51),
+            parent: ObjectId(40),
+            positioner: ObjectId(45),
+        })
+        .unwrap();
+        let popup = px.popup().unwrap();
+        use xdg_popup::Handler as _;
+        popup
+            .reposition(xdg_popup::reposition::Request {
+                positioner: ObjectId(45),
+                token: 7,
+            })
+            .unwrap();
+        // repositioned went out; no display error killed the client
+        assert_eq!(count_events(&client.queued_out_bytes(), popup.id, 2), 1);
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0);
+        // destroy forgets the client-scoped entry
+        {
+            let pos = client.objects.positioner(ObjectId(45)).unwrap();
+            use xdg_positioner::Handler as _;
+            pos.destroy(xdg_positioner::destroy::Request {}).unwrap();
+        }
+        assert!(client.objects.positioner(ObjectId(45)).is_none());
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub struct Objects {
     popups: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPopup>>>,
     outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::WlOutput>>>,
     xdg_outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::XdgOutput>>>,
+    /// client-scoped per spec: any xdg_wm_base bind may use any of them
+    positioners: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPositioner>>>,
     capture_sources:
         RefCell<HashMap<ObjectId, Rc<crate::protocol::image_copy_capture::CaptureSource>>>,
 }
@@ -110,6 +112,7 @@ impl Objects {
         self.popups.borrow_mut().clear();
         self.outputs.borrow_mut().clear();
         self.xdg_outputs.borrow_mut().clear();
+        self.positioners.borrow_mut().clear();
         self.capture_sources.borrow_mut().clear();
         let objs: Vec<_> = self.map.borrow_mut().drain().map(|(_, o)| o).collect();
         for obj in &objs {
@@ -141,6 +144,18 @@ impl Objects {
 
     pub fn forget_toplevel(&self, id: ObjectId) {
         self.toplevels.borrow_mut().remove(&id);
+    }
+
+    pub fn track_positioner(&self, p: Rc<crate::shell::xdg::XdgPositioner>) {
+        self.positioners.borrow_mut().insert(p.id, p);
+    }
+
+    pub fn positioner(&self, id: ObjectId) -> Option<Rc<crate::shell::xdg::XdgPositioner>> {
+        self.positioners.borrow().get(&id).cloned()
+    }
+
+    pub fn forget_positioner(&self, id: ObjectId) {
+        self.positioners.borrow_mut().remove(&id);
     }
 
     pub fn track_popup(&self, p: Rc<crate::shell::xdg::XdgPopup>) {
