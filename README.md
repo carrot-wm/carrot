@@ -50,10 +50,11 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 - **Per-output GPU assignment** - render specific displays on a selectable GPUs (e.g. iGPU for laptop screen, eGPU for gaming monitor)
 
 ### IPC
-- Custom JSON socket protocol (`$XDG_RUNTIME_DIR/carrot/<instance>/`)
+- Carrot-native JSON protocol over a single unix socket at `$XDG_RUNTIME_DIR/carrot.$WAYLAND_DISPLAY.sock` - one request and one reply per line
+- `burrow`, the companion CLI, for queries, dispatch, and a live `subscribe` event stream (ndjson)
 - Queries: active window, workspaces, workspace groups, special workspaces, monitors, clients
 - Event stream: window open/close, focus, workspace changes, monitor hotplug, fullscreen, urgent
-- Dispatcher commands over IPC (exec, workspace, focus, move, resize, kill, etc.)
+- Dispatcher commands (exec, workspace, focus, move, resize, kill, etc.)
 - **Launch-to-workspace** - spawn windows on any workspace without the need of switching to it first
 
 ### Integration
@@ -153,7 +154,7 @@ nix build github:flammablebunny/carrot
 cargo build --release
 ```
 
-System dependencies: just `vulkan-loader` (dlopened at runtime, never linked) and a Vulkan driver (ICD) for your GPU. Carrot links **zero C** - no `libdrm`, `libinput`, `libseat`, `libxkbcommon`, or `libwayland`; the DRM, input, and session stacks are all hand-rolled over raw syscalls. `kbvm` reads XKB keymap data from `xkeyboard-config`, wired up automatically by the Nix build.
+System dependencies: just `vulkan-loader` (dlopened at runtime, never linked) and a Vulkan driver (ICD) for your GPU. Carrot links **zero C** - no `libdrm`, `libinput`, `libseat`, `libxkbcommon`, or `libwayland`; the DRM, input, and session stacks are all hand-rolled over raw syscalls. `kbvm` parses an embedded default US keymap, so carrot boots with no XKB data on disk; it only reads `xkeyboard-config` when you configure a non-default layout, wired up automatically by the Nix build.
 
 ## Acknowledgments
 

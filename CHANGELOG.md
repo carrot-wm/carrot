@@ -9,17 +9,18 @@
 - Fullscreen
 - Fullscreen Borderless
 - Cursors
+- Cursor Warping
 - Complete XWayland Client
 - Complete Input Stack
 - Built In Rebinds Per Window
 - Per Input Device Configs
 - Complete Vulkan Graphics Pipeline
-- CarrotCTL IPC
+- Burrow IPC
 - VT Switching
 - DMA-BUF Import with Explicit Sync
-- Triple Buffered Output
+- Double Buffered Output
 - Hardware Cursor Plane
-- Screenshots
+- Screenshot Tool Compatiblity
 - Clipboard
 - Device Hotplug
 - Pointer Locking
@@ -27,3 +28,26 @@
 - EI Input Injection Server
 - Logind Session Integration
 - KDL Configuration
+- Lua Configuration
+- Multi Monitor Support
+- Monitor Hotplug
+- Layer Shell Support
+- Drag and Drop
+- Tearing
+- Adaptive Sync (VRR)
+- Taskbar & Dock Support
+- Clipboard Manager Support
+- Screen Recording Support
+- Window Rules
+- Launch to Workspace
+- Per Window Opacity
+- Interactive Move & Resize
+- Split Ratio Control
+- Relative Workspace Navigation
+- Directional Focus & Swap
+- Floating Windows
+- Idle Management
+- Idle Inhibit
+- Screen Sleep & Wake on Input (DPMS)
+- Game Input (Relative Pointer & Constraints)
+- App Launcher & Widget Keyboard Support
