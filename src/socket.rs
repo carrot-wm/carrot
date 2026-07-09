@@ -73,7 +73,12 @@ impl WaylandSocket {
         }
 
     // sound: run() binds the socket before any thread exists
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &final_name); }
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", &final_name);
+        // session identity for portals, toolkits and bars; not a theme var
+        std::env::set_var("XDG_CURRENT_DESKTOP", "carrot");
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
+    }
     Ok(WaylandSocket { name: final_name, path: final_path, fd, lock_path: final_lock_path, _lock_fd: final_lock_fd.expect("no socket was bound") })
 
     }
