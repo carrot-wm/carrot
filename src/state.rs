@@ -140,6 +140,7 @@ impl State {
             seat.grab_prev_focus.borrow_mut().take();
             seat.relative.borrow_mut().clear();
             seat.constraints.borrow_mut().clear();
+            *seat.cursor.borrow_mut() = crate::input::seat::CursorState::Default;
         }
         if let Some(x) = self.xwayland.borrow_mut().take() {
             x.clear();

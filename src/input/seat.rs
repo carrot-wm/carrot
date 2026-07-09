@@ -47,10 +47,12 @@ pub struct SeatGlobal {
     ptr_focus: RefCell<Option<Rc<WlSurface>>>,
     ptr_origin: Cell<(i32, i32)>,
     ptr_buttons: RefCell<Vec<u32>>,
-    /// serial of the most recent button press; drag/move grabs validate on it
+    /// serial of the newest button press; start_drag names it
     last_press_serial: Cell<u32>,
+    /// remap translations held down: from -> to, so a release always
+    /// pairs its press even if focus moved mid-hold
     remap_held: RefCell<HashMap<u32, u32>>,
-    /// a release bind is armed on press, disarmed by any other press
+    /// a matched release-kind bind waits here; any other press disarms
     armed_release: RefCell<Option<(u32, crate::config::Action)>>,
     // clipboard state rides on the seat: devices, sources, selection
     pub data: crate::protocol::data_device::DataDevices,
@@ -60,10 +62,22 @@ pub struct SeatGlobal {
     // full dismissal
     pub popup_grab: RefCell<Vec<Rc<crate::shell::xdg::XdgPopup>>>,
     pub grab_prev_focus: RefCell<Option<Rc<WlSurface>>>,
+    /// what the pointer plane shows; back to Default on every focus change
+    pub cursor: RefCell<CursorState>,
+    pub cursor_hot: Cell<(i32, i32)>,
     /// interactive move/resize riding the implicit grab, like the dnd slot
     grab: RefCell<Option<PointerGrab>>,
+    ptr_enter_serial: Cell<u32>,
     pub relative: RefCell<HashMap<ClientId, Vec<Rc<RelativePointer>>>>,
+    /// at most one per surface; active while that surface holds pointer focus
     pub constraints: RefCell<Vec<Rc<Constraint>>>,
+}
+
+/// pointer plane contents, client-driven via wl_pointer.set_cursor
+pub enum CursorState {
+    Default,
+    Hidden,
+    Surface(Rc<WlSurface>),
 }
 
 /// an interactive move or resize; deltas apply against the start geometry
@@ -112,62 +126,13 @@ impl SeatGlobal {
             data_control: Default::default(),
             popup_grab: RefCell::new(Vec::new()),
             grab_prev_focus: RefCell::new(None),
+            cursor: RefCell::new(CursorState::Default),
+            cursor_hot: Cell::new((0, 0)),
             grab: RefCell::new(None),
+            ptr_enter_serial: Cell::new(0),
             relative: RefCell::new(HashMap::new()),
             constraints: RefCell::new(Vec::new()),
         }))
-    }
-
-    /// startup and reload: rebuild for input.layout, latch numlock once,
-    /// push the new keymap to every bound keyboard
-    pub fn apply_input_config(&self, state: &Rc<State>) {
-        let cfg = state.config.borrow().clone();
-        let mut rebuilt = false;
-        if cfg.input.layout != *self.kb_layout.borrow() {
-            match Keymap::new(cfg.input.layout.as_deref()) {
-                Ok(map) => {
-                    *self.kb_state.borrow_mut() = map.create_state();
-                    *self.keymap.borrow_mut() = map;
-                    *self.kb_layout.borrow_mut() = cfg.input.layout.clone();
-                    self.mods.set(Mods::default());
-                    rebuilt = true;
-                }
-                // a bad layout keeps the working keymap; never a dead keyboard
-                Err(e) => eprintln!("carrot: keymap: {e}"),
-            }
-        }
-        if cfg.input.numlock && (rebuilt || !self.numlock_done.get()) {
-            self.latch_numlock();
-        }
-        self.numlock_done.set(true);
-        if rebuilt {
-            self.resend_keymap();
-        }
-    }
-
-    /// one simulated numlock tap on the fresh xkb state locks the modifier
-    fn latch_numlock(&self) {
-        const KEY_NUMLOCK: u32 = 69;
-        let map = self.keymap.borrow().clone();
-        let mut st = self.kb_state.borrow_mut();
-        st.process(&map, KEY_NUMLOCK, true);
-        st.process(&map, KEY_NUMLOCK, false);
-        self.mods.set(st.mods());
-    }
-
-    /// every bound keyboard gets the new fd, then modifiers to resync
-    fn resend_keymap(&self) {
-        let map = self.keymap.borrow().clone();
-        let mods = self.mods.get();
-        for seats in self.bindings.borrow().values() {
-            for seat in seats {
-                for kb in seat.keyboards.borrow().iter() {
-                    kb.send_keymap(&map);
-                    let serial = kb.client.state.next_serial(Some(&kb.client)) as u32;
-                    kb.send_modifiers(serial, mods);
-                }
-            }
-        }
     }
 
     pub fn cancel_repeat(&self) {
@@ -290,6 +255,60 @@ impl SeatGlobal {
             bytes.extend_from_slice(&k.to_le_bytes());
         }
         bytes
+    }
+
+    // -- keymap config --
+
+    /// startup and reload: rebuild for input.layout, latch numlock once,
+    /// push the new keymap to every bound keyboard
+    pub fn apply_input_config(&self, state: &Rc<State>) {
+        let cfg = state.config.borrow().clone();
+        let mut rebuilt = false;
+        if cfg.input.layout != *self.kb_layout.borrow() {
+            match Keymap::new(cfg.input.layout.as_deref()) {
+                Ok(map) => {
+                    *self.kb_state.borrow_mut() = map.create_state();
+                    *self.keymap.borrow_mut() = map;
+                    *self.kb_layout.borrow_mut() = cfg.input.layout.clone();
+                    self.mods.set(Mods::default());
+                    rebuilt = true;
+                }
+                // a bad layout keeps the working keymap; never a dead keyboard
+                Err(e) => eprintln!("carrot: keymap: {e}"),
+            }
+        }
+        if cfg.input.numlock && (rebuilt || !self.numlock_done.get()) {
+            self.latch_numlock();
+        }
+        self.numlock_done.set(true);
+        if rebuilt {
+            self.resend_keymap();
+        }
+    }
+
+    /// one simulated numlock tap on the fresh xkb state locks the modifier
+    fn latch_numlock(&self) {
+        const KEY_NUMLOCK: u32 = 69;
+        let map = self.keymap.borrow().clone();
+        let mut st = self.kb_state.borrow_mut();
+        st.process(&map, KEY_NUMLOCK, true);
+        st.process(&map, KEY_NUMLOCK, false);
+        self.mods.set(st.mods());
+    }
+
+    /// every bound keyboard gets the new fd, then modifiers to resync
+    fn resend_keymap(&self) {
+        let map = self.keymap.borrow().clone();
+        let mods = self.mods.get();
+        for seats in self.bindings.borrow().values() {
+            for seat in seats {
+                for kb in seat.keyboards.borrow().iter() {
+                    kb.send_keymap(&map);
+                    let serial = kb.client.state.next_serial(Some(&kb.client)) as u32;
+                    kb.send_modifiers(serial, mods);
+                }
+            }
+        }
     }
 }
 
@@ -503,245 +522,9 @@ impl Object for WlKeyboard {
     }
 }
 
-// -- wl_pointer (events land with the pointer routing pass) --
-
-pub struct WlPointer {
-    pub id: ObjectId,
-    pub client: Rc<Client>,
-    pub version: u32,
-}
-
-impl wl_pointer::Handler for WlPointer {
-    fn set_cursor(
-        &self,
-        _req: wl_pointer::set_cursor::Request,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // cursor snapshotting arrives with pointer routing
-        Ok(())
-    }
-
-    fn release(
-        &self,
-        _req: wl_pointer::release::Request,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.client.remove_obj(self.id)?;
-        Ok(())
-    }
-}
-
-impl Object for WlPointer {
-    fn id(&self) -> ObjectId {
-        self.id
-    }
-
-    fn interface(&self) -> &'static str {
-        wl_pointer::NAME
-    }
-
-    fn handle_request(
-        self: Rc<Self>,
-        opcode: u32,
-        r: &mut MsgReader<'_>,
-    ) -> Result<(), DispatchError> {
-        wl_pointer::dispatch(&*self, self.version, opcode, r)
-    }
-}
-
-// -- key delivery --
+// -- relative pointers, constraints, cursor --
 
 impl SeatGlobal {
-    /// one key edge: xkb, then binds, then the client
-    /// per-window key rebind, applied pre-xkb; press/release pair so a focus
-    /// change mid-hold can't strand a key down
-    fn remap(&self, state: &Rc<State>, key: u32, pressed: bool) -> u32 {
-        if !pressed {
-            if let Some(to) = self.remap_held.borrow_mut().remove(&key) {
-                return to;
-            }
-            return key;
-        }
-        let cfg = state.config.borrow().clone();
-        if cfg.remaps.is_empty() {
-            return key;
-        }
-        let focus = self.kb_focus.borrow().clone();
-        let Some(win) = focus.and_then(|s| crate::tree::window_for_surface(state, &s)) else {
-            return key;
-        };
-        let ws = crate::tree::workspace_of(state, &win)
-            .and_then(|w| {
-                state
-                    .workspaces
-                    .borrow()
-                    .iter()
-                    .position(|x| Rc::ptr_eq(x, &w))
-            })
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let to = crate::config::resolve_remap(
-            &cfg,
-            &win.app_id(),
-            &win.title(),
-            win.x11_opt().is_some(),
-            win.surface().client.pid,
-            ws,
-            key,
-        );
-        match to {
-            Some(to) => {
-                self.remap_held.borrow_mut().insert(key, to);
-                to
-            }
-            None => key,
-        }
-    }
-
-    pub fn key(&self, state: &Rc<State>, time_usec: u64, key: u32, pressed: bool) -> KeyAction {
-        crate::protocol::idle::note_activity(state);
-        let key = self.remap(state, key, pressed);
-        let changed = self
-            .kb_state
-            .borrow_mut()
-            .process(&self.keymap.borrow(), key, pressed);
-        if let Some(mods) = changed {
-            self.mods.set(mods);
-        }
-        {
-            let mut held = self.pressed.borrow_mut();
-            if pressed {
-                if !held.contains(&key) {
-                    held.push(key);
-                }
-            } else {
-                held.retain(|&k| k != key);
-            }
-        }
-
-        // binds exact-match the depressed set masked to shift|ctrl|alt|super
-        if pressed {
-            const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
-            const CTRL_ALT: u32 = (1 << 2) | (1 << 3);
-            let held_mods = self.mods.get().depressed & MASK;
-            if held_mods == CTRL_ALT {
-                let vt = match key {
-                    59..=68 => Some(key - 58),
-                    87 => Some(11),
-                    88 => Some(12),
-                    _ => None,
-                };
-                if let Some(vt) = vt {
-                    self.cancel_repeat(); // bound keys never repeat
-                    return KeyAction::SwitchVt(vt);
-                }
-            }
-            // configured binds, exact-set match; vt switching stays
-            // hardcoded above so a broken config can't strand the seat
-            let cfg = state.config.borrow().clone();
-            use crate::config::BindKind;
-            // a press of anything else disarms a waiting release bind
-            let mut armed = None;
-            for b in cfg.binds.iter() {
-                if held_mods == b.mods && key == b.key {
-                    match b.kind {
-                        BindKind::Mouse => continue,
-                        BindKind::Release => {
-                            armed = Some((key, b.action.clone()));
-                            continue;
-                        }
-                        BindKind::Repeat => {
-                            // re-fires from the repeat loop while held
-                            self.arm_repeat(key);
-                            return KeyAction::Act(b.action.clone());
-                        }
-                        // lock-safe fires like press until a session lock exists
-                        BindKind::Press | BindKind::LockSafe => {
-                            self.cancel_repeat();
-                            return KeyAction::Act(b.action.clone());
-                        }
-                    }
-                }
-            }
-            *self.armed_release.borrow_mut() = armed;
-        } else {
-            // the armed key came back up: fire, once
-            let hit = {
-                let mut slot = self.armed_release.borrow_mut();
-                match slot.take() {
-                    Some((k, act)) if k == key => Some(act),
-                    other => {
-                        *slot = other;
-                        None
-                    }
-                }
-            };
-            if let Some(act) = hit {
-                return KeyAction::Act(act);
-            }
-        }
-
-        // never deliver to a destroyed surface
-        let focus = self.kb_focus.borrow().clone();
-        let focus = match focus {
-            Some(s) if !s.destroyed.get() => Some(s),
-            Some(_) => {
-                self.kb_focus.borrow_mut().take();
-                None
-            }
-            None => None,
-        };
-        if let Some(surface) = focus {
-            let client = &surface.client;
-            let serial = state.next_serial(Some(client)) as u32;
-            let ms = (time_usec / 1000) as u32;
-            let mods = changed;
-            self.for_each_keyboard(client.id, 1, |kb| {
-                kb.client.event(|o| {
-                    wl_keyboard::key::send(o, kb.id, serial, ms, key, pressed as u32)
-                });
-                if let Some(m) = mods {
-                    kb.send_modifiers(serial, m);
-                }
-            });
-            let group = self.mods.get().group;
-            if pressed && self.keymap.borrow().repeats(key, group) {
-                self.arm_repeat(key);
-            } else if !pressed && self.repeat_key.get() == Some(key) {
-                self.cancel_repeat();
-            }
-        }
-        KeyAction::Handled
-    }
-
-    pub fn for_each_pointer(
-        &self,
-        client: ClientId,
-        min_version: u32,
-        mut f: impl FnMut(&Rc<WlPointer>),
-    ) {
-        if let Some(seats) = self.bindings.borrow().get(&client) {
-            for seat in seats {
-                if seat.version >= min_version {
-                    for p in seat.pointers.borrow().iter() {
-                        f(p);
-                    }
-                }
-            }
-        }
-    }
-
-    fn ptr_frame(&self, client: ClientId) {
-        self.for_each_pointer(client, wl_pointer::frame::SINCE, |p| {
-            p.client.event(|o| wl_pointer::frame::send(o, p.id));
-        });
-    }
-
-    /// deepest mapped surface under the global point, in z order
-    fn surface_at(&self, state: &Rc<State>, x: f64, y: f64) -> Option<(Rc<WlSurface>, i32, i32)> {
-        crate::tree::surface_at(state, x as i32, y as i32)
-    }
-
-    // -- relative pointers and constraints --
-
     pub fn add_relative_pointer(&self, client: ClientId, rp: Rc<RelativePointer>) {
         self.relative.borrow_mut().entry(client).or_default().push(rp);
     }
@@ -883,6 +666,453 @@ impl SeatGlobal {
         )
     }
 
+    fn cursor_is(&self, key: (ClientId, ObjectId)) -> bool {
+        match &*self.cursor.borrow() {
+            CursorState::Surface(s) => (s.client.id, s.id) == key,
+            _ => false,
+        }
+    }
+
+    /// push whatever the cursor state says onto the hardware plane
+    pub fn apply_cursor(&self, state: &Rc<State>) {
+        let d = state.display.borrow();
+        let Some(d) = d.as_ref() else { return };
+        match &*self.cursor.borrow() {
+            CursorState::Default => d.set_cursor_default(),
+            CursorState::Hidden => d.set_cursor_hidden(true),
+            // a cursor surface with no buffer is hidden, per spec
+            CursorState::Surface(s) => match cursor_pixels(s) {
+                Some((px, w, h)) => d.set_cursor_image(&px, w, h, self.cursor_hot.get()),
+                None => d.set_cursor_hidden(true),
+            },
+        }
+        d.move_cursor(state, self.ptr_x.get() as i32, self.ptr_y.get() as i32);
+    }
+
+    fn cursor_surface_committed(&self, key: (ClientId, ObjectId)) {
+        if !self.cursor_is(key) {
+            return;
+        }
+        let state = match &*self.cursor.borrow() {
+            CursorState::Surface(s) => s.client.state.clone(),
+            _ => return,
+        };
+        self.apply_cursor(&state);
+    }
+
+    fn cursor_surface_destroyed(&self, key: (ClientId, ObjectId)) {
+        if !self.cursor_is(key) {
+            return;
+        }
+        let state = match &*self.cursor.borrow() {
+            CursorState::Surface(s) => s.client.state.clone(),
+            _ => return,
+        };
+        *self.cursor.borrow_mut() = CursorState::Default;
+        self.apply_cursor(&state);
+    }
+}
+
+/// role object for cursor surfaces; hotspot rides the seat, offsets shift it
+struct CursorExt {
+    seat: std::rc::Weak<SeatGlobal>,
+    key: (ClientId, ObjectId),
+}
+
+impl crate::surface::SurfaceExt for CursorExt {
+    fn commit_requested(
+        self: Rc<Self>,
+        pending: Box<crate::surface::PendingState>,
+    ) -> Option<Box<crate::surface::PendingState>> {
+        if let Some(seat) = self.seat.upgrade() {
+            if seat.cursor_is(self.key) {
+                let (hx, hy) = seat.cursor_hot.get();
+                seat.cursor_hot.set((hx - pending.offset.0, hy - pending.offset.1));
+            }
+        }
+        Some(pending)
+    }
+
+    fn after_apply(&self) {
+        if let Some(seat) = self.seat.upgrade() {
+            seat.cursor_surface_committed(self.key);
+        }
+    }
+
+    fn on_surface_destroy(&self) -> Result<(), ()> {
+        if let Some(seat) = self.seat.upgrade() {
+            seat.cursor_surface_destroyed(self.key);
+        }
+        Ok(())
+    }
+}
+
+/// tightly packed argb bytes out of the cursor surface's commit shadow
+fn cursor_pixels(s: &WlSurface) -> Option<(Vec<u8>, u32, u32)> {
+    let buf = s.buffer.borrow();
+    let b = &buf.as_ref()?.buf;
+    let (w, h) = (b.rect.width() as u32, b.rect.height() as u32);
+    if w == 0 || h == 0 || w > 256 || h > 256 {
+        return None;
+    }
+    let row = (w * 4) as usize;
+    let need = row * h as usize;
+    // dmabuf cursors would need a gpu readback; nobody ships them
+    let shadow = s.shm_shadow.borrow();
+    let src = shadow.as_ref().filter(|p| p.len() >= need)?;
+    let mut px = src[..need].to_vec();
+    // the plane blends; xrgb needs its alpha forced opaque
+    if !b.format.has_alpha() {
+        for c in px.chunks_exact_mut(4) {
+            c[3] = 0xff;
+        }
+    }
+    Some((px, w, h))
+}
+
+// -- wl_pointer (events land with the pointer routing pass) --
+
+pub struct WlPointer {
+    pub id: ObjectId,
+    pub client: Rc<Client>,
+    pub version: u32,
+}
+
+impl wl_pointer::Handler for WlPointer {
+    fn set_cursor(
+        &self,
+        req: wl_pointer::set_cursor::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let c = &self.client;
+        let Some(seat) = c.state.seat.borrow().clone() else {
+            return Ok(());
+        };
+        // only the focused client, and only for the current enter
+        let focus = seat.ptr_focus.borrow().clone();
+        let focused_here = focus.is_some_and(|f| f.client.id == c.id);
+        if !focused_here || req.serial != seat.ptr_enter_serial.get() {
+            return Ok(());
+        }
+        if req.surface.0 == 0 {
+            *seat.cursor.borrow_mut() = CursorState::Hidden;
+            seat.apply_cursor(&c.state);
+            return Ok(());
+        }
+        let Some(s) = c.objects.surface(req.surface) else {
+            c.invalid_object(req.surface);
+            return Ok(());
+        };
+        match s.role.get() {
+            crate::surface::SurfaceRole::None | crate::surface::SurfaceRole::Cursor => {}
+            other => {
+                c.protocol_error(
+                    self.id,
+                    0, // wl_pointer error role
+                    &format!("the surface already has the {} role", other.name()),
+                );
+                return Ok(());
+            }
+        }
+        s.role.set(crate::surface::SurfaceRole::Cursor);
+        *s.ext.borrow_mut() = Rc::new(CursorExt {
+            seat: Rc::downgrade(&seat),
+            key: (c.id, s.id),
+        });
+        seat.cursor_hot.set((req.hotspot_x, req.hotspot_y));
+        *seat.cursor.borrow_mut() = CursorState::Surface(s);
+        seat.apply_cursor(&c.state);
+        Ok(())
+    }
+
+    fn release(
+        &self,
+        _req: wl_pointer::release::Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.client.remove_obj(self.id)?;
+        Ok(())
+    }
+}
+
+impl Object for WlPointer {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    fn interface(&self) -> &'static str {
+        wl_pointer::NAME
+    }
+
+    fn handle_request(
+        self: Rc<Self>,
+        opcode: u32,
+        r: &mut MsgReader<'_>,
+    ) -> Result<(), DispatchError> {
+        wl_pointer::dispatch(&*self, self.version, opcode, r)
+    }
+}
+
+// -- key delivery --
+
+impl SeatGlobal {
+    /// per-window key translation: a press consults the focused window's
+    /// remap profile, a release follows whatever its press mapped to
+    fn remap(&self, state: &Rc<State>, key: u32, pressed: bool) -> u32 {
+        if !pressed {
+            if let Some(to) = self.remap_held.borrow_mut().remove(&key) {
+                return to;
+            }
+            return key;
+        }
+        let cfg = state.config.borrow().clone();
+        if cfg.remaps.is_empty() {
+            return key;
+        }
+        let focus = self.kb_focus.borrow().clone();
+        let Some(win) = focus.and_then(|s| crate::tree::window_for_surface(state, &s)) else {
+            return key;
+        };
+        let ws = crate::tree::workspace_of(state, &win)
+            .and_then(|w| {
+                state
+                    .workspaces
+                    .borrow()
+                    .iter()
+                    .position(|x| Rc::ptr_eq(x, &w))
+            })
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let to = crate::config::resolve_remap(
+            &cfg,
+            &win.app_id(),
+            &win.title(),
+            win.x11_opt().is_some(),
+            win.surface().client.pid,
+            ws,
+            key,
+        );
+        match to {
+            Some(to) => {
+                self.remap_held.borrow_mut().insert(key, to);
+                to
+            }
+            None => key,
+        }
+    }
+
+    pub fn key(&self, state: &Rc<State>, time_usec: u64, key: u32, pressed: bool) -> KeyAction {
+        crate::protocol::idle::note_activity(state);
+        let key = self.remap(state, key, pressed);
+        let map = self.keymap.borrow().clone();
+        let changed = self.kb_state.borrow_mut().process(&map, key, pressed);
+        if let Some(mods) = changed {
+            self.mods.set(mods);
+        }
+        {
+            let mut held = self.pressed.borrow_mut();
+            if pressed {
+                if !held.contains(&key) {
+                    held.push(key);
+                }
+            } else {
+                held.retain(|&k| k != key);
+            }
+        }
+
+        // binds exact-match the depressed set masked to shift|ctrl|alt|super
+        if pressed {
+            const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
+            const CTRL_ALT: u32 = (1 << 2) | (1 << 3);
+            let held_mods = self.mods.get().depressed & MASK;
+            if held_mods == CTRL_ALT {
+                let vt = match key {
+                    59..=68 => Some(key - 58),
+                    87 => Some(11),
+                    88 => Some(12),
+                    _ => None,
+                };
+                if let Some(vt) = vt {
+                    self.cancel_repeat(); // bound keys never repeat
+                    return KeyAction::SwitchVt(vt);
+                }
+            }
+            // configured binds, exact-set match; vt switching stays
+            // hardcoded above so a broken config can't strand the seat
+            let cfg = state.config.borrow().clone();
+            use crate::config::BindKind;
+            // a press of anything else disarms a waiting release bind
+            let mut armed = None;
+            for b in cfg.binds.iter() {
+                if held_mods == b.mods && key == b.key {
+                    match b.kind {
+                        BindKind::Mouse => continue,
+                        BindKind::Release => {
+                            armed = Some((key, b.action.clone()));
+                            continue;
+                        }
+                        BindKind::Repeat => {
+                            // re-fires from the repeat loop while held
+                            self.arm_repeat(key);
+                            return KeyAction::Act(b.action.clone());
+                        }
+                        // lock-safe fires like press until a session lock
+                        // exists to gate the rest
+                        BindKind::Press | BindKind::LockSafe => {
+                            self.cancel_repeat();
+                            return KeyAction::Act(b.action.clone());
+                        }
+                    }
+                }
+            }
+            *self.armed_release.borrow_mut() = armed;
+        } else {
+            // the armed key came back up: fire, once
+            let hit = {
+                let mut slot = self.armed_release.borrow_mut();
+                match slot.take() {
+                    Some((k, act)) if k == key => Some(act),
+                    other => {
+                        *slot = other;
+                        None
+                    }
+                }
+            };
+            if let Some(act) = hit {
+                return KeyAction::Act(act);
+            }
+        }
+
+        // never deliver to a destroyed surface
+        let focus = self.kb_focus.borrow().clone();
+        let focus = match focus {
+            Some(s) if !s.destroyed.get() => Some(s),
+            Some(_) => {
+                self.kb_focus.borrow_mut().take();
+                None
+            }
+            None => None,
+        };
+        if let Some(surface) = focus {
+            let client = &surface.client;
+            let serial = state.next_serial(Some(client)) as u32;
+            let ms = (time_usec / 1000) as u32;
+            let mods = changed;
+            self.for_each_keyboard(client.id, 1, |kb| {
+                kb.client.event(|o| {
+                    wl_keyboard::key::send(o, kb.id, serial, ms, key, pressed as u32)
+                });
+                if let Some(m) = mods {
+                    kb.send_modifiers(serial, m);
+                }
+            });
+            let group = self.mods.get().group;
+            if pressed && map.repeats(key, group) {
+                self.arm_repeat(key);
+            } else if !pressed && self.repeat_key.get() == Some(key) {
+                self.cancel_repeat();
+            }
+        }
+        KeyAction::Handled
+    }
+
+    pub fn for_each_pointer(
+        &self,
+        client: ClientId,
+        min_version: u32,
+        mut f: impl FnMut(&Rc<WlPointer>),
+    ) {
+        if let Some(seats) = self.bindings.borrow().get(&client) {
+            for seat in seats {
+                if seat.version >= min_version {
+                    for p in seat.pointers.borrow().iter() {
+                        f(p);
+                    }
+                }
+            }
+        }
+    }
+
+    fn ptr_frame(&self, client: ClientId) {
+        self.for_each_pointer(client, wl_pointer::frame::SINCE, |p| {
+            p.client.event(|o| wl_pointer::frame::send(o, p.id));
+        });
+    }
+
+    /// deepest mapped surface under the global point, in z order
+    fn surface_at(&self, state: &Rc<State>, x: f64, y: f64) -> Option<(Rc<WlSurface>, i32, i32)> {
+        crate::tree::surface_at(state, x as i32, y as i32)
+    }
+
+    /// leave/enter dance onto whatever is under the point now
+    fn pick_focus(self: &Rc<Self>, state: &Rc<State>, x: f64, y: f64) {
+        let hit = self.surface_at(state, x, y);
+        let cur = self.ptr_focus.borrow().clone();
+        let same = match (&cur, &hit) {
+            (Some(a), Some((b, _, _))) => Rc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        if let Some(old) = cur {
+            if !old.destroyed.get() {
+                let serial = state.next_serial(Some(&old.client)) as u32;
+                self.for_each_pointer(old.client.id, 1, |p| {
+                    p.client
+                        .event(|o| wl_pointer::leave::send(o, p.id, serial, old.id));
+                });
+                self.ptr_frame(old.client.id);
+            }
+        }
+        if let Some((new, lx, ly)) = &hit {
+            let serial = state.next_serial(Some(&new.client)) as u32;
+            self.ptr_enter_serial.set(serial);
+            let (fx, fy) = (Fixed::from_int(*lx), Fixed::from_int(*ly));
+            self.for_each_pointer(new.client.id, 1, |p| {
+                p.client.event(|o| {
+                    wl_pointer::enter::send(o, p.id, serial, new.id, fx, fy)
+                });
+            });
+            self.ptr_frame(new.client.id);
+            self.ptr_origin.set((x as i32 - lx, y as i32 - ly));
+            // focus-follows-mouse targets the window root, never a subsurface,
+            // and never fires while a popup grab or lock holds the keyboard.
+            // popups and layer surfaces take the keyboard by click or
+            // exclusivity, not by hover
+            let root = new.get_root();
+            let role = root.role.get();
+            if role != crate::surface::SurfaceRole::Popup
+                && role != crate::surface::SurfaceRole::LayerSurface
+                && self.popup_grab.borrow().is_empty()
+                && crate::shell::layer::kb_lock(state).is_none()
+            {
+                super::focus::set_keyboard_focus(state, self, Some(root));
+            }
+        }
+        *self.ptr_focus.borrow_mut() = hit.as_ref().map(|(s, _, _)| s.clone());
+        // default arrow until the entered client sets its own cursor
+        *self.cursor.borrow_mut() = CursorState::Default;
+        self.apply_cursor(state);
+        self.refresh_constraint(state);
+    }
+
+    pub fn pointer_focus(&self) -> Option<Rc<WlSurface>> {
+        self.ptr_focus.borrow().clone()
+    }
+
+    /// the scene changed under a stationary cursor (map/unmap/arrange):
+    /// re-resolve pointer focus without waiting for the next motion
+    pub fn repick(self: &Rc<Self>, state: &Rc<State>) {
+        // an implicit grab pins focus; dnd re-targets on its own motion
+        if !self.ptr_buttons.borrow().is_empty()
+            || self.data.drag().is_some()
+            || self.active_lock().is_some()
+        {
+            return;
+        }
+        self.pick_focus(state, self.ptr_x.get(), self.ptr_y.get());
+    }
+
     pub fn pointer_motion(
         self: &Rc<Self>,
         state: &Rc<State>,
@@ -904,9 +1134,8 @@ impl SeatGlobal {
                 return;
             }
         }
-        let (w, h) = state.output_size.get();
-        let mut x = (self.ptr_x.get() + dx).clamp(0.0, (w.max(1) - 1) as f64);
-        let mut y = (self.ptr_y.get() + dy).clamp(0.0, (h.max(1) - 1) as f64);
+        let (mut x, mut y) =
+            crate::output::clamp_pointer(state, self.ptr_x.get() + dx, self.ptr_y.get() + dy);
         if let Some(con) = self.active_confine() {
             if con.surface.destroyed.get() || !con.surface.mapped.get() {
                 self.refresh_constraint(state);
@@ -916,9 +1145,10 @@ impl SeatGlobal {
         }
         self.ptr_x.set(x);
         self.ptr_y.set(y);
+        crate::tree::note_pointer_output(state, x, y);
 
-        // an active drag owns the pointer: the wl_pointer stream stays quiet
-        // and dnd enter/leave/motion track the surface underneath
+        // an active drag owns the pointer: the wl_pointer stream stays
+        // quiet and dnd enter/leave/motion track the surface underneath
         if let Some(drag) = self.data.drag() {
             self.drag_motion(state, &drag, time_usec, x, y);
             return;
@@ -932,51 +1162,7 @@ impl SeatGlobal {
 
         let grabbed = !self.ptr_buttons.borrow().is_empty();
         if !grabbed {
-            let hit = self.surface_at(state, x, y);
-            let cur = self.ptr_focus.borrow().clone();
-            let same = match (&cur, &hit) {
-                (Some(a), Some((b, _, _))) => Rc::ptr_eq(a, b),
-                (None, None) => true,
-                _ => false,
-            };
-            if !same {
-                if let Some(old) = cur {
-                    if !old.destroyed.get() {
-                        let serial = state.next_serial(Some(&old.client)) as u32;
-                        self.for_each_pointer(old.client.id, 1, |p| {
-                            p.client
-                                .event(|o| wl_pointer::leave::send(o, p.id, serial, old.id));
-                        });
-                        self.ptr_frame(old.client.id);
-                    }
-                }
-                if let Some((new, lx, ly)) = &hit {
-                    let serial = state.next_serial(Some(&new.client)) as u32;
-                    let (fx, fy) = (Fixed::from_int(*lx), Fixed::from_int(*ly));
-                    self.for_each_pointer(new.client.id, 1, |p| {
-                        p.client.event(|o| {
-                            wl_pointer::enter::send(o, p.id, serial, new.id, fx, fy)
-                        });
-                    });
-                    self.ptr_frame(new.client.id);
-                    self.ptr_origin.set((x as i32 - lx, y as i32 - ly));
-                    // focus follows mouse, onto the window root never a
-                    // subsurface; hovering a popup must not steal focus from its toplevel,
-                    // and neither may hovering anything while a grab holds the keyboard
-                    // layer surfaces only take the keyboard by click or
-                    // exclusivity, never by hover
-                    let root = new.get_root();
-                    let role = root.role.get();
-                    if role != crate::surface::SurfaceRole::Popup
-                        && role != crate::surface::SurfaceRole::LayerSurface
-                        && self.popup_grab.borrow().is_empty()
-                        && crate::shell::layer::kb_lock(state).is_none()
-                    {
-                        super::focus::set_keyboard_focus(state, self, Some(root));
-                    }
-                }
-                *self.ptr_focus.borrow_mut() = hit.as_ref().map(|(s, _, _)| s.clone());
-            }
+            self.pick_focus(state, x, y);
         }
 
         let focus = self.ptr_focus.borrow().clone();
@@ -990,13 +1176,98 @@ impl SeatGlobal {
                     .event(|o| wl_pointer::motion::send(o, p.id, ms, fx, fy));
             });
             self.send_relative(surface.client.id, time_usec, dx, dy, udx, udy);
+            self.ptr_frame(surface.client.id);
         }
+    }
+
+    pub fn pointer_button(self: &Rc<Self>, state: &Rc<State>, time_usec: u64, button: u32, pressed: bool) {
+        crate::protocol::idle::note_activity(state);
+        {
+            let mut held = self.ptr_buttons.borrow_mut();
+            if pressed {
+                held.push(button);
+            } else {
+                held.retain(|&b| b != button);
+            }
+        }
+        // buttons never reach clients during a drag; the last release
+        // ends the session as a drop or a cancel
+        if let Some(_drag) = self.data.drag() {
+            if !pressed && self.ptr_buttons.borrow().is_empty() {
+                self.end_drag(state);
+            }
+            return;
+        }
+        // same for a move/resize session: the last release ends it
+        if self.grab.borrow().is_some() {
+            if !pressed && self.ptr_buttons.borrow().is_empty() {
+                self.end_grab(state);
+            }
+            return;
+        }
+        let focus = self.ptr_focus.borrow().clone();
+        // a press outside the popup grab chain dismisses it; the click
+        // then continues to whoever it landed on
+        if pressed && !self.popup_grab.borrow().is_empty() {
+            let in_chain = focus.as_ref().is_some_and(|s| {
+                let root = s.get_root();
+                self.popup_grab
+                    .borrow()
+                    .iter()
+                    .any(|p| Rc::ptr_eq(&p.xdg.surface, &root))
+            });
+            if !in_chain {
+                crate::shell::xdg::dismiss_popup_grabs(state, self);
+            }
+        }
+        // on-demand keyboard interactivity: clicking a layer surface
+        // hands it the keyboard, clicking a window takes it back
+        if pressed && crate::shell::layer::kb_lock(state).is_none() {
+            if let Some(s) = &focus {
+                let root = s.get_root();
+                if root.role.get() == crate::surface::SurfaceRole::LayerSurface {
+                    let ls = crate::shell::layer::from_surface(state, &root);
+                    if ls.is_some_and(|l| l.current.get().ki != crate::shell::layer::KI_NONE) {
+                        super::focus::set_keyboard_focus(state, self, Some(root));
+                    }
+                }
+            }
+        }
+        // mouse binds: evdev button code in the key slot, kb mods held
+        if pressed {
+            const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
+            let held_mods = self.mods.get().depressed & MASK;
+            let cfg = state.config.borrow().clone();
+            let hit = cfg.binds.iter().find(|b| {
+                matches!(b.kind, crate::config::BindKind::Mouse)
+                    && b.mods == held_mods
+                    && b.key == button
+            });
+            if let Some(b) = hit {
+                crate::ipc::dispatch_action(state, &b.action);
+                return;
+            }
+        }
+        let Some(surface) = focus.filter(|s| !s.destroyed.get()) else {
+            return;
+        };
+        let serial = state.next_serial(Some(&surface.client)) as u32;
+        if pressed {
+            self.last_press_serial.set(serial);
+        }
+        let ms = (time_usec / 1000) as u32;
+        self.for_each_pointer(surface.client.id, 1, |p| {
+            p.client.event(|o| {
+                wl_pointer::button::send(o, p.id, serial, ms, button, pressed as u32)
+            });
+        });
+        self.ptr_frame(surface.client.id);
     }
 
     // -- drag and drop; the session itself lives on self.data --
 
-    /// start_drag is only honored for the client holding the implicit grab,
-    /// naming the press serial, from the surface under the pointer
+    /// start_drag is only honored for the client holding the implicit
+    /// grab, naming the press serial, from the surface under the pointer
     pub fn drag_grab_valid(&self, origin: &Rc<WlSurface>, serial: u32) -> bool {
         if self.ptr_buttons.borrow().is_empty() || self.data.drag().is_some() {
             return false;
@@ -1069,90 +1340,6 @@ impl SeatGlobal {
         // the pointer re-enters whatever it is over
         let usec = crate::util::Time::now().nsec() / 1_000;
         self.pointer_motion(state, usec, 0.0, 0.0, 0.0, 0.0);
-    }
-
-    pub fn pointer_button(self: &Rc<Self>, state: &Rc<State>, time_usec: u64, button: u32, pressed: bool) {
-        crate::protocol::idle::note_activity(state);
-        {
-            let mut held = self.ptr_buttons.borrow_mut();
-            if pressed {
-                held.push(button);
-            } else {
-                held.retain(|&b| b != button);
-            }
-        }
-        // buttons never reach clients during a drag; the last release ends
-        // the session as a drop or a cancel
-        if let Some(_drag) = self.data.drag() {
-            if !pressed && self.ptr_buttons.borrow().is_empty() {
-                self.end_drag(state);
-            }
-            return;
-        }
-        // same for a move/resize session: the last release ends it
-        if self.grab.borrow().is_some() {
-            if !pressed && self.ptr_buttons.borrow().is_empty() {
-                self.end_grab(state);
-            }
-            return;
-        }
-        let focus = self.ptr_focus.borrow().clone();
-        // a press outside the popup grab chain dismisses it; the click
-        // then continues to whoever it landed on
-        if pressed && !self.popup_grab.borrow().is_empty() {
-            let in_chain = focus.as_ref().is_some_and(|s| {
-                let root = s.get_root();
-                self.popup_grab
-                    .borrow()
-                    .iter()
-                    .any(|p| Rc::ptr_eq(&p.xdg.surface, &root))
-            });
-            if !in_chain {
-                crate::shell::xdg::dismiss_popup_grabs(state, self);
-            }
-        }
-        // on-demand keyboard interactivity: clicking a layer surface
-        // hands it the keyboard, clicking a window takes it back
-        if pressed && crate::shell::layer::kb_lock(state).is_none() {
-            if let Some(s) = &focus {
-                let root = s.get_root();
-                if root.role.get() == crate::surface::SurfaceRole::LayerSurface {
-                    let ls = crate::shell::layer::from_surface(state, &root);
-                    if ls.is_some_and(|l| l.current.get().ki != crate::shell::layer::KI_NONE) {
-                        super::focus::set_keyboard_focus(state, self, Some(root));
-                    }
-                }
-            }
-        }
-        // mouse binds: evdev button code in the key slot, kb mods held
-        if pressed {
-            const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
-            let held_mods = self.mods.get().depressed & MASK;
-            let cfg = state.config.borrow().clone();
-            let hit = cfg.binds.iter().find(|b| {
-                matches!(b.kind, crate::config::BindKind::Mouse)
-                    && b.mods == held_mods
-                    && b.key == button
-            });
-            if let Some(b) = hit {
-                crate::ipc::dispatch_action(state, &b.action);
-                return;
-            }
-        }
-        let Some(surface) = focus.filter(|s| !s.destroyed.get()) else {
-            return;
-        };
-        let serial = state.next_serial(Some(&surface.client)) as u32;
-        if pressed {
-            self.last_press_serial.set(serial);
-        }
-        let ms = (time_usec / 1000) as u32;
-        self.for_each_pointer(surface.client.id, 1, |p| {
-            p.client.event(|o| {
-                wl_pointer::button::send(o, p.id, serial, ms, button, pressed as u32)
-            });
-        });
-        self.ptr_frame(surface.client.id);
     }
 
     // -- interactive move/resize --
@@ -1270,7 +1457,7 @@ impl SeatGlobal {
             return;
         };
         let ms = (time_usec / 1000) as u32;
-        // ~15 logical px per detent, the ecosystem convention
+        // ~15 logical px per wheel detent
         let px = Fixed::from_f64(dist as f64 / 120.0 * 15.0);
         self.for_each_pointer(surface.client.id, 1, |p| {
             if p.version >= wl_pointer::axis_source::SINCE {
@@ -1340,4 +1527,264 @@ fn resize_rect(r: crate::rect::Rect, edges: u32, dx: f64, dy: f64, min: i32) -> 
         out.y2 = ((r.y2 as f64 + dy) as i32).max(r.y1 + min);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::test_utils::{count_events, test_client};
+    use crate::protocol::interfaces::{
+        zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+    };
+    use crate::protocol::pointer_constraints::{ConstraintsManager, LockedPointer};
+    use wl_pointer::Handler as _;
+    use zwp_locked_pointer_v1::Handler as _;
+    use zwp_pointer_constraints_v1::Handler as _;
+
+    fn setup() -> (Rc<crate::state::State>, Rc<Client>, Rc<SeatGlobal>, Rc<WlSurface>) {
+        let (state, client) = test_client();
+        state.output_size.set((2560, 1440));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let s = WlSurface::new(ObjectId(10), &client, 6);
+        client.add_client_obj(s.clone()).unwrap();
+        client.objects.track_surface(s.clone());
+        s.mapped.set(true);
+        // pointer parked on the surface at global 100,80; surface at 40,30
+        *seat.ptr_focus.borrow_mut() = Some(s.clone());
+        seat.ptr_origin.set((40, 30));
+        seat.ptr_x.set(100.0);
+        seat.ptr_y.set(80.0);
+        s.size.set((800, 600));
+        (state, client, seat, s)
+    }
+
+    fn lock(
+        client: &Rc<Client>,
+        surface: ObjectId,
+        id: u32,
+        lifetime: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mgr = ConstraintsManager {
+            id: ObjectId(70),
+            client: client.clone(),
+            version: 1,
+        };
+        mgr.lock_pointer(zwp_pointer_constraints_v1::lock_pointer::Request {
+            id: ObjectId(id),
+            surface,
+            pointer: ObjectId(0),
+            region: ObjectId(0),
+            lifetime,
+        })
+    }
+
+    #[test]
+    fn a_lock_freezes_the_pointer_and_deltas_keep_flowing() {
+        let (state, client, seat, s) = setup();
+        let rp = Rc::new(crate::protocol::relative_pointer::RelativePointer {
+            id: ObjectId(60),
+            client: client.clone(),
+        });
+        seat.add_relative_pointer(client.id, rp);
+        lock(&client, s.id, 71, 2).unwrap();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, ObjectId(71), 0), 1, "locked");
+        seat.pointer_motion(&state, 7_000, 25.0, -12.0, 25.0, -12.0);
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (100.0, 80.0));
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, ObjectId(60), 0), 1, "relative_motion");
+    }
+
+    #[test]
+    fn unlock_lands_on_the_position_hint() {
+        let (state, client, seat, s) = setup();
+        lock(&client, s.id, 71, 1).unwrap();
+        let con = seat.constraint_for(&s).unwrap();
+        let lp = LockedPointer { id: ObjectId(71), con };
+        lp.set_cursor_position_hint(zwp_locked_pointer_v1::set_cursor_position_hint::Request {
+            surface_x: Fixed::from_int(400),
+            surface_y: Fixed::from_int(300),
+        })
+        .unwrap();
+        lp.destroy(zwp_locked_pointer_v1::destroy::Request {}).unwrap();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, ObjectId(71), 1), 1, "unlocked");
+        // origin 40,30 + hint 400,300
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (440.0, 330.0));
+        // oneshot never re-arms
+        assert!(seat.constraint_for(&s).is_none());
+    }
+
+    #[test]
+    fn a_confine_clamps_motion_into_the_surface() {
+        let (state, client, seat, s) = setup();
+        let mgr = ConstraintsManager {
+            id: ObjectId(70),
+            client: client.clone(),
+            version: 1,
+        };
+        mgr.confine_pointer(zwp_pointer_constraints_v1::confine_pointer::Request {
+            id: ObjectId(72),
+            surface: s.id,
+            pointer: ObjectId(0),
+            region: ObjectId(0),
+            lifetime: 2,
+        })
+        .unwrap();
+        // surface spans 40,30 .. 840,630; a huge delta pins to the edge
+        seat.pointer_motion(&state, 7_000, 5000.0, 5000.0, 5000.0, 5000.0);
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (839.0, 629.0));
+    }
+
+    #[test]
+    fn one_constraint_per_surface() {
+        let (_state, client, seat, s) = setup();
+        lock(&client, s.id, 71, 2).unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 0);
+        lock(&client, s.id, 73, 2).unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 1);
+        let _ = seat;
+    }
+
+    #[test]
+    fn release_binds_fire_on_keyup_and_disarm_on_other_presses() {
+        use crate::config::{Action, Bind, BindKind, Config};
+        let (state, _client, seat, _s) = setup();
+        let mut cfg = Config::default();
+        cfg.binds.push(Bind {
+            mods: 0,
+            key: 30,
+            action: Action::Quit,
+            kind: BindKind::Release,
+        });
+        *state.config.borrow_mut() = Rc::new(cfg);
+        // press arms, keyup fires
+        assert!(matches!(seat.key(&state, 1_000, 30, true), KeyAction::Handled));
+        assert!(matches!(seat.key(&state, 2_000, 30, false), KeyAction::Act(Action::Quit)));
+        // an interleaved press disarms
+        assert!(matches!(seat.key(&state, 3_000, 30, true), KeyAction::Handled));
+        assert!(matches!(seat.key(&state, 4_000, 31, true), KeyAction::Handled));
+        seat.key(&state, 5_000, 31, false);
+        assert!(matches!(seat.key(&state, 6_000, 30, false), KeyAction::Handled));
+    }
+
+    #[test]
+    fn a_drag_rides_the_grab_and_release_ends_it() {
+        use crate::protocol::data_device::WlDataDevice;
+        use crate::protocol::interfaces::wl_data_device::Handler as _;
+        let (state, client, seat, s) = setup();
+        let dev = Rc::new(WlDataDevice {
+            id: ObjectId(70),
+            client: client.clone(),
+            version: 3,
+        });
+        client.add_client_obj(dev.clone()).unwrap();
+        // press on the surface arms the grab and records the serial
+        seat.pointer_button(&state, 1_000, 0x110, true);
+        let serial = seat.last_press_serial.get();
+        // a stale serial is ignored
+        dev.start_drag(crate::protocol::interfaces::wl_data_device::start_drag::Request {
+            source: ObjectId::NONE,
+            origin: s.id,
+            icon: ObjectId::NONE,
+            serial: serial + 1,
+        })
+        .unwrap();
+        assert!(seat.data.drag().is_none());
+        // the real one starts an internal (source-less) session
+        dev.start_drag(crate::protocol::interfaces::wl_data_device::start_drag::Request {
+            source: ObjectId::NONE,
+            origin: s.id,
+            icon: ObjectId::NONE,
+            serial,
+        })
+        .unwrap();
+        assert!(seat.data.drag().is_some());
+        // pointer focus moved to the session
+        assert!(seat.ptr_focus.borrow().is_none());
+        // releasing the grab ends it
+        seat.pointer_button(&state, 2_000, 0x110, false);
+        assert!(seat.data.drag().is_none());
+    }
+
+    #[test]
+    fn set_cursor_needs_the_enter_serial() {
+        let (_state, client, seat, _s) = setup();
+        seat.ptr_enter_serial.set(9);
+        let ptr = WlPointer {
+            id: ObjectId(50),
+            client: client.clone(),
+            version: 9,
+        };
+        ptr.set_cursor(wl_pointer::set_cursor::Request {
+            serial: 8,
+            surface: ObjectId(0),
+            hotspot_x: 0,
+            hotspot_y: 0,
+        })
+        .unwrap();
+        assert!(matches!(&*seat.cursor.borrow(), CursorState::Default));
+        ptr.set_cursor(wl_pointer::set_cursor::Request {
+            serial: 9,
+            surface: ObjectId(0),
+            hotspot_x: 0,
+            hotspot_y: 0,
+        })
+        .unwrap();
+        assert!(matches!(&*seat.cursor.borrow(), CursorState::Hidden));
+    }
+
+    #[test]
+    fn resize_edges_move_only_the_dragged_sides() {
+        use crate::rect::Rect;
+        let r = Rect { x1: 100, y1: 100, x2: 500, y2: 400 };
+        // bottom-right: those two edges follow the deltas
+        let out = resize_rect(r, 2 | 8, 50.0, -20.0, 50);
+        assert_eq!(out, Rect { x1: 100, y1: 100, x2: 550, y2: 380 });
+        // top-left: the box shrinks from the other side
+        let out = resize_rect(r, 1 | 4, 30.0, 40.0, 50);
+        assert_eq!(out, Rect { x1: 130, y1: 140, x2: 500, y2: 400 });
+        // no bit, no change on that axis
+        let out = resize_rect(r, 8, 25.0, 999.0, 50);
+        assert_eq!(out, Rect { x1: 100, y1: 100, x2: 525, y2: 400 });
+    }
+
+    #[test]
+    fn resize_stops_at_the_minimum_size() {
+        use crate::rect::Rect;
+        let r = Rect { x1: 100, y1: 100, x2: 500, y2: 400 };
+        // dragging left/top far past the opposite edge pins at min
+        let out = resize_rect(r, 1 | 4, 1000.0, 1000.0, 50);
+        assert_eq!(out, Rect { x1: 450, y1: 350, x2: 500, y2: 400 });
+        // and right/bottom collapsing inward pins the same way
+        let out = resize_rect(r, 2 | 8, -1000.0, -1000.0, 50);
+        assert_eq!(out, Rect { x1: 100, y1: 100, x2: 150, y2: 150 });
+    }
+
+    #[test]
+    fn a_cursor_surface_takes_the_role() {
+        let (_state, client, seat, _s) = setup();
+        seat.ptr_enter_serial.set(3);
+        let cs = WlSurface::new(ObjectId(11), &client, 6);
+        client.add_client_obj(cs.clone()).unwrap();
+        client.objects.track_surface(cs.clone());
+        let ptr = WlPointer {
+            id: ObjectId(50),
+            client: client.clone(),
+            version: 9,
+        };
+        ptr.set_cursor(wl_pointer::set_cursor::Request {
+            serial: 3,
+            surface: cs.id,
+            hotspot_x: 4,
+            hotspot_y: 7,
+        })
+        .unwrap();
+        assert_eq!(cs.role.get(), crate::surface::SurfaceRole::Cursor);
+        assert_eq!(seat.cursor_hot.get(), (4, 7));
+        assert!(matches!(&*seat.cursor.borrow(), CursorState::Surface(_)));
+        // no buffer yet: hidden on the plane, but the state tracks the surface
+        cs.commit_impl();
+    }
 }
