@@ -339,9 +339,8 @@ impl Xwm {
                 }
             }
             E::MapRequest { window, .. } => {
-                // always granted; the tree decides placement after the
-                // buffer shows up. everything is read once here, property
-                // notifies keep it fresh afterwards
+                // always granted; the tree places it once a buffer shows up.
+                // read everything once here, property notifies keep it fresh
                 if let Some(xwin) = self.win(window) {
                     self.refresh_all(&xwin).await;
                 }
@@ -975,13 +974,10 @@ impl Xwm {
             }
         } else if !mapped && in_tree {
             let win = xwin.window.borrow_mut().take().unwrap();
-            if win.floating.get() {
-                let ws = crate::tree::active(&self.state);
-                ws.remove_float(&win);
-                self.state.damage.trigger();
-            } else {
-                crate::tree::unmap_window(&self.state, &win);
-            }
+            // unmap_window finds the workspace that really holds it; the
+            // active one may have changed since map (workspace switches,
+            // pointer crossing outputs)
+            crate::tree::unmap_window(&self.state, &win);
             self.client_list_remove(xwin.xid);
         }
     }
@@ -1165,7 +1161,7 @@ async fn bring_up(c: &Rc<Parsnip>) -> Result<(), ParsnipError> {
     });
     c.send(|b| wire::change_property(b, PROP_REPLACE, wm_win, wm_name, utf8, 8, b"carrot"));
 
-    // a single fake desktop; steam refuses to believe in a wm without one
+    // one fake desktop; ewmh clients probe the desktop props to confirm a compliant wm
     let mut atoms: Vec<u32> = vec![check, wm_name];
     for name in [
         "_NET_WM_STATE",

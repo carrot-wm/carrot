@@ -806,6 +806,10 @@ fn window_hit(
     x: i32,
     y: i32,
 ) -> Option<(Rc<Window>, Rc<WlSurface>, i32, i32)> {
+    // an unmapped surface draws nothing and must catch nothing
+    if !win.surface().mapped.get() {
+        return None;
+    }
     let rect = win.draw_rect(state);
     if let Some(tl) = win.xdg_opt() {
         if let Some(hit) = popups_hit(&tl.xdg, rect.x1, rect.y1, x, y) {

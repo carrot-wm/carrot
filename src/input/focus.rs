@@ -8,6 +8,9 @@ use crate::surface::WlSurface;
 use std::rc::Rc;
 
 pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<Rc<WlSurface>>) {
+    // a destroyed surface's id may already be recycled client-side;
+    // naming it in enter/leave is a fatal error over there
+    let new = new.filter(|s| !s.destroyed.get());
     let old = seat.kb_focus.borrow().clone();
     match (&old, &new) {
         (Some(a), Some(b)) if Rc::ptr_eq(a, b) => return,
@@ -17,11 +20,13 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
     // a repeat must never leak across surfaces
     seat.cancel_repeat();
     if let Some(old) = &old {
-        let serial = state.next_serial(Some(&old.client)) as u32;
-        seat.for_each_keyboard(old.client.id, 1, |kb| {
-            kb.client
-                .event(|o| wl_keyboard::leave::send(o, kb.id, serial, old.id));
-        });
+        if !old.destroyed.get() {
+            let serial = state.next_serial(Some(&old.client)) as u32;
+            seat.for_each_keyboard(old.client.id, 1, |kb| {
+                kb.client
+                    .event(|o| wl_keyboard::leave::send(o, kb.id, serial, old.id));
+            });
+        }
         old.ext.borrow().set_active(false);
     }
     let old_win = old.as_ref().and_then(|s| crate::tree::window_for_surface(state, s));

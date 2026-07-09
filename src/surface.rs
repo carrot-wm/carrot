@@ -89,10 +89,10 @@ pub struct ParentData {
 
 pub struct WlSurface {
     pub id: ObjectId,
-    pub client: Rc<Client>,
-    pub version: u32,
     /// never-reused identity; texture caches key on this, not the wire id
     pub uid: u64,
+    pub client: Rc<Client>,
+    pub version: u32,
     pub(crate) role: Cell<SurfaceRole>,
     pub(crate) ext: RefCell<Rc<dyn SurfaceExt>>,
     pub(crate) pending: RefCell<Box<PendingState>>,
@@ -111,6 +111,8 @@ pub struct WlSurface {
     pub(crate) extents: Cell<Rect>,
     pub(crate) frame_callbacks: RefCell<Vec<FrameCallback>>,
     pub(crate) children: RefCell<Option<Box<ParentData>>>,
+    pub(crate) mapped: Cell<bool>,
+    pub(crate) destroyed: Cell<bool>,
     /// bumps when a commit attaches or damages; shm re-uploads key off it
     pub(crate) content_gen: Cell<u64>,
     /// commit-time copy of the shm pixels (tight w*4 rows); the client
@@ -120,17 +122,15 @@ pub struct WlSurface {
     pub(crate) tearing: Cell<bool>,
     /// a wp_tearing_control_v1 exists; the protocol allows exactly one
     pub(crate) tearing_control: Cell<bool>,
-    pub(crate) mapped: Cell<bool>,
-    pub(crate) destroyed: Cell<bool>,
 }
 
 impl WlSurface {
     pub fn new(id: ObjectId, client: &Rc<Client>, version: u32) -> Rc<WlSurface> {
         Rc::new(WlSurface {
             id,
+            uid: client.state.next_uid(),
             client: client.clone(),
             version,
-            uid: client.state.next_uid(),
             role: Cell::new(SurfaceRole::None),
             ext: RefCell::new(Rc::new(NoneExt)),
             pending: RefCell::new(Box::default()),
@@ -145,13 +145,13 @@ impl WlSurface {
             size: Cell::new((0, 0)),
             extents: Cell::new(Rect::default()),
             frame_callbacks: RefCell::new(Vec::new()),
-            children: RefCell::new(None),
-            content_gen: Cell::new(0),
-            shm_shadow: RefCell::new(None),
             tearing: Cell::new(false),
             tearing_control: Cell::new(false),
+            children: RefCell::new(None),
             mapped: Cell::new(false),
             destroyed: Cell::new(false),
+            content_gen: Cell::new(0),
+            shm_shadow: RefCell::new(None),
         })
     }
 
@@ -347,6 +347,7 @@ impl wl_surface::Handler for WlSurface {
             );
             return Ok(());
         }
+        self.destroyed.set(true);
         // orphan children: role sticks, tree link dies
         let children = self.children.borrow_mut().take();
         if let Some(ch) = children {
@@ -361,7 +362,29 @@ impl wl_surface::Handler for WlSurface {
         self.pending.borrow_mut().frame_callbacks.clear();
         self.client.objects.forget_surface(self.id);
         self.client.remove_obj(self.id)?;
-        self.destroyed.set(true);
+        // the id is free for reuse once the client sees delete_id, but the
+        // wm side (xwayland especially) unlinks its window later on its own
+        // socket; the surface must stop being hittable and holding foci NOW
+        // or the next enter names a recycled id and kills the connection
+        if self.mapped.replace(false) {
+            let state = &self.client.state;
+            state.damage.trigger();
+            let seat = state.seat.borrow().clone();
+            if let Some(seat) = seat {
+                let focused = seat
+                    .kb_focus
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|f| std::ptr::eq(f.as_ref(), self));
+                if focused {
+                    crate::input::focus::set_keyboard_focus(state, &seat, None);
+                }
+                let role = self.role.get();
+                if role != SurfaceRole::Cursor && role != SurfaceRole::DndIcon {
+                    seat.repick(state);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -790,6 +813,19 @@ mod tests {
         assert!(!s.mapped.get());
         assert_eq!(s.size.get(), (0, 0));
         assert_eq!(s.buf_x.get(), 0);
+    }
+
+    #[test]
+    fn destroy_unmaps_immediately() {
+        // the wm side unlinks its window later on its own socket; a
+        // destroyed surface must already be unhittable by then
+        let (_st, client, s) = setup();
+        let buf = test_buffer(&client, ObjectId(20), 8, 8);
+        attach_commit(&s, buf.id);
+        assert!(s.mapped.get());
+        s.destroy(wl_surface::destroy::Request {}).unwrap();
+        assert!(s.destroyed.get());
+        assert!(!s.mapped.get());
     }
 
     #[test]
