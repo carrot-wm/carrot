@@ -1305,6 +1305,10 @@ pub fn popup_closed(state: &Rc<State>, popup: &Rc<XdgPopup>) {
     };
     let target = target.filter(|s| !s.destroyed.get());
     crate::input::focus::set_keyboard_focus(state, &seat, target);
+    // an exclusive layer lock that yielded to the grab re-asserts
+    if seat.popup_grab.borrow().is_empty() {
+        crate::shell::layer::apply_kb_lock(state);
+    }
     // the pointer may have been parked on the popup that just left
     seat.repick(state);
 }

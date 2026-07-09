@@ -175,6 +175,11 @@ impl Drop for ClientHolder {
         if let Some(seat) = self.data.state.seat.borrow().clone() {
             seat.drop_client(self.data.id);
         }
+        // ditto for layer surfaces: their exclusive zones must be handed
+        // back even though the client never said destroy
+        crate::shell::layer::drop_client(&self.data.state, self.data.id);
+        crate::protocol::foreign_toplevel::drop_client(&self.data.state, self.data.id);
+        self.data.state.idle.drop_client(self.data.id);
         self.data.flush_request.clear();
         self.data.shutdown.clear();
     }

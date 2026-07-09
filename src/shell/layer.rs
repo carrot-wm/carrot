@@ -7,7 +7,7 @@
 // background, mapping order within a layer), so two bars on one edge
 // stack instead of overlapping; what's left over is the tiling area.
 
-use crate::client::{Client, ClientError, Object};
+use crate::client::{Client, ClientError, ClientId, Object};
 use crate::protocol::globals::Global;
 use crate::protocol::interfaces::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use crate::protocol::wire::MsgReader;
@@ -597,6 +597,22 @@ impl SurfaceExt for LayerExt {
             state.layers.borrow_mut().push(ls.clone());
             arrange(&state);
             apply_kb_lock(&state);
+            // on_demand top/overlay grabs the keyboard the moment it maps
+            // (launcher pattern); exclusive locks still win
+            if ls.current.get().ki == KI_ON_DEMAND
+                && ls.current.get().layer >= TOP
+                && kb_lock(&state).is_none()
+            {
+                if let Some(seat) = state.seat.borrow().clone() {
+                    if seat.popup_grab.borrow().is_empty() {
+                        crate::input::focus::set_keyboard_focus(
+                            &state,
+                            &seat,
+                            Some(ls.surface.clone()),
+                        );
+                    }
+                }
+            }
             // the enter event tells the client which output shows it (scale, geometry)
             crate::tree::send_surface_output(&state, &ls.surface, ls.output.get(), true);
             state.damage.trigger();
@@ -790,19 +806,53 @@ pub fn kb_lock(state: &Rc<State>) -> Option<Rc<LayerSurface>> {
     lock
 }
 
+/// a dead client never sends destroy: sweep its layer surfaces out and
+/// give any exclusive-zone space back to the tiling area
+pub fn drop_client(state: &Rc<State>, id: ClientId) {
+    let removed = {
+        let mut layers = state.layers.borrow_mut();
+        let before = layers.len();
+        layers.retain(|l| l.client.id != id);
+        before != layers.len()
+    };
+    if removed {
+        arrange(state);
+        apply_kb_lock(state);
+        state.damage.trigger();
+    }
+}
+
 // route the keyboard to the lock holder, or release it when the lock died
 pub fn apply_kb_lock(state: &Rc<State>) {
     let Some(seat) = state.seat.borrow().clone() else {
         return;
     };
+    // an active popup grab owns the keyboard; the lock re-asserts when
+    // the chain empties (popup_closed calls back in)
+    if !seat.popup_grab.borrow().is_empty() {
+        return;
+    }
     match kb_lock(state) {
         Some(ls) => {
             crate::input::focus::set_keyboard_focus(state, &seat, Some(ls.surface.clone()));
         }
         None => {
             let focused = seat.kb_focus.borrow().clone();
-            let on_layer = focused
-                .is_some_and(|s| s.role.get() == SurfaceRole::LayerSurface && !s.mapped.get());
+            // release when the holder unmapped, was closed, or dropped
+            // interactivity to none; a mapped on_demand holder keeps the
+            // keyboard
+            let on_layer = focused.is_some_and(|s| {
+                if s.role.get() != SurfaceRole::LayerSurface {
+                    return false;
+                }
+                if !s.mapped.get() {
+                    return true;
+                }
+                s.ext
+                    .borrow()
+                    .layer_surface()
+                    .is_some_and(|l| l.closed.get() || l.current.get().ki == KI_NONE)
+            });
             if on_layer {
                 let ws = crate::tree::active(state);
                 let (cx, cy) = crate::tree::cursor_pos(state);
@@ -984,6 +1034,20 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_client_hands_its_exclusive_zone_back() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (s1, l1) = mk_layer(&client, 10, 20, TOP);
+        map_bar(&state, &client, &s1, &l1, 30, 30, 40);
+        assert_eq!(state.usable.get(), Rect { x1: 0, y1: 30, x2: 800, y2: 600 });
+        // the client is killed: no destroy requests, just teardown
+        client.objects.destroy();
+        drop_client(&state, client.id);
+        assert!(state.layers.borrow().is_empty());
+        assert_eq!(state.usable.get(), Rect { x1: 0, y1: 0, x2: 800, y2: 600 });
+    }
+
+    #[test]
     fn identical_configures_are_deduped() {
         let (state, client) = test_client();
         state.output_size.set((800, 600));
@@ -996,6 +1060,33 @@ mod tests {
         crate::shell::xdg::flush_configures(&state);
         assert_eq!(count_events(&client.queued_out_bytes(), ls.id, 0), 1);
         assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0);
+    }
+
+    #[test]
+    fn on_demand_focuses_on_map_and_releases_on_downgrade() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let (s, ls) = mk_layer(&client, 10, 20, TOP);
+        ls.set_keyboard_interactivity(
+            zwlr_layer_surface_v1::set_keyboard_interactivity::Request {
+                keyboard_interactivity: KI_ON_DEMAND,
+            },
+        )
+        .unwrap();
+        map_bar(&state, &client, &s, &ls, 30, 30, 40);
+        // the launcher pattern: typable the moment it maps
+        assert!(seat.kb_focus.borrow().as_ref().is_some_and(|f| Rc::ptr_eq(f, &s)));
+        // dropping interactivity to none hands the keyboard back
+        ls.set_keyboard_interactivity(
+            zwlr_layer_surface_v1::set_keyboard_interactivity::Request {
+                keyboard_interactivity: KI_NONE,
+            },
+        )
+        .unwrap();
+        commit(&s);
+        assert!(!seat.kb_focus.borrow().as_ref().is_some_and(|f| Rc::ptr_eq(f, &s)));
     }
 
     #[test]
@@ -1056,6 +1147,24 @@ mod tests {
         // the client answers closed with destroy
         ls.destroy(zwlr_layer_surface_v1::destroy::Request {}).unwrap();
         assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0);
+    }
+
+    #[test]
+    fn output_loss_releases_an_exclusive_keyboard_lock() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let (s, ls) = mk_layer(&client, 10, 20, OVERLAY);
+        ls.set_keyboard_interactivity(zwlr_layer_surface_v1::set_keyboard_interactivity::Request {
+            keyboard_interactivity: KI_EXCLUSIVE,
+        })
+        .unwrap();
+        map_bar(&state, &client, &s, &ls, 40, 0, 40);
+        assert!(seat.kb_focus.borrow().as_ref().is_some_and(|f| Rc::ptr_eq(f, &s)));
+        ls.close_for_output_loss(&state, None);
+        assert!(kb_lock(&state).is_none());
+        assert!(!seat.kb_focus.borrow().as_ref().is_some_and(|f| Rc::ptr_eq(f, &s)));
     }
 
     #[test]
