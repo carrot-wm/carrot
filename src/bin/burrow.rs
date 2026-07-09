@@ -34,11 +34,101 @@ fn socket_path() -> Option<std::path::PathBuf> {
 }
 
 fn usage() -> ! {
+    eprintln!(
+        "usage: burrow [--json] <command>\n\
+         actions:  workspace N|+-N | send-to-workspace N | toggle-fullscreen |\n\
+                   toggle-floating | close-window | focus-next | focus-prev |\n\
+                   focus-left|right|up|down | swap-left|right|up|down |\n\
+                   split-ratio +-D | spawn CMD.. | quit\n\
+         queries:  monitors | workspaces | windows | clients\n\
+         control:  reload | subscribe"
+    );
     std::process::exit(2)
+}
+
+// -- expanded output --
+
+fn plain(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn block(cmd: &str, it: &serde_json::Value) {
+    let mut skip: Vec<&str> = Vec::new();
+    if cmd == "workspaces" {
+        let active = if it["active"].as_bool().unwrap_or(false) { " (active)" } else { "" };
+        println!("Workspace {}{active}:", plain(&it["index"]));
+        skip.extend(["index", "active"]);
+    } else {
+        match it.get("id") {
+            Some(id) => println!(
+                "Window {} ({}): {}",
+                plain(id),
+                plain(&it["app-id"]),
+                plain(&it["title"])
+            ),
+            None => println!("Window ({}): {}", plain(&it["app-id"]), plain(&it["title"])),
+        }
+        skip.extend(["id", "app-id", "title"]);
+    }
+    // geometry reads as a pair, not four scalars
+    if let (Some(x), Some(y), Some(w), Some(h)) =
+        (it.get("x"), it.get("y"), it.get("w"), it.get("h"))
+    {
+        println!("    at: {},{}", plain(x), plain(y));
+        println!("    size: {},{}", plain(w), plain(h));
+        skip.extend(["x", "y", "w", "h"]);
+    }
+    if let Some(map) = it.as_object() {
+        for (k, v) in map {
+            if !skip.contains(&k.as_str()) {
+                println!("    {k}: {}", plain(v));
+            }
+        }
+    }
+}
+
+fn render(cmd: &str, line: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        println!("{line}");
+        return;
+    };
+    if let Some(e) = v.get("error") {
+        eprintln!("burrow: {}", plain(e));
+        std::process::exit(1);
+    }
+    let Some(ok) = v.get("ok") else {
+        println!("{line}");
+        return;
+    };
+    match ok {
+        serde_json::Value::Array(items) => {
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                block(cmd, it);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                println!("{k}: {}", plain(v));
+            }
+        }
+        serde_json::Value::Bool(true) => println!("ok"),
+        other => println!("{}", plain(other)),
+    }
 }
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let raw = args.first().is_some_and(|a| a == "--json" || a == "-j");
+    if raw {
+        args.remove(0);
+    }
     if args.is_empty() {
         usage();
     }
@@ -100,7 +190,11 @@ fn main() {
     let streaming = args[0] == "subscribe";
     for line in reader.lines() {
         let Ok(l) = line else { break };
+        if streaming || raw {
             println!("{l}");
+        } else {
+            render(&args[0], &l);
+        }
         if !streaming {
             break;
         }
