@@ -40,12 +40,52 @@ impl IdleState {
         self.inhibitors.borrow_mut().clear();
     }
 
-    fn inhibited(&self) -> bool {
+    fn inhibited(&self, state: &Rc<State>) -> bool {
         self.inhibitors
             .borrow()
             .iter()
-            .any(|i| i.surface.upgrade().is_some_and(|s| s.mapped.get()))
+            .any(|i| i.surface.upgrade().is_some_and(|s| visible(state, &s)))
     }
+}
+
+/// an inhibitor is only in effect while its surface is visible, not merely
+/// mapped: a player parked on another workspace must not hold the screen
+/// awake. visible = the root is a mapped layer surface, or its window sits
+/// on a workspace that is on glass and is not buried under a fullscreen
+fn visible(state: &Rc<State>, s: &Rc<WlSurface>) -> bool {
+    if !s.mapped.get() {
+        return false;
+    }
+    let root = s.get_root();
+    if root.role.get() == crate::surface::SurfaceRole::LayerSurface {
+        return true;
+    }
+    let float_above = state.config.borrow().float_above_fullscreen;
+    for ws in crate::tree::visible_workspaces(state) {
+        if ws
+            .fullscreen
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| Rc::ptr_eq(&w.surface(), &root))
+        {
+            return true;
+        }
+        let covered = ws.fullscreen.borrow().is_some();
+        if ws.floats.borrow().iter().any(|w| Rc::ptr_eq(&w.surface(), &root)) {
+            if !covered || float_above {
+                return true;
+            }
+            continue;
+        }
+        if !covered {
+            let mut tiled = false;
+            ws.tiling.for_each(|w| tiled |= Rc::ptr_eq(&w.surface(), &root));
+            if tiled {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// every input event lands here; must stay cheap
@@ -68,7 +108,7 @@ pub fn note_activity(state: &Rc<State>) {
 /// deadline sweep
 pub fn tick(state: &Rc<State>) {
     let idle = &state.idle;
-    if idle.inhibited() {
+    if idle.inhibited(state) {
         // a visible inhibitor counts as continuous activity
         idle.last_activity.set(crate::util::Time::now().nsec());
         return;
@@ -357,18 +397,14 @@ mod tests {
         assert_eq!(count_events(&client.queued_out_bytes(), n.id, 1), 1, "resumed");
     }
 
-    #[test]
-    fn a_mapped_inhibitor_blocks_idling() {
-        use crate::protocol::interfaces::wl_surface;
-        use crate::protocol::shm::test_buffer;
-        use wl_surface::Handler as _;
-        let (state, client) = test_client();
-        let s = WlSurface::new(ObjectId(10), &client, 6);
-        client.add_client_obj(s.clone()).unwrap();
-        client.objects.track_surface(s.clone());
-        let b = test_buffer(&client, ObjectId(20), 8, 8);
-        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 }).unwrap();
-        s.commit(wl_surface::commit::Request {}).unwrap();
+    fn inhibited_toplevel(
+        state: &Rc<crate::state::State>,
+        client: &Rc<Client>,
+    ) -> (Rc<WlSurface>, Rc<IdleNotification>) {
+        state.output_size.set((800, 600));
+        let base = crate::shell::xdg::tests::mk_base(client, 30);
+        let (s, x, _t) = crate::shell::xdg::tests::mk_toplevel(client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map(state, client, &s, &x, 20);
         let i = Rc::new(IdleInhibitor {
             id: ObjectId(71),
             client: client.clone(),
@@ -384,6 +420,15 @@ mod tests {
         });
         client.add_client_obj(n.clone()).unwrap();
         state.idle.notifications.borrow_mut().push(n.clone());
+        (s, n)
+    }
+
+    #[test]
+    fn a_mapped_inhibitor_blocks_idling() {
+        use crate::protocol::interfaces::wl_surface;
+        use wl_surface::Handler as _;
+        let (state, client) = test_client();
+        let (s, n) = inhibited_toplevel(&state, &client);
         tick(&state);
         assert!(!n.idled.get(), "visible inhibitor holds the screen awake");
         // unmap the surface: inhibition lapses
@@ -392,5 +437,20 @@ mod tests {
         state.idle.last_activity.set(0);
         tick(&state);
         assert!(n.idled.get());
+    }
+
+    #[test]
+    fn an_inhibitor_stops_holding_when_its_workspace_leaves_the_glass() {
+        let (state, client) = test_client();
+        let (_s, n) = inhibited_toplevel(&state, &client);
+        state.idle.last_activity.set(0);
+        tick(&state);
+        assert!(!n.idled.get(), "on glass, the inhibitor holds");
+        // the window's workspace is no longer shown; per spec the mapped
+        // but invisible surface stops inhibiting
+        crate::tree::switch_workspace(&state, 1);
+        state.idle.last_activity.set(0);
+        tick(&state);
+        assert!(n.idled.get(), "hidden window must not hold the screen awake");
     }
 }
