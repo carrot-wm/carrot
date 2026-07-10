@@ -1,2 +1,4 @@
 /target
 .direnv/
+tools/gen-keymap/target/
+tools/gen-xwire/target/
