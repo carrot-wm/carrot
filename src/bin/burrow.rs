@@ -9,6 +9,9 @@
 // expanded key: value blocks; --json keeps the wire form, and subscribe
 // always streams raw ndjson for scripts.
 
+// eyra hookup, same as the main binary - origin startup + c-gull libc
+extern crate eyra;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 

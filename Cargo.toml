@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ash = "0.38"
+# origin startup + c-gull libc linked in: zero linked C. experimental-relocate
+# self-relocates the static-PIE, so no ld.so while .dynsym survives for
+# --export-dynamic (a dlopened lib's libc imports resolve against us).
+eyra = { version = "0.22", features = ["experimental-relocate"] }
+
+# no default features: no `loaded`/libloading (pulls dl* nothing defines);
+# the entry comes from the icd via dlopen-rs + Entry::from_static_fn
+ash = { version = "0.38", default-features = false }
 rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "pipe", "time", "process"] }
 kbvm = "0.1.6"
 
@@ -27,5 +34,18 @@ trace = []
 [profile.dev]
 panic = "abort"
 
+# origin self-relocates the static-PIE before relocations exist; any call left
+# un-inlined in that window goes through a still-zero GOT slot and _start
+# faults on entry. o3 flattens the window like the release build.
+[profile.dev.package.origin]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
 [profile.release]
 panic = "abort"
+
+# eyra's libc routed to taproot - the same libc the dlopened mesa closure gets
+[patch.crates-io]
+c-scape = { path = "../taproot/c-scape" }
+c-gull = { path = "../taproot/c-gull" }

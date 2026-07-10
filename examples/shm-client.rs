@@ -2,6 +2,9 @@
 // size, then it holds the connection open and acks further configures.
 // run: WAYLAND_DISPLAY=wayland-2 cargo run --example shm-client
 
+// eyra hookup, see main.rs
+extern crate eyra;
+
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use rustix::net::{
     AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix,

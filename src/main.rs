@@ -1,5 +1,8 @@
 // module layout carved up front; empty mods are intentional.
 
+// links origin (startup) + c-gull (libc) so std runs with zero linked C
+extern crate eyra;
+
 // core runtime
 mod cpu_worker;
 mod engine;

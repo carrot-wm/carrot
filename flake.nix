@@ -6,6 +6,11 @@
 
     crane.url = "github:ipetkov/crane";
 
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -29,10 +34,28 @@
           pkgs,
           lib,
           self',
+          inputs',
           ...
         }:
         let
           craneLib = crane.mkLib pkgs;
+
+          # nightly is mandatory: -Z build-std + eyra. rust-src for build-std.
+          # pinned to taproot's rust-toolchain.toml so carrot and its libc
+          # build on the same compiler.
+          toolchain =
+            (inputs'.fenix.packages.toolchainOf {
+              channel = "nightly";
+              date = "2026-06-11";
+              sha256 = "sha256-L59udwZx36niu4S6j9huMpLBWL4m/Flt61nbXfXk/wk=";
+            }).withComponents
+              [
+                "cargo"
+                "rustc"
+                "rust-src"
+                "clippy"
+                "rustfmt"
+              ];
 
           # Only include source files that are actually relevant to the build
           src = lib.cleanSourceWith {
@@ -89,12 +112,10 @@
           };
 
           devShells.default = pkgs.mkShell {
-            inputsFrom = [ carrot ];
-
             packages = with pkgs; [
-              clippy
+              toolchain
               rust-analyzer
-              rustfmt
+              binutils # readelf / nm for the zero-C gate
 
               # Vulkan debugging
               vulkan-tools          # vulkaninfo

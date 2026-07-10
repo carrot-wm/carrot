@@ -1,0 +1,22 @@
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[unstable]
+# "test" from source too: the precompiled sysroot libtest carries its own core
+# (E0152 duplicate lang items); panic-abort-tests keeps the whole graph on the
+# abort runtime - no unwinder, matching the project-wide panic = "abort"
+build-std = ["std", "panic_abort", "test"]
+panic-abort-tests = true
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # fully static, but keep PIE: eyra's experimental-relocate self-relocates,
+    # so no PT_INTERP while .dynsym survives for --export-dynamic.
+    "-C", "target-feature=+crt-static",
+    # export c-gull into .dynsym so a dlopened lib's libc resolves against us
+    "-C", "link-arg=-Wl,--export-dynamic",
+    # first definition wins, and rustc orders dependents before dependencies:
+    # c-scape's full getauxval shadows origin's few-types shim, and dlopen-rs's
+    # real dl* shadow c-scape's stubs. adds no C - link behaviour only.
+    "-C", "link-arg=-Wl,--allow-multiple-definition",
+]
