@@ -86,6 +86,8 @@ pub enum Arg<'a> {
     U32(u32),
     Str(&'a str),
     Bool(bool),
+    StrDict(&'a [(&'a str, &'a str)]),
+    StrArray(&'a [&'a str]),
 }
 
 struct PendingReply {
@@ -131,10 +133,37 @@ fn system_bus_path() -> Result<String, DbusError> {
     }
 }
 
+fn session_bus_path() -> Result<String, DbusError> {
+    if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        let first = addr.split(';').next().unwrap_or("");
+        if let Some(rest) = first.strip_prefix("unix:path=") {
+            return Ok(rest.split(',').next().unwrap_or(rest).to_string());
+        }
+        return Err(DbusError::Env(
+            "DBUS_SESSION_BUS_ADDRESS is not a unix:path= address",
+        ));
+    }
+    match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(rt) => Ok(format!("{rt}/bus")),
+        Err(_) => Err(DbusError::Env("no DBUS_SESSION_BUS_ADDRESS or XDG_RUNTIME_DIR")),
+    }
+}
+
 impl DbusConn {
     pub async fn connect(eng: &Rc<Engine>, ring: &Rc<Ring>) -> Result<Rc<DbusConn>, DbusError> {
+        Self::connect_path(eng, ring, system_bus_path()?).await
+    }
+
+    pub async fn connect_session(eng: &Rc<Engine>, ring: &Rc<Ring>) -> Result<Rc<DbusConn>, DbusError> {
+        Self::connect_path(eng, ring, session_bus_path()?).await
+    }
+
+    async fn connect_path(
+        eng: &Rc<Engine>,
+        ring: &Rc<Ring>,
+        path: String,
+    ) -> Result<Rc<DbusConn>, DbusError> {
         use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, socket_with};
-        let path = system_bus_path()?;
         let fd = socket_with(
             AddressFamily::UNIX,
             SocketType::STREAM,
@@ -220,6 +249,8 @@ impl DbusConn {
                 Arg::U32(v) => b.put_u32(*v),
                 Arg::Str(v) => b.put_str(v),
                 Arg::Bool(v) => b.put_bool(*v),
+                Arg::StrDict(v) => b.put_str_dict(v),
+                Arg::StrArray(v) => b.put_str_array(v),
             }
         }
         b.finish()
@@ -455,6 +486,78 @@ impl DbusConn {
         self.signal_handlers.borrow_mut().clear();
         self.fail_all(DbusError::Closed);
     }
+}
+
+/// hand the session's addresses to bus activation and the systemd user
+/// manager: portals (xdg-desktop-portal and its backends) are bus-activated
+/// and cannot reach the compositor without WAYLAND_DISPLAY in their env
+pub async fn export_session_env(
+    eng: Rc<Engine>,
+    ring: Rc<Ring>,
+    state: Rc<crate::state::State>,
+) {
+    // xwayland picks its display number early in its own task; give it a
+    // moment so DISPLAY rides along, then export without it
+    for _ in 0..20 {
+        if state.xwayland.borrow().is_some() {
+            break;
+        }
+        let deadline = crate::util::Time::from_nsec(crate::util::Time::now().nsec() + 100_000_000);
+        if ring.timeout(deadline).await.is_err() {
+            return;
+        }
+    }
+    let conn = match DbusConn::connect_session(&eng, &ring).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("carrot: dbus: no session bus, portals will not find us: {e}");
+            return;
+        }
+    };
+    let wd = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let desk = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "carrot".into());
+    let xdisp = state
+        .xwayland
+        .borrow()
+        .as_ref()
+        .map(|x| format!(":{}", x.display));
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("WAYLAND_DISPLAY", wd.as_str()),
+        ("XDG_CURRENT_DESKTOP", desk.as_str()),
+    ];
+    if let Some(d) = &xdisp {
+        pairs.push(("DISPLAY", d.as_str()));
+    }
+    let r1 = conn
+        .call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "UpdateActivationEnvironment",
+            "a{ss}",
+            &[Arg::StrDict(&pairs)],
+        )
+        .await;
+    let assigns: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let refs: Vec<&str> = assigns.iter().map(|s| s.as_str()).collect();
+    let r2 = conn
+        .call(
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "SetEnvironment",
+            "as",
+            &[Arg::StrArray(&refs)],
+        )
+        .await;
+    match (&r1, &r2) {
+        (Ok(_), Ok(_)) => eprintln!("carrot: dbus: session env exported (activation + systemd)"),
+        (Ok(_), Err(_)) => {
+            eprintln!("carrot: dbus: session env exported (activation only, no systemd user manager)")
+        }
+        (Err(e), _) => eprintln!("carrot: dbus: session env export failed: {e}"),
+    }
+    conn.clear();
 }
 
 pub fn probe() -> i32 {

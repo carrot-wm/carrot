@@ -110,6 +110,36 @@ impl MsgBuilder {
         self.buf.push(0);
     }
 
+    /// a{ss}: byte length, pad to the 8-aligned first entry, (str, str) pairs.
+    /// the length counts from after that first pad, per the wire format
+    pub fn put_str_dict(&mut self, entries: &[(&str, &str)]) {
+        self.pad(4);
+        let len_at = self.buf.len();
+        self.buf.extend_from_slice(&0u32.to_le_bytes());
+        self.pad(8);
+        let start = self.buf.len();
+        for (k, v) in entries {
+            self.pad(8);
+            self.put_str(k);
+            self.put_str(v);
+        }
+        let len = (self.buf.len() - start) as u32;
+        self.buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
+    }
+
+    /// as: byte length, then packed strings
+    pub fn put_str_array(&mut self, items: &[&str]) {
+        self.pad(4);
+        let len_at = self.buf.len();
+        self.buf.extend_from_slice(&0u32.to_le_bytes());
+        let start = self.buf.len();
+        for s in items {
+            self.put_str(s);
+        }
+        let len = (self.buf.len() - start) as u32;
+        self.buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
+    }
+
     fn put_sig(&mut self, v: &str) {
         self.buf.push(v.len() as u8);
         self.buf.extend_from_slice(v.as_bytes());

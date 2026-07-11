@@ -296,6 +296,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         xwayland::run(st).await;
     });
     let st = state.clone();
+    let _portal_env = engine.spawn(
+        "portal env",
+        dbus::export_session_env(engine.clone(), ring.clone(), st),
+    );
+    let st = state.clone();
     let police = engine.spawn("slow clients", async move {
         loop {
             let c = st.slow_clients.pop().await;
