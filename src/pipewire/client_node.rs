@@ -236,8 +236,13 @@ impl SourceNode {
         self.con.send(self.proxy_id, CN_UPDATE, &b.buf).await
     }
 
-    /// one output port: a single fixed memfd format, header meta, buffers
     async fn send_port_update(&self) -> Result<(), PwError> {
+        let body = self.port_update_body();
+        self.con.send(self.proxy_id, CN_PORT_UPDATE, &body).await
+    }
+
+    /// one output port: a single fixed memfd format, header meta, buffers
+    fn port_update_body(&self) -> Vec<u8> {
         let (w, h, fps) = (self.width, self.height, self.fps);
         let mut b = PodBuilder::default();
         b.struct_(|b| {
@@ -280,7 +285,7 @@ impl SourceNode {
                 b.uint(PARAM_INFO_READ);
             });
         });
-        self.con.send(self.proxy_id, CN_PORT_UPDATE, &b.buf).await
+        b.buf
     }
 
     async fn set_active(&self, active: bool) -> Result<(), PwError> {
@@ -481,6 +486,21 @@ impl SourceNode {
 
     pub fn ready(&self) -> bool {
         self.io.is_some() && !self.buffers.is_empty() && self.format_set
+    }
+
+    /// re-advertise the port at a new size: stale buffers drop and the
+    /// daemon renegotiates format and buffers. the node borrow releases
+    /// before the await, so the pump stays free to handle events
+    pub async fn resize(node: &Rc<std::cell::RefCell<SourceNode>>, w: u32, h: u32) -> Result<(), PwError> {
+        let (con, proxy_id, body) = {
+            let mut n = node.borrow_mut();
+            n.width = w;
+            n.height = h;
+            n.format_set = false;
+            n.buffers.clear();
+            (n.con.clone(), n.proxy_id, n.port_update_body())
+        };
+        con.send(proxy_id, CN_PORT_UPDATE, &body).await
     }
 
     /// hand the next buffer to the graph: `fill` paints the pixels, then

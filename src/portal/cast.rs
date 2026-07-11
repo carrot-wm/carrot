@@ -1,17 +1,38 @@
 // a portal screencast: one pipewire client-node per session, fed from the
-// present tail. frames re-compose via screencopy, so a cast keeps working
-// even where the live path scans out on a hardware plane.
+// present tail. frames re-compose via screencopy/window_capture, so a cast
+// keeps working even where the live path scans out on a hardware plane.
+// size changes (window resizes, mode changes) renegotiate the stream.
 
 use crate::engine::SpawnedFuture;
 use crate::pipewire::client_node::SourceNode;
 use crate::pipewire::{PwConn, PwError};
 use crate::state::State;
-use crate::util::Time;
+use crate::tree::{Window, workspace::Workspace};
+use crate::util::{AsyncQueue, Time};
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 const PROXY_ID: u32 = 2;
 const COOKIE: i32 = 0x0ca5;
+
+/// what a session's token restores; windows match by ident in-session and
+/// by app id + title across restarts (idents reset with the compositor)
+#[derive(Clone)]
+pub enum RestoreData {
+    Output(String),
+    Window { ident: u64, app_id: String, title: String },
+}
+
+pub enum Pick {
+    Monitor,
+    Window,
+    Restored(RestoreData),
+}
+
+enum Source {
+    Output(String),
+    Window { win: Weak<Window>, ident: u64, app_id: String, title: String },
+}
 
 pub struct Cast {
     /// the portal session handle path; Session.Close tears us down by it
@@ -21,23 +42,31 @@ pub struct Cast {
     pub width: u32,
     pub height: u32,
     pub pos: (i32, i32),
-    output_name: String,
+    source: Source,
     /// paint the pointer into the frames (portal cursor mode EMBEDDED)
     cursor: bool,
     node: Rc<RefCell<SourceNode>>,
     /// presents can outpace the negotiated rate; feed() gates on this
     frame_ns: u64,
     last: Cell<u64>,
+    /// the size the resizer was last asked for; feed() pushes once per change
+    resize_target: Cell<(u32, u32)>,
+    resize_req: Rc<AsyncQueue<(u32, u32)>>,
     /// the pump lost the daemon; the present tail sweeps us out
     dead: Rc<Cell<bool>>,
     _pump: SpawnedFuture<()>,
+    _resizer: SpawnedFuture<()>,
 }
 
 /// connect, create the node, wait for the daemon to bind it, register with
 /// the state. the returned cast is already live at the present tail.
-pub async fn start(state: &Rc<State>, session: String, cursor: bool) -> Result<Rc<Cast>, PwError> {
-    let (output_name, width, height, fps, pos) =
-        pick_output(state).ok_or(PwError::Env("no output to cast"))?;
+pub async fn start(
+    state: &Rc<State>,
+    session: String,
+    cursor: bool,
+    pick: Pick,
+) -> Result<Rc<Cast>, PwError> {
+    let (source, width, height, fps, pos) = resolve(state, pick)?;
     let con = Rc::new(PwConn::connect(&state.ring)?);
     con.hello().await?;
     let node = Rc::new(RefCell::new(
@@ -61,37 +90,142 @@ pub async fn start(state: &Rc<State>, session: String, cursor: bool) -> Result<R
             dead.set(true);
         }
     });
+    let resize_req: Rc<AsyncQueue<(u32, u32)>> = Rc::new(AsyncQueue::default());
+    let resizer = state.eng.spawn("cast resize", {
+        let node = node.clone();
+        let q = resize_req.clone();
+        async move {
+            loop {
+                let (w, h) = q.pop().await;
+                let _ = SourceNode::resize(&node, w, h).await;
+            }
+        }
+    });
     let cast = Rc::new(Cast {
         session,
         node_id,
         width,
         height,
         pos,
-        output_name,
+        source,
         cursor,
         node,
         frame_ns: 1_000_000_000 / fps as u64,
         last: Cell::new(0),
+        resize_target: Cell::new((width, height)),
+        resize_req,
         dead,
         _pump: pump,
+        _resizer: resizer,
     });
     state.casts.borrow_mut().push(cast.clone());
     Ok(cast)
 }
 
-fn pick_output(state: &Rc<State>) -> Option<(String, u32, u32, u32, (i32, i32))> {
+fn resolve(state: &Rc<State>, pick: Pick) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
+    match pick {
+        Pick::Monitor => output_source(state, None),
+        Pick::Restored(RestoreData::Output(name)) => output_source(state, Some(&name)),
+        Pick::Window => {
+            let win = crate::tree::focused_window(state)
+                .ok_or(PwError::Env("no focused window to cast"))?;
+            window_source(state, win)
+        }
+        Pick::Restored(RestoreData::Window { ident, app_id, title }) => {
+            // a stale token falls back to the focused window rather than
+            // failing the whole cast; the picker will own this choice
+            let win = find_window(state, ident, &app_id, &title)
+                .or_else(|| crate::tree::focused_window(state))
+                .ok_or(PwError::Env("no window to cast"))?;
+            window_source(state, win)
+        }
+    }
+}
+
+fn output_source(
+    state: &Rc<State>,
+    name: Option<&str>,
+) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
     let d = state.display.borrow();
-    let outs = d.as_ref()?.outputs.borrow();
-    let out = outs.get(state.focused_output.get()).or_else(|| outs.first())?;
-    let fps = out
-        .conn
+    let outs = d
+        .as_ref()
+        .map(|d| d.outputs.borrow().clone())
+        .unwrap_or_default();
+    let out = name
+        .and_then(|n| outs.iter().find(|o| o.conn.name == n))
+        .or_else(|| outs.get(state.focused_output.get()))
+        .or_else(|| outs.first())
+        .ok_or(PwError::Env("no output to cast"))?;
+    Ok((
+        Source::Output(out.conn.name.clone()),
+        out.width,
+        out.height,
+        refresh(out),
+        out.pos.get(),
+    ))
+}
+
+fn window_source(
+    state: &Rc<State>,
+    win: Rc<Window>,
+) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
+    let rect = win.draw_rect(state);
+    if rect.is_empty() {
+        return Err(PwError::Env("the window has no size yet"));
+    }
+    let fps = crate::tree::workspace_of(state, &win)
+        .and_then(|ws| {
+            let d = state.display.borrow();
+            d.as_ref()?.outputs.borrow().get(ws.output.get()).map(refresh)
+        })
+        .unwrap_or(60);
+    let source = Source::Window {
+        win: Rc::downgrade(&win),
+        ident: win.ident,
+        app_id: win.app_id(),
+        title: win.title(),
+    };
+    Ok((source, rect.width() as u32, rect.height() as u32, fps, (rect.x1, rect.y1)))
+}
+
+fn refresh(out: &Rc<crate::output::Output>) -> u32 {
+    out.conn
         .pipe
         .borrow()
         .as_ref()
         .map(|p| p.mode.vrefresh)
         .unwrap_or(60)
-        .max(1);
-    Some((out.conn.name.clone(), out.width, out.height, fps, out.pos.get()))
+        .max(1)
+}
+
+fn find_window(state: &Rc<State>, ident: u64, app_id: &str, title: &str) -> Option<Rc<Window>> {
+    let mut by_ident = None;
+    let mut by_both = None;
+    let mut by_app = None;
+    for ws in state.workspaces.borrow().iter() {
+        ws.for_each(|w| {
+            if w.ident == ident {
+                by_ident = Some(w.clone());
+            }
+            if w.app_id() == app_id {
+                if w.title() == title && by_both.is_none() {
+                    by_both = Some(w.clone());
+                }
+                if by_app.is_none() {
+                    by_app = Some(w.clone());
+                }
+            }
+        });
+    }
+    by_ident.or(by_both).or(by_app)
+}
+
+/// the workspace the presented output currently shows
+fn shown_workspace(state: &Rc<State>, name: &str) -> Option<Rc<Workspace>> {
+    let d = state.display.borrow();
+    let outs = d.as_ref()?.outputs.borrow();
+    let out = outs.iter().find(|o| o.conn.name == name)?;
+    state.workspaces.borrow().get(out.ws.get()).cloned()
 }
 
 /// present tail: the frame just shown is what casts of this output stream
@@ -106,9 +240,7 @@ pub fn output_presented(state: &Rc<State>, name: &str) {
             sweep = true;
             continue;
         }
-        if c.output_name == name {
-            c.feed(state);
-        }
+        c.feed(state, name);
     }
     if sweep {
         state.casts.borrow_mut().retain(|c| !c.dead.get());
@@ -116,27 +248,86 @@ pub fn output_presented(state: &Rc<State>, name: &str) {
 }
 
 impl Cast {
-    fn feed(&self, state: &Rc<State>) {
-        if !self.node.borrow().ready() {
-            return;
+    /// what a fresh token for this cast should restore
+    pub fn restore_data(&self) -> RestoreData {
+        match &self.source {
+            Source::Output(n) => RestoreData::Output(n.clone()),
+            Source::Window { ident, app_id, title, .. } => RestoreData::Window {
+                ident: *ident,
+                app_id: app_id.clone(),
+                title: title.clone(),
+            },
+        }
+    }
+
+    fn feed(&self, state: &Rc<State>, presented: &str) {
+        enum Cap {
+            Out(usize),
+            Win(Rc<Window>),
+        }
+        let (cap, w, h) = match &self.source {
+            Source::Output(name) => {
+                if name != presented {
+                    return;
+                }
+                let Some((idx, w, h)) = crate::output::output_geometry(state, name) else {
+                    return;
+                };
+                (Cap::Out(idx), w, h)
+            }
+            Source::Window { win, .. } => {
+                let Some(win) = win.upgrade() else {
+                    self.dead.set(true);
+                    return;
+                };
+                if !win.surface().mapped.get() {
+                    return;
+                }
+                // foreground gate: stream only while the window's workspace
+                // is the one on glass on the presented output
+                let Some(ws) = crate::tree::workspace_of(state, &win) else {
+                    return;
+                };
+                let Some(shown) = shown_workspace(state, presented) else {
+                    return;
+                };
+                if !Rc::ptr_eq(&ws, &shown) {
+                    return;
+                }
+                let rect = win.draw_rect(state);
+                if rect.is_empty() {
+                    return;
+                }
+                (Cap::Win(win), rect.width() as u32, rect.height() as u32)
+            }
+        };
+        {
+            let n = self.node.borrow();
+            if w != n.width || h != n.height {
+                if self.resize_target.get() != (w, h) {
+                    self.resize_target.set((w, h));
+                    self.resize_req.push((w, h));
+                }
+                return;
+            }
+            if !n.ready() {
+                return;
+            }
         }
         let now = Time::now().nsec();
         if now.saturating_sub(self.last.get()) < self.frame_ns - self.frame_ns / 10 {
             return;
         }
-        let Some((idx, w, h)) = crate::output::output_geometry(state, &self.output_name) else {
-            return;
+        let px = match cap {
+            Cap::Out(idx) => {
+                let Some(region) = crate::rect::Rect::new_sized(0, 0, w as i32, h as i32) else {
+                    return;
+                };
+                crate::output::screencopy(state, idx, region, self.cursor)
+            }
+            Cap::Win(win) => crate::output::window_capture(state, &win),
         };
-        // a mode change under a live cast: hold off; renegotiation is later
-        if w != self.width || h != self.height {
-            return;
-        }
-        let Some(region) = crate::rect::Rect::new_sized(0, 0, w as i32, h as i32) else {
-            return;
-        };
-        let Some(px) = crate::output::screencopy(state, idx, region, self.cursor) else {
-            return;
-        };
+        let Some(px) = px else { return };
         self.node.borrow_mut().produce(|dst, _| {
             let n = px.len().min(dst.len());
             dst[..n].copy_from_slice(&px[..n]);

@@ -289,6 +289,12 @@ pub fn parse(msg: &[u8]) -> Result<Header, DbusError> {
     Ok(h)
 }
 
+#[derive(Debug, PartialEq)]
+pub enum SvVal {
+    U(u32),
+    S(String),
+}
+
 pub struct Rd<'a> {
     pub buf: &'a [u8],
     pub pos: usize,
@@ -359,8 +365,8 @@ impl<'a> Rd<'a> {
             .ok_or(DbusError::Malformed("fd index out of range"))
     }
 
-    /// the u32-valued entries of an a{sv}; everything else is skipped
-    pub fn u32_dict(&mut self) -> Result<Vec<(String, u32)>, DbusError> {
+    /// the u32- and string-valued entries of an a{sv}; the rest is skipped
+    pub fn sv_dict(&mut self) -> Result<Vec<(String, SvVal)>, DbusError> {
         let len = self.u32()? as usize;
         self.align(8)?;
         let end = self.pos + len;
@@ -372,13 +378,25 @@ impl<'a> Rd<'a> {
             self.align(8)?;
             let key = self.str()?;
             let sig = self.sig()?;
-            if sig == "u" {
-                out.push((key, self.u32()?));
-            } else {
-                self.skip_value(&sig)?;
+            match sig.as_str() {
+                "u" => out.push((key, SvVal::U(self.u32()?))),
+                "s" => out.push((key, SvVal::S(self.str()?))),
+                _ => self.skip_value(&sig)?,
             }
         }
         Ok(out)
+    }
+
+    /// the u32-valued entries of an a{sv}; everything else is skipped
+    pub fn u32_dict(&mut self) -> Result<Vec<(String, u32)>, DbusError> {
+        Ok(self
+            .sv_dict()?
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                SvVal::U(u) => Some((k, u)),
+                _ => None,
+            })
+            .collect())
     }
 
     /// generic skip for header fields we don't care about
@@ -513,6 +531,39 @@ mod tests {
         let mut r = Rd::new(&msg[h.body.0..h.body.1], &[]);
         let d = r.u32_dict().unwrap();
         assert_eq!(d, vec![("cursor_mode".into(), 2), ("types".into(), 1)]);
+    }
+
+    #[test]
+    fn sv_dict_keeps_strings_and_u32s() {
+        let mut b = MsgBuilder::call(1, 0);
+        b.path("/x");
+        b.destination("d");
+        b.interface("i");
+        b.member("m");
+        b.signature("a{sv}");
+        b.finish_header();
+        b.put_array(8, |b| {
+            b.align(8);
+            b.put_str("persist_mode");
+            b.put_variant("u", |b| b.put_u32(2));
+            b.align(8);
+            b.put_str("restore_token");
+            b.put_variant("s", |b| b.put_str("carrot:1:2"));
+            b.align(8);
+            b.put_str("is_cool");
+            b.put_variant("b", |b| b.put_bool(true));
+        });
+        let msg = b.finish();
+        let h = parse(&msg).unwrap();
+        let mut r = Rd::new(&msg[h.body.0..h.body.1], &[]);
+        let d = r.sv_dict().unwrap();
+        assert_eq!(
+            d,
+            vec![
+                ("persist_mode".into(), SvVal::U(2)),
+                ("restore_token".into(), SvVal::S("carrot:1:2".into())),
+            ]
+        );
     }
 
     #[test]

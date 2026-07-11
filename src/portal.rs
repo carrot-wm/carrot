@@ -21,14 +21,21 @@ const IF_SESSION: &str = "org.freedesktop.impl.portal.Session";
 const IF_REQUEST: &str = "org.freedesktop.impl.portal.Request";
 
 const SOURCE_MONITOR: u32 = 1;
+const SOURCE_WINDOW: u32 = 2;
 const CURSOR_HIDDEN: u32 = 1;
 const CURSOR_EMBEDDED: u32 = 2;
-const VERSION: u32 = 2;
+// version 4: restore_token/persist_mode understood
+const VERSION: u32 = 4;
 // portal response codes
 const R_ENDED: u32 = 2;
 
 struct Session {
     cursor_mode: Cell<u32>,
+    types: Cell<u32>,
+    /// requested persistence; we grant at most 1 (compositor lifetime)
+    persist: Cell<u32>,
+    /// what a presented restore_token resolved to
+    restore: RefCell<Option<cast::RestoreData>>,
     /// the in-flight Start; dropping it cancels the cast setup
     starting: Cell<Option<SpawnedFuture<()>>>,
 }
@@ -36,14 +43,18 @@ struct Session {
 impl Default for Session {
     fn default() -> Session {
         Session {
-            // the spec default: no pointer in the frames
+            // the spec defaults: no pointer in the frames, monitors only
             cursor_mode: Cell::new(CURSOR_HIDDEN),
+            types: Cell::new(SOURCE_MONITOR),
+            persist: Cell::new(0),
+            restore: RefCell::new(None),
             starting: Cell::new(None),
         }
     }
 }
 
 type Sessions = Rc<RefCell<HashMap<String, Session>>>;
+type Tokens = Rc<RefCell<HashMap<String, cast::RestoreData>>>;
 
 fn reply_response(c: &DbusConn, call: &MethodCall, code: u32) {
     c.reply(call, "ua{sv}", |b| {
@@ -62,7 +73,9 @@ fn response_to(c: &DbusConn, serial: u32, dest: &str, code: u32) {
 fn prop_variant(b: &mut MsgBuilder, prop: &str) -> bool {
     match prop {
         "version" => b.put_variant("u", |b| b.put_u32(VERSION)),
-        "AvailableSourceTypes" => b.put_variant("u", |b| b.put_u32(SOURCE_MONITOR)),
+        "AvailableSourceTypes" => {
+            b.put_variant("u", |b| b.put_u32(SOURCE_MONITOR | SOURCE_WINDOW))
+        }
         "AvailableCursorModes" => {
             b.put_variant("u", |b| b.put_u32(CURSOR_HIDDEN | CURSOR_EMBEDDED))
         }
@@ -107,41 +120,43 @@ fn serve_properties(conn: &Rc<DbusConn>) {
     }));
 }
 
-/// the streams a(ua{sv}) result the app receives: node id plus geometry
-fn put_streams(b: &mut MsgBuilder, cast: &cast::Cast) {
-    b.put_u32(0);
-    b.put_array(8, |b| {
-        b.align(8);
-        b.put_str("streams");
-        b.put_variant("a(ua{sv})", |b| {
+/// the streams a(ua{sv}) results entry: node id plus geometry
+fn put_streams_entry(b: &mut MsgBuilder, cast: &cast::Cast) {
+    let source_type = match cast.restore_data() {
+        cast::RestoreData::Output(_) => SOURCE_MONITOR,
+        cast::RestoreData::Window { .. } => SOURCE_WINDOW,
+    };
+    b.align(8);
+    b.put_str("streams");
+    b.put_variant("a(ua{sv})", |b| {
+        b.put_array(8, |b| {
+            b.align(8);
+            b.put_u32(cast.node_id);
             b.put_array(8, |b| {
                 b.align(8);
-                b.put_u32(cast.node_id);
-                b.put_array(8, |b| {
+                b.put_str("size");
+                b.put_variant("(ii)", |b| {
                     b.align(8);
-                    b.put_str("size");
-                    b.put_variant("(ii)", |b| {
-                        b.align(8);
-                        b.put_i32(cast.width as i32);
-                        b.put_i32(cast.height as i32);
-                    });
-                    b.align(8);
-                    b.put_str("position");
-                    b.put_variant("(ii)", |b| {
-                        b.align(8);
-                        b.put_i32(cast.pos.0);
-                        b.put_i32(cast.pos.1);
-                    });
-                    b.align(8);
-                    b.put_str("source_type");
-                    b.put_variant("u", |b| b.put_u32(SOURCE_MONITOR));
+                    b.put_i32(cast.width as i32);
+                    b.put_i32(cast.height as i32);
                 });
+                b.align(8);
+                b.put_str("position");
+                b.put_variant("(ii)", |b| {
+                    b.align(8);
+                    b.put_i32(cast.pos.0);
+                    b.put_i32(cast.pos.1);
+                });
+                b.align(8);
+                b.put_str("source_type");
+                b.put_variant("u", |b| b.put_u32(source_type));
             });
         });
     });
 }
 
-fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
+fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, state: Rc<State>) {
+    use crate::dbus::wire::SvVal;
     let me = conn.clone();
     conn.serve(IF_SCREENCAST, Box::new(move |c, call| {
         match call.member.as_str() {
@@ -165,7 +180,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
                 let _request = rd.str().unwrap_or_default();
                 let session = rd.str().unwrap_or_default();
                 let _app = rd.str();
-                let opts = rd.u32_dict().unwrap_or_default();
+                let opts = rd.sv_dict().unwrap_or_default();
                 let map = sessions.borrow();
                 let Some(s) = map.get(&session) else {
                     drop(map);
@@ -176,8 +191,16 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
                     );
                     return;
                 };
-                if let Some((_, m)) = opts.iter().find(|(k, _)| k == "cursor_mode") {
-                    s.cursor_mode.set(*m);
+                for (k, v) in &opts {
+                    match (k.as_str(), v) {
+                        ("cursor_mode", SvVal::U(m)) => s.cursor_mode.set(*m),
+                        ("types", SvVal::U(t)) => s.types.set(*t),
+                        ("persist_mode", SvVal::U(p)) => s.persist.set(*p),
+                        ("restore_token", SvVal::S(t)) => {
+                            *s.restore.borrow_mut() = tokens.borrow().get(t).cloned();
+                        }
+                        _ => {}
+                    }
                 }
                 drop(map);
                 reply_response(c, call, 0);
@@ -186,7 +209,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
                 let mut rd = call.rd();
                 let _request = rd.str().unwrap_or_default();
                 let session = rd.str().unwrap_or_default();
-                let cursor = {
+                let (cursor, persist, pick) = {
                     let map = sessions.borrow();
                     let Some(s) = map.get(&session) else {
                         drop(map);
@@ -197,16 +220,50 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
                         );
                         return;
                     };
-                    s.cursor_mode.get() == CURSOR_EMBEDDED
+                    let pick = if let Some(r) = s.restore.borrow().clone() {
+                        cast::Pick::Restored(r)
+                    } else if s.types.get() == SOURCE_WINDOW {
+                        cast::Pick::Window
+                    } else {
+                        cast::Pick::Monitor
+                    };
+                    (s.cursor_mode.get() == CURSOR_EMBEDDED, s.persist.get(), pick)
                 };
                 // the node id comes from the daemon; the cast task replies
                 let (serial, dest) = (call.serial, call.sender.clone());
                 let me = me.clone();
                 let st = state.clone();
+                let toks = tokens.clone();
                 let sess = session.clone();
                 let task = state.eng.spawn("cast start", async move {
-                    match cast::start(&st, sess, cursor).await {
-                        Ok(cast) => me.reply_to(serial, &dest, "ua{sv}", |b| put_streams(b, &cast)),
+                    match cast::start(&st, sess, cursor, pick).await {
+                        Ok(cast) => {
+                            let token = (persist > 0).then(|| {
+                                let t = format!(
+                                    "carrot:{:x}:{:x}",
+                                    st.next_uid(),
+                                    crate::util::Time::now().nsec()
+                                );
+                                toks.borrow_mut().insert(t.clone(), cast.restore_data());
+                                t
+                            });
+                            me.reply_to(serial, &dest, "ua{sv}", |b| {
+                                b.put_u32(0);
+                                b.put_array(8, |b| {
+                                    put_streams_entry(b, &cast);
+                                    if let Some(t) = &token {
+                                        b.align(8);
+                                        b.put_str("restore_token");
+                                        b.put_variant("s", |b| b.put_str(t));
+                                        // granted persistence: this compositor's
+                                        // lifetime, whatever was asked
+                                        b.align(8);
+                                        b.put_str("persist_mode");
+                                        b.put_variant("u", |b| b.put_u32(1));
+                                    }
+                                });
+                            });
+                        }
                         Err(e) => {
                             eprintln!("carrot: portal: cast failed: {e}");
                             response_to(&me, serial, &dest, R_ENDED);
@@ -240,8 +297,9 @@ async fn run_inner(
 ) -> Result<(), DbusError> {
     let conn = DbusConn::connect_session(eng, ring).await?;
     let sessions: Sessions = Rc::new(RefCell::new(HashMap::new()));
+    let tokens: Tokens = Rc::new(RefCell::new(HashMap::new()));
     serve_properties(&conn);
-    serve_screencast(&conn, sessions.clone(), state.clone());
+    serve_screencast(&conn, sessions.clone(), tokens, state.clone());
     conn.serve(IF_SESSION, Box::new({
         let sessions = sessions.clone();
         let state = state.clone();
