@@ -63,6 +63,7 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 - `wlr-layer-shell` for panels, overlays, and lock screens
 - `wlr-foreign-toplevel-management` for taskbars and window switchers
 - Screencopy for screenshots
+- Built-in `xdg-desktop-portal` ScreenCast backend with a pure-Rust PipeWire client - screensharing needs no `xdg-desktop-portal-wlr`
 - Clipboard via `zwlr_data_control_v1`
 - DPMS wake on input
 
@@ -139,6 +140,50 @@ wayland.windowManager.carrot = {
 ```
 
 </details>
+
+### Screensharing
+
+Carrot serves the ScreenCast portal itself and draws no chooser of its own,
+so the share menu is whatever you want it to be. Every share request passes
+one consent step:
+
+- a **restore token** from an earlier share skips straight through,
+- otherwise the configured **picker** command runs,
+- with no picker configured, the next **left click** picks the window (or
+  output) under the cursor - Escape or any other button cancels, and the
+  click never reaches the app.
+
+The picker is any program: it receives one JSON candidate per line on stdin
+and answers with the chosen `id` on stdout (empty output or exit without an
+answer cancels the share).
+
+```json
+{"kind":"output","id":"o:DP-1","name":"DP-1","width":2560,"height":1440,"x":0,"y":0}
+{"kind":"window","id":"w:42","app_id":"foot","title":"~","workspace":2}
+{"kind":"workspace","id":"ws:2","index":2,"output":"DP-1","active":true}
+```
+
+Workspace entries are a carrot extra - sharing one follows the workspace
+across outputs instead of pinning to a monitor. Theming lives entirely in
+the picker program: a dmenu-style script works anywhere,
+
+```kdl
+general {
+    picker "carrot-share-menu"
+}
+```
+
+```sh
+#!/bin/sh
+# carrot-share-menu: candidates in, one id out
+jq -r '[.id, .kind, (.name // .app_id // ""), (.title // "")] | @tsv' \
+    | fuzzel --dmenu \
+    | cut -f1
+```
+
+while a quickshell (or any shell) setup can forward the candidate list to
+its own styled menu over IPC and print the id it picked. The picker path
+never grabs the seat, so shell-drawn menus receive their clicks normally.
 
 ## Building
 
