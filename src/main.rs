@@ -36,6 +36,7 @@ mod ei;
 mod input;
 mod ipc;
 mod pipewire;
+mod portal;
 mod sighand;
 mod tree;
 mod xwayland;
@@ -110,6 +111,9 @@ fn main() {
     }
     if std::env::args().any(|a| a == "pw-pattern") {
         std::process::exit(pipewire::pattern());
+    }
+    if std::env::args().any(|a| a == "portal-probe") {
+        std::process::exit(portal::probe());
     }
 
     if let Err(e) = run() {
@@ -307,6 +311,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "portal env",
         dbus::export_session_env(engine.clone(), ring.clone(), st),
     );
+    let st = state.clone();
+    let _portal = engine.spawn("portal", portal::run(engine.clone(), ring.clone(), st));
     let st = state.clone();
     let police = engine.spawn("slow clients", async move {
         loop {

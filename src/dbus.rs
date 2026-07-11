@@ -4,7 +4,7 @@
 // wrong reply.
 
 mod logind;
-mod wire;
+pub(crate) mod wire;
 
 pub use logind::{DeviceEvent, LogindSession};
 
@@ -16,7 +16,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
-use wire::{MsgBuilder, Rd};
+pub(crate) use wire::MsgBuilder;
+use wire::Rd;
 
 #[derive(Debug)]
 pub enum DbusError {
@@ -97,6 +98,26 @@ struct PendingReply {
 
 type SignalCb = Box<dyn Fn(&SignalMsg)>;
 
+/// an inbound method call, ready for reply()/reply_err()
+pub struct MethodCall {
+    pub path: String,
+    pub interface: String,
+    pub member: String,
+    pub sender: String,
+    pub serial: u32,
+    pub sig: String,
+    pub body: Vec<u8>,
+    pub fds: Vec<Rc<OwnedFd>>,
+}
+
+type MethodCb = Box<dyn Fn(&DbusConn, &MethodCall)>;
+
+impl MethodCall {
+    pub fn rd(&self) -> wire::Rd<'_> {
+        wire::Rd::new(&self.body, &self.fds)
+    }
+}
+
 pub struct DbusConn {
     ring: Rc<Ring>,
     fd: Rc<OwnedFd>,
@@ -104,6 +125,7 @@ pub struct DbusConn {
     closed: Cell<bool>,
     replies: RefCell<HashMap<u32, Rc<PendingReply>>>,
     signal_handlers: RefCell<Vec<(&'static str, &'static str, SignalCb)>>,
+    method_handlers: RefCell<Vec<(&'static str, MethodCb)>>,
     out: AsyncQueue<Vec<u8>>,
     tasks: Cell<Option<(SpawnedFuture<()>, SpawnedFuture<()>)>>,
     pub unique_name: RefCell<String>,
@@ -184,6 +206,7 @@ impl DbusConn {
             closed: Cell::new(false),
             replies: RefCell::new(HashMap::new()),
             signal_handlers: RefCell::new(Vec::new()),
+            method_handlers: RefCell::new(Vec::new()),
             out: AsyncQueue::default(),
             tasks: Cell::new(None),
             unique_name: RefCell::new(String::new()),
@@ -218,6 +241,51 @@ impl DbusConn {
         }
         *conn.unique_name.borrow_mut() = hello.rd().str()?;
         Ok(conn)
+    }
+
+    /// serve an interface: the callback owns member dispatch and replies
+    pub fn serve(&self, interface: &'static str, cb: MethodCb) {
+        self.method_handlers.borrow_mut().push((interface, cb));
+    }
+
+    pub fn reply(&self, call: &MethodCall, sig: &str, f: impl FnOnce(&mut wire::MsgBuilder)) {
+        let serial = self.next_serial();
+        let mut b = wire::MsgBuilder::method_return(serial, call.serial, &call.sender);
+        if !sig.is_empty() {
+            b.signature(sig);
+        }
+        b.finish_header();
+        f(&mut b);
+        self.out.push(b.finish());
+    }
+
+    pub fn reply_err(&self, call: &MethodCall, name: &str, text: &str) {
+        let serial = self.next_serial();
+        let mut b = wire::MsgBuilder::error_msg(serial, call.serial, &call.sender, name);
+        b.signature("s");
+        b.finish_header();
+        b.put_str(text);
+        self.out.push(b.finish());
+    }
+
+    /// claim a well-known name; 4 = DBUS_NAME_FLAG_DO_NOT_QUEUE
+    pub async fn request_name(&self, name: &str) -> Result<(), DbusError> {
+        let r = self
+            .call(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "RequestName",
+                "su",
+                &[Arg::Str(name), Arg::U32(4)],
+            )
+            .await?;
+        // 1 = primary owner
+        if r.sig == "u" && r.rd().u32()? == 1 {
+            Ok(())
+        } else {
+            Err(DbusError::Env("could not become the portal name owner"))
+        }
     }
 
     fn next_serial(&self) -> u32 {
@@ -446,7 +514,37 @@ impl DbusConn {
                         }
                     }
                 }
-                // client-only: logind never sends inbound calls; drop them
+                wire::METHOD_CALL => {
+                    let call = MethodCall {
+                        path: h.path.unwrap_or_default(),
+                        interface: h.interface.unwrap_or_default(),
+                        member: h.member.unwrap_or_default(),
+                        sender: h.sender.unwrap_or_default(),
+                        serial: h.serial,
+                        sig: h.signature,
+                        body,
+                        fds,
+                    };
+                    let handled = {
+                        let hs = self.method_handlers.borrow();
+                        let mut hit = false;
+                        for (iface, cb) in hs.iter() {
+                            if *iface == call.interface {
+                                cb(self, &call);
+                                hit = true;
+                                break;
+                            }
+                        }
+                        hit
+                    };
+                    if !handled {
+                        self.reply_err(
+                            &call,
+                            "org.freedesktop.DBus.Error.UnknownMethod",
+                            "no such interface here",
+                        );
+                    }
+                }
                 _ => crate::trace!("ignoring dbus message type {}", h.mtype),
             }
         }

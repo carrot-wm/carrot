@@ -31,10 +31,10 @@ pub struct MsgBuilder {
 }
 
 impl MsgBuilder {
-    pub fn call(serial: u32, flags: u8) -> MsgBuilder {
+    fn msg(mtype: u8, serial: u32, flags: u8) -> MsgBuilder {
         let mut buf = Vec::with_capacity(256);
         buf.push(b'l');
-        buf.push(METHOD_CALL);
+        buf.push(mtype);
         buf.push(flags);
         buf.push(1);
         buf.extend_from_slice(&0u32.to_le_bytes());
@@ -42,6 +42,34 @@ impl MsgBuilder {
         // header array length, backpatched in finish_header
         buf.extend_from_slice(&0u32.to_le_bytes());
         MsgBuilder { buf, body_start: 0 }
+    }
+
+    pub fn call(serial: u32, flags: u8) -> MsgBuilder {
+        Self::msg(METHOD_CALL, serial, flags)
+    }
+
+    pub fn method_return(serial: u32, reply_to: u32, dest: &str) -> MsgBuilder {
+        let mut b = Self::msg(METHOD_RETURN, serial, 1);
+        b.field_u32(F_REPLY_SERIAL, reply_to);
+        b.destination(dest);
+        b
+    }
+
+    pub fn error_msg(serial: u32, reply_to: u32, dest: &str, name: &str) -> MsgBuilder {
+        let mut b = Self::msg(ERROR, serial, 1);
+        b.field_str(F_ERROR_NAME, b's', name);
+        b.field_u32(F_REPLY_SERIAL, reply_to);
+        b.destination(dest);
+        b
+    }
+
+    fn field_u32(&mut self, code: u8, value: u32) {
+        self.pad(8);
+        self.buf.push(code);
+        self.buf.push(1);
+        self.buf.push(b'u');
+        self.buf.push(0);
+        self.put_u32(value);
     }
 
     fn pad(&mut self, align: usize) {
@@ -140,6 +168,29 @@ impl MsgBuilder {
         self.buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
     }
 
+    pub fn align(&mut self, n: usize) {
+        self.pad(n);
+    }
+
+    /// variant: signature then the value, written by the closure
+    pub fn put_variant(&mut self, sig: &str, f: impl FnOnce(&mut MsgBuilder)) {
+        self.put_sig(sig);
+        f(self);
+    }
+
+    /// array of elements with the given alignment; the length excludes the
+    /// pad to the first element, per the wire format
+    pub fn put_array(&mut self, elem_align: usize, f: impl FnOnce(&mut MsgBuilder)) {
+        self.pad(4);
+        let len_at = self.buf.len();
+        self.buf.extend_from_slice(&0u32.to_le_bytes());
+        self.pad(elem_align);
+        let start = self.buf.len();
+        f(self);
+        let len = (self.buf.len() - start) as u32;
+        self.buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
+    }
+
     fn put_sig(&mut self, v: &str) {
         self.buf.push(v.len() as u8);
         self.buf.extend_from_slice(v.as_bytes());
@@ -168,6 +219,7 @@ pub struct Header {
     pub interface: Option<String>,
     pub member: Option<String>,
     pub path: Option<String>,
+    pub sender: Option<String>,
 }
 
 /// total message length, once 16 prefix bytes are available
@@ -217,7 +269,8 @@ pub fn parse(msg: &[u8]) -> Result<Header, DbusError> {
             (F_REPLY_SERIAL, "u") => h.reply_serial = Some(r.u32()?),
             (F_SIGNATURE, "g") => h.signature = r.sig()?,
             (F_UNIX_FDS, "u") => h.unix_fds = r.u32()?,
-            (F_SENDER, "s") | (F_DESTINATION, "s") => {
+            (F_SENDER, "s") => h.sender = Some(r.str()?),
+            (F_DESTINATION, "s") => {
                 let _ = r.str()?;
             }
             _ => r.skip_value(&sig)?,
