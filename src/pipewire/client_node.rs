@@ -26,6 +26,32 @@ const EV_CORE_BOUND_ID: u8 = 5;
 
 pub const CLIENT_NODE_VERSION: i32 = 4;
 
+/// the three port params: EnumFormat, Buffers, Meta. framerate is left
+/// unconstrained on purpose - casts are damage-driven and consumers pin
+/// their own rate; a fixed fraction here empties the intersection with
+/// their EnumFormat and the link dies with "no more input formats"
+fn port_params(b: &mut PodBuilder, w: u32, h: u32) {
+    b.object(OBJ_FORMAT, PARAM_ENUM_FORMAT, |b| {
+        b.prop(FMT_MEDIA_TYPE, |b| b.id(MEDIA_TYPE_VIDEO));
+        b.prop(FMT_MEDIA_SUBTYPE, |b| b.id(MEDIA_SUBTYPE_RAW));
+        b.prop(FMT_VIDEO_FORMAT, |b| b.choice_enum_id(VIDEO_FORMAT_BGRX, &[VIDEO_FORMAT_BGRX]));
+        b.prop(FMT_VIDEO_SIZE, |b| b.rectangle(w, h));
+    });
+    b.object(OBJ_PARAM_BUFFERS, PARAM_BUFFERS, |b| {
+        b.prop(BUFFERS_BUFFERS, |b| b.choice_range_int(3, 2, 8));
+        b.prop(BUFFERS_BLOCKS, |b| b.int(1));
+        b.prop(BUFFERS_SIZE, |b| b.int((w * h * 4) as i32));
+        b.prop(BUFFERS_STRIDE, |b| b.int((w * 4) as i32));
+        b.prop(BUFFERS_DATATYPE, |b| {
+            b.choice(super::pod::CHOICE_FLAGS, super::pod::T_INT, 4, &[&(1u32 << DATA_MEM_FD).to_le_bytes()]);
+        });
+    });
+    b.object(OBJ_PARAM_META, PARAM_META, |b| {
+        b.prop(META_TYPE, |b| b.id(META_HEADER));
+        b.prop(META_SIZE, |b| b.int(META_HEADER_BYTES as i32));
+    });
+}
+
 // update masks
 const UPDATE_PARAMS: u32 = 1 << 0;
 const UPDATE_INFO: u32 = 1 << 1;
@@ -243,33 +269,14 @@ impl SourceNode {
 
     /// one output port: a single fixed memfd format, header meta, buffers
     fn port_update_body(&self) -> Vec<u8> {
-        let (w, h, fps) = (self.width, self.height, self.fps);
+        let (w, h) = (self.width, self.height);
         let mut b = PodBuilder::default();
         b.struct_(|b| {
             b.uint(DIRECTION_OUTPUT);
             b.uint(0); // port id
             b.uint(UPDATE_PARAMS | UPDATE_INFO);
             b.uint(3); // params
-            b.object(OBJ_FORMAT, PARAM_ENUM_FORMAT, |b| {
-                b.prop(FMT_MEDIA_TYPE, |b| b.id(MEDIA_TYPE_VIDEO));
-                b.prop(FMT_MEDIA_SUBTYPE, |b| b.id(MEDIA_SUBTYPE_RAW));
-                b.prop(FMT_VIDEO_FORMAT, |b| b.choice_enum_id(VIDEO_FORMAT_BGRX, &[VIDEO_FORMAT_BGRX]));
-                b.prop(FMT_VIDEO_SIZE, |b| b.rectangle(w, h));
-                b.prop(FMT_VIDEO_FRAMERATE, |b| b.fraction(fps, 1));
-            });
-            b.object(OBJ_PARAM_BUFFERS, PARAM_BUFFERS, |b| {
-                b.prop(BUFFERS_BUFFERS, |b| b.choice_range_int(3, 2, 8));
-                b.prop(BUFFERS_BLOCKS, |b| b.int(1));
-                b.prop(BUFFERS_SIZE, |b| b.int((w * h * 4) as i32));
-                b.prop(BUFFERS_STRIDE, |b| b.int((w * 4) as i32));
-                b.prop(BUFFERS_DATATYPE, |b| {
-                    b.choice(super::pod::CHOICE_FLAGS, super::pod::T_INT, 4, &[&(1u32 << DATA_MEM_FD).to_le_bytes()]);
-                });
-            });
-            b.object(OBJ_PARAM_META, PARAM_META, |b| {
-                b.prop(META_TYPE, |b| b.id(META_HEADER));
-                b.prop(META_SIZE, |b| b.int(META_HEADER_BYTES as i32));
-            });
+            port_params(b, w, h);
             b.struct_(|b| {
                 b.long((PORT_CHANGE_FLAGS | PORT_CHANGE_RATE | PORT_CHANGE_PARAMS) as i64);
                 b.long(0); // flags
@@ -554,5 +561,33 @@ impl SourceNode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_format_leaves_framerate_unconstrained() {
+        let mut b = PodBuilder::default();
+        port_params(&mut b, 640, 360);
+        let mut p = PodParser::new(&b.buf);
+        let (ty, id, mut obj) = p.object().unwrap();
+        assert_eq!((ty, id), (OBJ_FORMAT, PARAM_ENUM_FORMAT));
+        let mut keys = Vec::new();
+        while !obj.done() {
+            keys.push(obj.prop_key().unwrap());
+            obj.value().unwrap();
+        }
+        for want in [FMT_MEDIA_TYPE, FMT_MEDIA_SUBTYPE, FMT_VIDEO_FORMAT, FMT_VIDEO_SIZE] {
+            assert!(keys.contains(&want), "EnumFormat lost key {want:#x}");
+        }
+        // a fixed framerate empties the intersection with real consumers
+        // (obs pins its own rate); omitted = wildcard, like jay
+        assert!(
+            !keys.contains(&FMT_VIDEO_FRAMERATE),
+            "EnumFormat must not constrain the framerate"
+        );
     }
 }
