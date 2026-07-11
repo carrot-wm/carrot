@@ -8,9 +8,17 @@ pub const T_ID: u32 = 0x03;
 pub const T_INT: u32 = 0x04;
 pub const T_LONG: u32 = 0x05;
 pub const T_STRING: u32 = 0x08;
+pub const T_RECTANGLE: u32 = 0x0a;
+pub const T_FRACTION: u32 = 0x0b;
 pub const T_STRUCT: u32 = 0x0e;
 pub const T_OBJECT: u32 = 0x0f;
 pub const T_FD: u32 = 0x12;
+pub const T_CHOICE: u32 = 0x13;
+
+pub const CHOICE_NONE: u32 = 0;
+pub const CHOICE_RANGE: u32 = 1;
+pub const CHOICE_ENUM: u32 = 3;
+pub const CHOICE_FLAGS: u32 = 4;
 
 #[derive(Debug)]
 pub enum PodError {
@@ -83,6 +91,63 @@ impl PodBuilder {
 
     pub fn struct_(&mut self, f: impl FnOnce(&mut PodBuilder)) {
         self.pod(T_STRUCT, f);
+    }
+
+    pub fn rectangle(&mut self, w: u32, h: u32) {
+        self.pod(T_RECTANGLE, |b| {
+            b.buf.extend_from_slice(&w.to_le_bytes());
+            b.buf.extend_from_slice(&h.to_le_bytes());
+        });
+    }
+
+    pub fn fraction(&mut self, num: u32, denom: u32) {
+        self.pod(T_FRACTION, |b| {
+            b.buf.extend_from_slice(&num.to_le_bytes());
+            b.buf.extend_from_slice(&denom.to_le_bytes());
+        });
+    }
+
+    /// spa object: object type + id, then (key, flags, pod) properties
+    pub fn object(&mut self, obj_ty: u32, obj_id: u32, f: impl FnOnce(&mut PodBuilder)) {
+        self.pod(T_OBJECT, |b| {
+            b.buf.extend_from_slice(&obj_ty.to_le_bytes());
+            b.buf.extend_from_slice(&obj_id.to_le_bytes());
+            f(b);
+        });
+    }
+
+    /// one object property; the closure writes exactly one pod
+    pub fn prop(&mut self, key: u32, f: impl FnOnce(&mut PodBuilder)) {
+        self.buf.extend_from_slice(&key.to_le_bytes());
+        self.buf.extend_from_slice(&0u32.to_le_bytes());
+        f(self);
+    }
+
+    /// choice body: choice type + flags, then headerless raw values of one
+    /// child type; the first value is the default
+    pub fn choice(&mut self, choice_ty: u32, child_ty: u32, child_size: u32, values: &[&[u8]]) {
+        self.pod(T_CHOICE, |b| {
+            b.buf.extend_from_slice(&choice_ty.to_le_bytes());
+            b.buf.extend_from_slice(&0u32.to_le_bytes());
+            b.buf.extend_from_slice(&child_size.to_le_bytes());
+            b.buf.extend_from_slice(&child_ty.to_le_bytes());
+            for v in values {
+                b.buf.extend_from_slice(v);
+            }
+        });
+    }
+
+    pub fn choice_enum_id(&mut self, default: u32, alts: &[u32]) {
+        let mut vals: Vec<[u8; 4]> = vec![default.to_le_bytes()];
+        vals.extend(alts.iter().map(|v| v.to_le_bytes()));
+        let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+        self.choice(CHOICE_ENUM, T_ID, 4, &refs);
+    }
+
+    pub fn choice_range_int(&mut self, default: i32, min: i32, max: i32) {
+        let vals = [default.to_le_bytes(), min.to_le_bytes(), max.to_le_bytes()];
+        let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+        self.choice(CHOICE_RANGE, T_INT, 4, &refs);
     }
 
     /// pipewire's props dict: struct { n_items, then key/value strings }
@@ -196,6 +261,112 @@ impl<'a> PodParser<'a> {
         let d = &self.d[self.pos..self.pos + size];
         self.advance(size);
         Ok(PodParser::new(d))
+    }
+
+    pub fn rectangle(&mut self) -> Result<(u32, u32), PodError> {
+        let d = self.fixed(T_RECTANGLE, 8)?;
+        Ok((
+            u32::from_le_bytes(d[0..4].try_into().unwrap()),
+            u32::from_le_bytes(d[4..8].try_into().unwrap()),
+        ))
+    }
+
+    pub fn fraction(&mut self) -> Result<(u32, u32), PodError> {
+        let d = self.fixed(T_FRACTION, 8)?;
+        Ok((
+            u32::from_le_bytes(d[0..4].try_into().unwrap()),
+            u32::from_le_bytes(d[4..8].try_into().unwrap()),
+        ))
+    }
+
+    /// enter an object: returns (object type, object id) and a sub-parser
+    /// positioned at the first property
+    pub fn object(&mut self) -> Result<(u32, u32, PodParser<'a>), PodError> {
+        let (size, ty) = self.header()?;
+        if ty != T_OBJECT {
+            return Err(PodError::Type { want: T_OBJECT, got: ty });
+        }
+        if size < 8 {
+            return Err(PodError::Truncated);
+        }
+        let obj_ty = u32::from_le_bytes(self.d[self.pos..self.pos + 4].try_into().unwrap());
+        let obj_id = u32::from_le_bytes(self.d[self.pos + 4..self.pos + 8].try_into().unwrap());
+        let body = &self.d[self.pos + 8..self.pos + size];
+        self.advance(size);
+        Ok((obj_ty, obj_id, PodParser::new(body)))
+    }
+
+    /// next object property key; the value pod follows
+    pub fn prop_key(&mut self) -> Result<u32, PodError> {
+        if self.pos + 8 > self.d.len() {
+            return Err(PodError::Truncated);
+        }
+        let key = u32::from_le_bytes(self.d[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 8;
+        Ok(key)
+    }
+
+    /// the next pod's raw value, unwrapping a choice to its default child:
+    /// returns (value type, value bytes)
+    pub fn value(&mut self) -> Result<(u32, &'a [u8]), PodError> {
+        let (size, ty) = self.header()?;
+        if ty != T_CHOICE {
+            let d = &self.d[self.pos..self.pos + size];
+            self.advance(size);
+            return Ok((ty, d));
+        }
+        if size < 16 {
+            return Err(PodError::Truncated);
+        }
+        let child_size =
+            u32::from_le_bytes(self.d[self.pos + 8..self.pos + 12].try_into().unwrap()) as usize;
+        let child_ty =
+            u32::from_le_bytes(self.d[self.pos + 12..self.pos + 16].try_into().unwrap());
+        if child_size > size - 16 {
+            return Err(PodError::Truncated);
+        }
+        let v0 = self.pos + 16;
+        let d = &self.d[v0..v0 + child_size];
+        self.advance(size);
+        Ok((child_ty, d))
+    }
+
+    pub fn value_id(&mut self) -> Result<u32, PodError> {
+        match self.value()? {
+            (T_ID | T_INT, d) if d.len() >= 4 => {
+                Ok(u32::from_le_bytes(d[..4].try_into().unwrap()))
+            }
+            (got, _) => Err(PodError::Type { want: T_ID, got }),
+        }
+    }
+
+    pub fn value_int(&mut self) -> Result<i32, PodError> {
+        match self.value()? {
+            (T_INT | T_ID, d) if d.len() >= 4 => {
+                Ok(i32::from_le_bytes(d[..4].try_into().unwrap()))
+            }
+            (got, _) => Err(PodError::Type { want: T_INT, got }),
+        }
+    }
+
+    pub fn value_rectangle(&mut self) -> Result<(u32, u32), PodError> {
+        match self.value()? {
+            (T_RECTANGLE, d) if d.len() >= 8 => Ok((
+                u32::from_le_bytes(d[0..4].try_into().unwrap()),
+                u32::from_le_bytes(d[4..8].try_into().unwrap()),
+            )),
+            (got, _) => Err(PodError::Type { want: T_RECTANGLE, got }),
+        }
+    }
+
+    pub fn value_fraction(&mut self) -> Result<(u32, u32), PodError> {
+        match self.value()? {
+            (T_FRACTION, d) if d.len() >= 8 => Ok((
+                u32::from_le_bytes(d[0..4].try_into().unwrap()),
+                u32::from_le_bytes(d[4..8].try_into().unwrap()),
+            )),
+            (got, _) => Err(PodError::Type { want: T_FRACTION, got }),
+        }
     }
 
     pub fn dict(&mut self) -> Result<Vec<(String, String)>, PodError> {

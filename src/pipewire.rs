@@ -2,6 +2,7 @@
 // 16-byte headers (object id | opcode<<24|size | seq | n_fds) with spa pods
 // as bodies and fds over SCM_RIGHTS. P0 scope: connect, hello, registry.
 
+pub mod client_node;
 pub mod pod;
 
 use pod::{PodBuilder, PodParser};
@@ -13,6 +14,7 @@ const CORE_HELLO: u8 = 1;
 const CORE_SYNC: u8 = 2;
 const CORE_PONG: u8 = 3;
 const CORE_GET_REGISTRY: u8 = 5;
+pub(crate) const CORE_CREATE_OBJECT: u8 = 6;
 const EV_CORE_INFO: u8 = 0;
 const EV_CORE_DONE: u8 = 1;
 const EV_CORE_PING: u8 = 2;
@@ -71,12 +73,15 @@ pub struct Frame {
     pub opcode: u8,
     pub seq: u32,
     pub body: Vec<u8>,
-    pub fds: Vec<OwnedFd>,
+    /// options so handlers can take ownership fd by fd
+    pub fds: Vec<Option<OwnedFd>>,
 }
 
 pub struct PwConn {
     fd: Rc<OwnedFd>,
     seq: std::cell::Cell<u32>,
+    /// fds arrive with whatever read was in flight; frames claim n_fds each
+    pending_fds: std::cell::RefCell<std::collections::VecDeque<OwnedFd>>,
 }
 
 impl PwConn {
@@ -94,6 +99,7 @@ impl PwConn {
         Ok(PwConn {
             fd: Rc::new(fd),
             seq: std::cell::Cell::new(0),
+            pending_fds: std::cell::RefCell::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -113,7 +119,7 @@ impl PwConn {
         Ok(())
     }
 
-    fn read_exact(&self, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> Result<(), PwError> {
+    fn read_exact(&self, buf: &mut [u8]) -> Result<(), PwError> {
         use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
         let mut off = 0;
         while off < buf.len() {
@@ -130,7 +136,7 @@ impl PwConn {
             }
             for m in anc.drain() {
                 if let RecvAncillaryMessage::ScmRights(rights) = m {
-                    fds.extend(rights);
+                    self.pending_fds.borrow_mut().extend(rights);
                 }
             }
             off += r.bytes;
@@ -140,15 +146,18 @@ impl PwConn {
 
     pub fn recv(&self) -> Result<Frame, PwError> {
         let mut hdr = [0u8; 16];
-        let mut fds = Vec::new();
-        self.read_exact(&mut hdr, &mut fds)?;
+        self.read_exact(&mut hdr)?;
         let id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
         let w2 = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
         let seq = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        let n_fds = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
         let opcode = (w2 >> 24) as u8;
         let size = (w2 & 0xff_ffff) as usize;
         let mut body = vec![0u8; size];
-        self.read_exact(&mut body, &mut fds)?;
+        self.read_exact(&mut body)?;
+        // this frame's declared share of the fd stream, in arrival order
+        let mut q = self.pending_fds.borrow_mut();
+        let fds = (0..n_fds).map(|_| q.pop_front().map(Some).flatten()).collect();
         Ok(Frame { id, opcode, seq, body, fds })
     }
 
@@ -184,6 +193,10 @@ impl PwConn {
         self.send(0, CORE_SYNC, &b.buf)
     }
 
+    pub fn raw_fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
     pub fn pong(&self, id: i32, seq: i32) -> Result<(), PwError> {
         let mut b = PodBuilder::default();
         b.struct_(|b| {
@@ -191,6 +204,92 @@ impl PwConn {
             b.int(seq);
         });
         self.send(0, CORE_PONG, &b.buf)
+    }
+}
+
+/// `carrot pw-pattern [secs]`: a Video/Source client-node pushing a moving
+/// test pattern - the P1 gate. connect a consumer (helvum/gstreamer/obs)
+/// and watch it move
+pub fn pattern() -> i32 {
+    let secs: u64 = std::env::args()
+        .skip_while(|a| a != "pw-pattern")
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(3600);
+    match pattern_inner(secs) {
+        Ok(frames) => {
+            println!("pw-pattern: done, {frames} frames");
+            0
+        }
+        Err(e) => {
+            eprintln!("pw-pattern: {e}");
+            1
+        }
+    }
+}
+
+fn pattern_inner(secs: u64) -> Result<u64, PwError> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let con = Rc::new(PwConn::connect()?);
+    con.hello()?;
+    let mut node = client_node::SourceNode::create(con.clone(), 2, 640, 360, 30)?;
+    let started = crate::util::Time::now();
+    let mut announced = false;
+    let mut tick = 0u64;
+    let mut last = 0u64;
+    let frame_ns = 1_000_000_000 / node.fps as u64;
+    loop {
+        let now = crate::util::Time::now().nsec();
+        let elapsed = now.saturating_sub(started.nsec());
+        if elapsed / 1_000_000_000 >= secs {
+            return Ok(tick);
+        }
+        let next = last + frame_ns;
+        let wait_ns = next.saturating_sub(now).min(200_000_000);
+        let mut pfd = [PollFd::new(con.raw_fd(), PollFlags::IN)];
+        let ts = Timespec {
+            tv_sec: (wait_ns / 1_000_000_000) as i64,
+            tv_nsec: (wait_ns % 1_000_000_000) as i64,
+        };
+        let n = poll(&mut pfd, Some(&ts)).unwrap_or(0);
+        if n > 0 {
+            let mut f = con.recv()?;
+            if !node.handle(&mut f)? {
+                match (f.id, f.opcode) {
+                    (0, EV_CORE_PING) => {
+                        let mut p = PodParser::new(&f.body);
+                        let mut s = p.struct_()?;
+                        let id = s.int()?;
+                        let seq = s.int()?;
+                        con.pong(id, seq)?;
+                    }
+                    (0, EV_CORE_ERROR) => {
+                        let mut p = PodParser::new(&f.body);
+                        let mut s = p.struct_()?;
+                        let id = s.int()?;
+                        let _seq = s.int()?;
+                        let res = s.int()?;
+                        let msg = s.string()?.to_string();
+                        return Err(PwError::Remote(format!("object {id}: {msg} ({res})")));
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        // frame due
+        if node.ready() {
+            if !announced {
+                announced = true;
+                println!(
+                    "pw-pattern: streaming {}x{}@{} BGRx as global {:?}",
+                    node.width, node.height, node.fps, node.bound_global
+                );
+            }
+            node.produce(tick)?;
+            tick += 1;
+        }
+        last = crate::util::Time::now().nsec();
     }
 }
 

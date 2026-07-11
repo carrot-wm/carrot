@@ -108,6 +108,9 @@ fn main() {
     if std::env::args().any(|a| a == "pw-probe") {
         std::process::exit(pipewire::probe());
     }
+    if std::env::args().any(|a| a == "pw-pattern") {
+        std::process::exit(pipewire::pattern());
+    }
 
     if let Err(e) = run() {
         eprintln!("carrot: fatal: {e}");
