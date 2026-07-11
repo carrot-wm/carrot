@@ -285,33 +285,6 @@ pub(crate) async fn pump_node(
     }
 }
 
-/// pump until the daemon acks `cookie`; creation errors surface here
-pub(crate) async fn pump_until_done(
-    con: &PwConn,
-    node: &Rc<RefCell<SourceNode>>,
-    cookie: i32,
-) -> Result<(), PwError> {
-    loop {
-        let mut f = con.recv().await?;
-        if node.borrow_mut().handle(&mut f)? {
-            continue;
-        }
-        match (f.id, f.opcode) {
-            (0, EV_CORE_PING) => answer_ping(con, &f.body).await?,
-            (0, EV_CORE_ERROR) => return Err(remote_error(&f.body)),
-            (0, EV_CORE_DONE) => {
-                let mut p = PodParser::new(&f.body);
-                let mut s = p.struct_()?;
-                let _id = s.int()?;
-                if s.int()? == cookie {
-                    return Ok(());
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// `carrot pw-pattern [secs]`: a Video/Source client-node pushing a moving
 /// test pattern - the P1 gate. connect a consumer (helvum/gstreamer/obs)
 /// and watch it move
@@ -369,6 +342,7 @@ async fn pattern_run(eng: &Rc<Engine>, ring: &Rc<Ring>, secs: u64) -> Result<u64
     let started = crate::util::Time::now();
     let frame_ns = 1_000_000_000 / fps as u64;
     let mut announced = false;
+    let mut bound = false;
     let mut tick = 0u64;
     loop {
         let now = crate::util::Time::now().nsec();
@@ -377,6 +351,13 @@ async fn pattern_run(eng: &Rc<Engine>, ring: &Rc<Ring>, secs: u64) -> Result<u64
         }
         if let Some(e) = failed.borrow_mut().take() {
             return Err(e);
+        }
+        if !bound {
+            if let Some(g) = node.borrow().bound_global {
+                let ms = now.saturating_sub(started.nsec()) / 1_000_000;
+                println!("pw-pattern: bound as global {g} after {ms}ms");
+                bound = true;
+            }
         }
         let _ = ring.timeout(crate::util::Time::from_nsec(now + frame_ns)).await;
         let mut n = node.borrow_mut();

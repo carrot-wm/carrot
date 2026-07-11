@@ -13,7 +13,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 const PROXY_ID: u32 = 2;
-const COOKIE: i32 = 0x0ca5;
+/// the daemon binds the global asynchronously (permissions and all);
+/// this is how long a cast waits for its BoundId
+const BIND_WAIT_NS: u64 = 5_000_000_000;
 
 /// what a session's token restores; windows match by ident in-session and
 /// by app id + title across restarts (idents reset with the compositor).
@@ -78,24 +80,37 @@ pub async fn start(
     let node = Rc::new(RefCell::new(
         SourceNode::create(con.clone(), PROXY_ID, width, height, fps).await?,
     ));
-    con.sync(COOKIE).await?;
-    crate::pipewire::pump_until_done(&con, &node, COOKIE).await?;
-    let node_id = node
-        .borrow()
-        .bound_global
-        .ok_or(PwError::Env("the daemon never bound the node"))?;
     let dead = Rc::new(Cell::new(false));
+    let failed: Rc<RefCell<Option<PwError>>> = Rc::new(RefCell::new(None));
     let pump = state.eng.spawn("cast pump", {
         let con = con.clone();
         let node = node.clone();
         let dead = dead.clone();
+        let failed = failed.clone();
         async move {
             if let Err(e) = crate::pipewire::pump_node(&con, &node).await {
                 eprintln!("carrot: cast: {e}");
+                *failed.borrow_mut() = Some(e);
             }
             dead.set(true);
         }
     });
+    // BoundId lands whenever the export completes, not inside our sync
+    // round-trip; the pump collects it while we poll
+    let deadline = Time::now().nsec() + BIND_WAIT_NS;
+    let node_id = loop {
+        if let Some(id) = node.borrow().bound_global {
+            break id;
+        }
+        if dead.get() {
+            return Err(failed.borrow_mut().take().unwrap_or(PwError::Closed));
+        }
+        let now = Time::now().nsec();
+        if now >= deadline {
+            return Err(PwError::Env("the daemon never bound the node"));
+        }
+        let _ = state.ring.timeout(Time::from_nsec(now + 50_000_000)).await;
+    };
     let resize_req: Rc<AsyncQueue<(u32, u32)>> = Rc::new(AsyncQueue::default());
     let resizer = state.eng.spawn("cast resize", {
         let node = node.clone();
