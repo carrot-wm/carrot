@@ -49,14 +49,21 @@ pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
         let _ = sin.write_all(list.as_bytes());
     }
     let out: Rc<OwnedFd> = Rc::new(child.stdout.take()?.into());
+    let pid = child.id();
     let child = Rc::new(RefCell::new(child));
     let watchdog = state.eng.spawn("picker watchdog", {
-        let child = child.clone();
         let ring = state.ring.clone();
         async move {
             let deadline = Time::from_nsec(Time::now().nsec() + ANSWER_NS);
             if ring.timeout(deadline).await.is_ok() {
-                let _ = child.borrow_mut().kill();
+                // the picker runs in its own session (setsid): take the
+                // whole group down, a shell wrapper's menu included
+                if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                    let _ = rustix::process::kill_process_group(
+                        pid,
+                        rustix::process::Signal::KILL,
+                    );
+                }
             }
         }
     });
