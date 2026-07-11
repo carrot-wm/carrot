@@ -35,6 +35,7 @@ mod dbus;
 mod ei;
 mod input;
 mod ipc;
+mod pipewire;
 mod sighand;
 mod tree;
 mod xwayland;
@@ -103,6 +104,9 @@ fn main() {
     }
     if std::env::args().any(|a| a == "xparsnip-probe") {
         std::process::exit(xparsnip::probe());
+    }
+    if std::env::args().any(|a| a == "pw-probe") {
+        std::process::exit(pipewire::probe());
     }
 
     if let Err(e) = run() {
