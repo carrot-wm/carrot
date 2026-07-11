@@ -398,6 +398,7 @@ fn parse_general(node: &KdlNode, src: &str, cfg: &mut Config) -> Result<(), Stri
                 }
             }
             "allow-tearing" => cfg.allow_tearing = need_bool(c, src)?,
+            "picker" => cfg.picker = Some(need_str(c, src)?),
             "software-cursor" => cfg.software_cursor = need_bool(c, src)?,
             other => return Err(at(c, src, &format!("unknown general key \"{other}\""))),
         }

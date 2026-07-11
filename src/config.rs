@@ -227,6 +227,8 @@ pub struct Config {
     pub submaps: Vec<(String, Vec<Bind>)>,
     /// named scratchpads; the command spawns on first toggle
     pub specials: Vec<(String, Option<String>)>,
+    /// the screencast consent picker; unset casts the focused target
+    pub picker: Option<String>,
 }
 
 // mod bits match the seat's exact-set matcher
@@ -264,6 +266,7 @@ impl Default for Config {
             remaps: Vec::new(),
             submaps: Vec::new(),
             specials: Vec::new(),
+            picker: None,
         }
     }
 }
@@ -637,6 +640,13 @@ mod tests {
         assert!(c.binds.is_empty());
         assert!(c.rules.is_empty() && c.outputs.is_empty() && c.devices.is_empty());
         assert!(c.remaps.is_empty());
+        assert!(c.picker.is_none());
+    }
+
+    #[test]
+    fn picker_command_parses() {
+        let cfg = parse("general {\n    picker \"fuzzel-pick\"\n}\n").unwrap();
+        assert_eq!(cfg.picker.as_deref(), Some("fuzzel-pick"));
     }
 
     #[test]

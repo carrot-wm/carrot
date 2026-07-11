@@ -26,6 +26,8 @@ pub enum RestoreData {
 pub enum Pick {
     Monitor,
     Window,
+    /// a picker choice; the window must still exist
+    Ident(u64),
     Restored(RestoreData),
 }
 
@@ -131,6 +133,11 @@ fn resolve(state: &Rc<State>, pick: Pick) -> Result<(Source, u32, u32, u32, (i32
                 .ok_or(PwError::Env("no focused window to cast"))?;
             window_source(state, win)
         }
+        Pick::Ident(ident) => {
+            let win = window_by_ident(state, ident)
+                .ok_or(PwError::Env("the chosen window is gone"))?;
+            window_source(state, win)
+        }
         Pick::Restored(RestoreData::Window { ident, app_id, title }) => {
             // a stale token falls back to the focused window rather than
             // failing the whole cast; the picker will own this choice
@@ -198,16 +205,29 @@ fn refresh(out: &Rc<crate::output::Output>) -> u32 {
         .max(1)
 }
 
+fn window_by_ident(state: &Rc<State>, ident: u64) -> Option<Rc<Window>> {
+    let mut hit = None;
+    for ws in state.workspaces.borrow().iter() {
+        ws.for_each(|w| {
+            if w.ident == ident {
+                hit = Some(w.clone());
+            }
+        });
+    }
+    hit
+}
+
 fn find_window(state: &Rc<State>, ident: u64, app_id: &str, title: &str) -> Option<Rc<Window>> {
-    let mut by_ident = None;
+    if let Some(w) = window_by_ident(state, ident) {
+        return Some(w);
+    }
+    // idents reset with the compositor; match identity by app id, narrowed
+    // by title when it still fits
     let mut by_both = None;
     let mut by_app = None;
     for ws in state.workspaces.borrow().iter() {
         ws.for_each(|w| {
-            if w.ident == ident {
-                by_ident = Some(w.clone());
-            }
-            if w.app_id() == app_id {
+            if w.app_id() == app_id && !app_id.is_empty() {
                 if w.title() == title && by_both.is_none() {
                     by_both = Some(w.clone());
                 }
@@ -217,7 +237,7 @@ fn find_window(state: &Rc<State>, ident: u64, app_id: &str, title: &str) -> Opti
             }
         });
     }
-    by_ident.or(by_both).or(by_app)
+    by_both.or(by_app)
 }
 
 /// the workspace the presented output currently shows

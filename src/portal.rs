@@ -5,6 +5,7 @@
 // global id once the daemon binds it.
 
 pub mod cast;
+mod picker;
 
 use crate::dbus::{DbusConn, DbusError, MethodCall, MsgBuilder};
 use crate::engine::{Engine, SpawnedFuture};
@@ -27,6 +28,7 @@ const CURSOR_EMBEDDED: u32 = 2;
 // version 4: restore_token/persist_mode understood
 const VERSION: u32 = 4;
 // portal response codes
+const R_CANCELLED: u32 = 1;
 const R_ENDED: u32 = 2;
 
 struct Session {
@@ -209,7 +211,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                 let mut rd = call.rd();
                 let _request = rd.str().unwrap_or_default();
                 let session = rd.str().unwrap_or_default();
-                let (cursor, persist, pick) = {
+                let (cursor, persist, types, restore) = {
                     let map = sessions.borrow();
                     let Some(s) = map.get(&session) else {
                         drop(map);
@@ -220,15 +222,14 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                         );
                         return;
                     };
-                    let pick = if let Some(r) = s.restore.borrow().clone() {
-                        cast::Pick::Restored(r)
-                    } else if s.types.get() == SOURCE_WINDOW {
-                        cast::Pick::Window
-                    } else {
-                        cast::Pick::Monitor
-                    };
-                    (s.cursor_mode.get() == CURSOR_EMBEDDED, s.persist.get(), pick)
+                    (
+                        s.cursor_mode.get() == CURSOR_EMBEDDED,
+                        s.persist.get(),
+                        s.types.get(),
+                        s.restore.borrow().clone(),
+                    )
                 };
+                let picker_cmd = state.config.borrow().picker.clone();
                 // the node id comes from the daemon; the cast task replies
                 let (serial, dest) = (call.serial, call.sender.clone());
                 let me = me.clone();
@@ -236,6 +237,25 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                 let toks = tokens.clone();
                 let sess = session.clone();
                 let task = state.eng.spawn("cast start", async move {
+                    let pick = if let Some(r) = restore {
+                        // a token is prior consent; it skips the picker
+                        cast::Pick::Restored(r)
+                    } else if let Some(cmd) = &picker_cmd {
+                        match picker::pick(&st, cmd, types).await {
+                            Some(picker::Choice::Output(name)) => {
+                                cast::Pick::Restored(cast::RestoreData::Output(name))
+                            }
+                            Some(picker::Choice::Window(ident)) => cast::Pick::Ident(ident),
+                            None => {
+                                response_to(&me, serial, &dest, R_CANCELLED);
+                                return;
+                            }
+                        }
+                    } else if types == SOURCE_WINDOW {
+                        cast::Pick::Window
+                    } else {
+                        cast::Pick::Monitor
+                    };
                     match cast::start(&st, sess, cursor, pick).await {
                         Ok(cast) => {
                             let token = (persist > 0).then(|| {

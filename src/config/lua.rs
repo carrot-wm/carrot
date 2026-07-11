@@ -204,6 +204,7 @@ fn general(v: &Value, cfg: &mut Config) -> Result<(), String> {
             "allow_tearing" => cfg.allow_tearing = need_bool(&v, &key)?,
             "software_cursor" => cfg.software_cursor = need_bool(&v, &key)?,
             "float_above_fullscreen" => cfg.float_above_fullscreen = need_bool(&v, &key)?,
+            "picker" => cfg.picker = Some(need_str(&v, &key)?),
             "layout" => {
                 cfg.layout = need_str(&v, &key)?;
                 if cfg.layout != "dwindle" {
