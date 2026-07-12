@@ -14,8 +14,9 @@
 // }
 
 use super::{
-    Action, Bind, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule, LayoutMode, ModKey,
-    Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch, SpawnCfg, Vrr, WindowRule,
+    Action, Bind, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
+    LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch, SpawnCfg,
+    Vrr, WindowRule,
 };
 use piccolo::{Closure, Executor, Lua, Table, Value};
 
@@ -348,8 +349,58 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
             "mode" => {
                 l.mode = match need_str(&v, &key)?.as_str() {
                     "dwindle" => LayoutMode::Dwindle,
-                    _ => return Err("mode is \"dwindle\"".to_string()),
+                    "scrolling" => LayoutMode::Scrolling,
+                    _ => return Err("mode is \"dwindle\" or \"scrolling\"".to_string()),
                 };
+            }
+            "scrolling" => {
+                for (k, v) in table(&v, "scrolling")?.iter() {
+                    let key = vstr(&k).ok_or("scrolling keys must be strings")?;
+                    match key.as_str() {
+                        "preset_widths" => {
+                            let ws: Vec<f64> = indexed_entries(&v, &key)?
+                                .iter()
+                                .filter_map(vnum)
+                                .collect();
+                            if ws.is_empty() || ws.iter().any(|w| !(0.05..=1.0).contains(w)) {
+                                return Err(
+                                    "preset_widths is one or more proportions in 0.05..1".into()
+                                );
+                            }
+                            l.scrolling.preset_widths = ws;
+                        }
+                        "default_width" => {
+                            l.scrolling.default_width = ColWidthCfg::Prop(super::f64_in(
+                                need_num(&v, &key)?,
+                                "default_width",
+                                0.05,
+                                1.0,
+                            )?);
+                        }
+                        "default_width_px" => {
+                            l.scrolling.default_width = ColWidthCfg::FixedPx(super::int_in(
+                                need_int(&v, &key)?,
+                                "default_width_px",
+                                50,
+                                100_000,
+                            )?
+                                as i32);
+                        }
+                        "center_focus" => {
+                            l.scrolling.center_focus = match need_str(&v, &key)?.as_str() {
+                                "never" => CenterFocus::Never,
+                                "always" => CenterFocus::Always,
+                                "on-overflow" => CenterFocus::OnOverflow,
+                                _ => {
+                                    return Err(
+                                        "center_focus is never, always or on-overflow".into()
+                                    );
+                                }
+                            };
+                        }
+                        other => return Err(format!("unknown scrolling key `{other}`")),
+                    }
+                }
             }
             "gaps_in" => l.gaps_in = super::int_in(need_int(&v, &key)?, "gaps_in", 0, 500)? as i32,
             "gaps_out" => {

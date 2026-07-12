@@ -112,6 +112,38 @@ pub struct InputCfg {
 pub enum LayoutMode {
     #[default]
     Dwindle,
+    Scrolling,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ColWidthCfg {
+    Prop(f64),
+    FixedPx(i32),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum CenterFocus {
+    #[default]
+    Never,
+    Always,
+    OnOverflow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollCfg {
+    pub preset_widths: Vec<f64>,
+    pub default_width: ColWidthCfg,
+    pub center_focus: CenterFocus,
+}
+
+impl Default for ScrollCfg {
+    fn default() -> ScrollCfg {
+        ScrollCfg {
+            preset_widths: vec![1.0 / 3.0, 0.5, 2.0 / 3.0],
+            default_width: ColWidthCfg::Prop(0.5),
+            center_focus: CenterFocus::Never,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -128,6 +160,7 @@ pub struct LayoutCfg {
     pub gaps_out: i32,
     pub border: BorderCfg,
     pub float_above_fullscreen: bool,
+    pub scrolling: ScrollCfg,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]

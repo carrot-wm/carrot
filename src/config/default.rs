@@ -55,6 +55,12 @@ layout {
         inactive-color "#585b70"
     }
     // float-above-fullscreen
+    // scrolling layout tuning (mode "scrolling")
+    // scrolling {
+    //     preset-widths 0.333 0.5 0.667
+    //     default-width 0.5
+    //     center-focus "never"
+    // }
 }
 
 cursor {
