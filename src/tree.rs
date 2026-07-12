@@ -278,6 +278,7 @@ impl Window {
             self.anims.borrow_mut().move_ = None;
             return;
         };
+        state.anim_clock.touch();
         let now = state.anim_clock.now();
         let mut anims = self.anims.borrow_mut();
         // retarget folds the current visual offset into the new from-delta
@@ -1070,18 +1071,19 @@ mod tests {
         let base = crate::shell::xdg::tests::mk_base(&client, 90);
         let (_s, _xdg, tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 91, 92, 93);
         let win = Rc::new(Window::new(&state, WindowKind::Xdg(tl)));
-        state.anim_clock.freeze(0);
         win.set_rect_animated(&state, Rect::new_sized_saturating(0, 0, 100, 100));
         // first placement never animates - there is no previous rect
         assert!(win.anims.borrow().move_.is_none());
         win.set_rect_animated(&state, Rect::new_sized_saturating(200, 0, 100, 100));
         assert!(win.anims.borrow().move_.is_some());
-        // mid-flight the visual sits between the old and new x
-        state.anim_clock.freeze(30_000_000);
+        // mid-flight the visual sits between the old and new x (the start
+        // stamp is real monotonic time - anims begin in event context)
+        let t0 = state.anim_clock.now();
+        state.anim_clock.freeze(t0 + 30_000_000);
         let vr = win.visual_rect(&state);
         assert!(vr.x1 > 0 && vr.x1 < 200, "got x1={}", vr.x1);
         // far future: settled on the target, and the anim prunes away
-        state.anim_clock.freeze(10_000_000_000);
+        state.anim_clock.freeze(t0 + 10_000_000_000);
         assert_eq!(win.visual_rect(&state).x1, 200);
         assert!(!win.anims_live(state.anim_clock.now()));
         assert!(win.anims.borrow().move_.is_none());

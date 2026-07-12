@@ -166,6 +166,12 @@ impl AnimClock {
     pub fn freeze(&self, ns: u64) {
         self.now_ns.set(ns);
     }
+    /// forward-only bump to real monotonic time; anim starts happen in
+    /// event context where the compose-frozen stamp can be seconds stale
+    pub fn touch(&self) {
+        let now = crate::util::Time::now().nsec();
+        self.now_ns.set(self.now_ns.get().max(now));
+    }
     pub fn now(&self) -> u64 {
         self.now_ns.get()
     }
