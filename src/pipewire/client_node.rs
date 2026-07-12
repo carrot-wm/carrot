@@ -91,6 +91,9 @@ const META_HEADER: u32 = 1;
 const META_HEADER_BYTES: u32 = 32;
 const DATA_MEM_PTR: u32 = 1;
 const DATA_MEM_FD: u32 = 2;
+/// what the daemon actually sends in UseBuffers: it imports our requested
+/// MemFd into the pool (AddMem) and rewrites the data as a pool id
+const DATA_MEM_ID: u32 = 4;
 const IO_BUFFERS: u32 = 1;
 pub const STATUS_HAVE_DATA: u32 = 1 << 1;
 const ACTIVATION_TRIGGERED: u32 = 1;
@@ -475,7 +478,7 @@ impl SourceNode {
                 if ty == DATA_MEM_PTR {
                     data = mem.ptr(data_id as usize);
                     data_len = maxsize as usize;
-                } else if ty == DATA_MEM_FD {
+                } else if ty == DATA_MEM_FD || ty == DATA_MEM_ID {
                     let dm = self.pool.map(data_id, mapoffset, maxsize)?;
                     data = dm.ptr(0);
                     data_len = maxsize as usize;
