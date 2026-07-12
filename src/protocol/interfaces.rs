@@ -500,6 +500,20 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface wp_presentation, version = 2;
+    request destroy();
+    request feedback(surface: object, callback: new_id);
+    event clock_id(clk_id: uint);
+}
+
+crate::wl_protocol! {
+    interface wp_presentation_feedback, version = 2;
+    event sync_output(output: object);
+    event presented(tv_sec_hi: uint, tv_sec_lo: uint, tv_nsec: uint, refresh: uint, seq_hi: uint, seq_lo: uint, flags: uint);
+    event discarded();
+}
+
+crate::wl_protocol! {
     interface zxdg_decoration_manager_v1, version = 1;
     request destroy();
     request get_toplevel_decoration(id: new_id, toplevel: object);
@@ -845,6 +859,12 @@ mod tests {
         assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
         assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
         assert_eq!(wp_tearing_control_v1::destroy::OPCODE, 1);
+        assert_eq!(wp_presentation::destroy::OPCODE, 0);
+        assert_eq!(wp_presentation::feedback::OPCODE, 1);
+        assert_eq!(wp_presentation::clock_id::OPCODE, 0);
+        assert_eq!(wp_presentation_feedback::sync_output::OPCODE, 0);
+        assert_eq!(wp_presentation_feedback::presented::OPCODE, 1);
+        assert_eq!(wp_presentation_feedback::discarded::OPCODE, 2);
         assert_eq!(xwayland_shell_v1::get_xwayland_surface::OPCODE, 1);
         assert_eq!(xwayland_surface_v1::set_serial::OPCODE, 0);
         assert_eq!(xwayland_surface_v1::destroy::OPCODE, 1);
