@@ -5,6 +5,7 @@
 
 pub mod dwindle;
 pub mod float;
+pub mod layout;
 pub mod scrolling;
 pub mod workspace;
 
@@ -397,7 +398,9 @@ impl Window {
 pub fn active(state: &Rc<State>) -> Rc<Workspace> {
     let mut list = state.workspaces.borrow_mut();
     if list.is_empty() {
-        list.push(Rc::new(Workspace::default()));
+        let w = Workspace::default();
+        w.tiling.set_mode_empty(state.config.borrow().layout.mode);
+        list.push(Rc::new(w));
     }
     let idx = state.active_ws.get().min(list.len() - 1);
     list[idx].clone()
@@ -412,6 +415,7 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
         while list.len() <= idx {
             let w = Workspace::default();
             w.output.set(state.focused_output.get());
+            w.tiling.set_mode_empty(state.config.borrow().layout.mode);
             list.push(Rc::new(w));
         }
     }
@@ -455,9 +459,49 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
 
 /// scrolling workspaces own the horizontal axis; any of them forces the
 /// workspace stack vertical. an all-dwindle session slides horizontally
-pub fn ws_axis_vertical(_state: &Rc<State>) -> bool {
-    // no scrolling layout mode exists yet
-    false
+pub fn ws_axis_vertical(state: &Rc<State>) -> bool {
+    state
+        .workspaces
+        .borrow()
+        .iter()
+        .any(|w| w.tiling.mode() == crate::config::LayoutMode::Scrolling)
+}
+
+/// switch a workspace's tiling mode, re-tiling its windows in order; the
+/// move animations carry the reshuffle
+pub fn set_layout(state: &Rc<State>, ws: &Rc<Workspace>, mode: crate::config::LayoutMode) {
+    if ws.tiling.mode() == mode {
+        return;
+    }
+    let cfg = state.config.borrow().clone();
+    let wins: Vec<Rc<Window>> = match ws.tiling.mode() {
+        crate::config::LayoutMode::Dwindle => {
+            let mut v = Vec::new();
+            ws.tiling.dwindle.for_each(|w| v.push(w.clone()));
+            for w in &v {
+                ws.tiling.dwindle.remove(w);
+            }
+            v
+        }
+        crate::config::LayoutMode::Scrolling => ws.tiling.strip.take_all(),
+    };
+    ws.tiling.set_mode_empty(mode);
+    let (cx, cy) = cursor_pos(state);
+    for w in &wins {
+        match mode {
+            crate::config::LayoutMode::Dwindle => ws.tiling.dwindle.insert(w, cx, cy),
+            crate::config::LayoutMode::Scrolling => {
+                ws.tiling.strip.insert_ordered(w, &cfg.layout.scrolling)
+            }
+        }
+    }
+    if mode == crate::config::LayoutMode::Scrolling {
+        if let Some(first) = wins.first() {
+            ws.tiling.strip.note_focus(first);
+        }
+    }
+    relayout(state, ws);
+    state.damage.trigger();
 }
 
 pub(crate) fn cursor_pos(state: &Rc<State>) -> (i32, i32) {
@@ -501,14 +545,16 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
         while list.len() <= n {
             let w = Workspace::default();
             w.output.set(state.focused_output.get());
+            w.tiling.set_mode_empty(state.config.borrow().layout.mode);
             list.push(Rc::new(w));
         }
     }
     let target = state.workspaces.borrow()[n].clone();
     let area = tiling_area_for(state, &target);
+    let scfg = state.config.borrow().layout.scrolling.clone();
     target
         .tiling
-        .insert(&win, (area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2);
+        .insert(&win, (area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2, &scfg);
     if ws.output.get() != target.output.get() {
         send_surface_output(state, &win.surface(), ws.output.get(), false);
         send_surface_output(state, &win.surface(), target.output.get(), true);
@@ -662,6 +708,13 @@ pub(crate) fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {
     if crate::shell::layer::kb_lock(state).is_some() {
         return;
     }
+    if let Some(w) = win {
+        if !w.floating.get() {
+            if let Some(ws) = workspace_of(state, w) {
+                ws.tiling.note_focus_win(w);
+            }
+        }
+    }
     let seat = state.seat.borrow().clone();
     if let Some(seat) = seat {
         // picking a window is selecting outside any popup grab chain
@@ -731,7 +784,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
         fs.set_fullscreen_state(false);
     }
     let (cx, cy) = cursor_pos(state);
-    ws.tiling.insert(win, cx, cy);
+    ws.tiling.insert(win, cx, cy, &cfg.layout.scrolling);
     relayout(state, &ws);
     if fx.floating == Some(true) && !win.floating.get() {
         float_into(state, &ws, win, fx.size, fx.center);
@@ -982,19 +1035,33 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
     }
     let area = tiling_area_for(state, ws);
     let cfg = state.config.borrow().clone();
-    ws.tiling.recalculate(area);
-    ws.tiling.for_each(|win| {
-        let raw = win
-            .node
-            .borrow()
-            .upgrade()
-            .map(|n| n.rect.get())
-            .unwrap_or_default();
-        win.set_rect_animated(state, apply_gaps(raw, area, &cfg));
-        if !win.fullscreen.get() {
-            win.configure_rect();
+    match ws.tiling.mode() {
+        crate::config::LayoutMode::Dwindle => {
+            ws.tiling.dwindle.recalculate(area);
+            ws.tiling.dwindle.for_each(|win| {
+                let raw = win
+                    .node
+                    .borrow()
+                    .upgrade()
+                    .map(|n| n.rect.get())
+                    .unwrap_or_default();
+                win.set_rect_animated(state, apply_gaps(raw, area, &cfg));
+                if !win.fullscreen.get() {
+                    win.configure_rect();
+                }
+            });
         }
-    });
+        crate::config::LayoutMode::Scrolling => {
+            let old_view = ws.tiling.strip.view_px();
+            for (win, raw) in ws.tiling.strip.layout(area, &cfg.layout.scrolling) {
+                win.set_rect_animated(state, apply_gaps(raw, area, &cfg));
+                if !win.fullscreen.get() {
+                    win.configure_rect();
+                }
+            }
+            ws.tiling.strip.animate_view(state, old_view);
+        }
+    }
 }
 
 // -- hit testing --
@@ -1197,6 +1264,39 @@ mod tests {
         assert_eq!(win.visual_rect(&state).x1, 200);
         assert!(!win.anims_live(state.anim_clock.now()));
         assert!(win.anims.borrow().move_.is_none());
+    }
+
+    #[test]
+    fn layout_conversion_roundtrip_preserves_windows() {
+        let (state, client) = crate::client::test_utils::test_client();
+        let base = crate::shell::xdg::tests::mk_base(&client, 400);
+        let ws = active(&state);
+        let mut wins = Vec::new();
+        for i in 0..3u32 {
+            let (_s, _x, tl) = crate::shell::xdg::tests::mk_toplevel(
+                &client,
+                &base,
+                401 + i * 3,
+                402 + i * 3,
+                403 + i * 3,
+            );
+            let w = Rc::new(Window::new(&state, WindowKind::Xdg(tl)));
+            ws.tiling.insert(&w, 0, 0, &state.config.borrow().layout.scrolling);
+            wins.push(w);
+        }
+        assert_eq!(ws.tiling.mode(), crate::config::LayoutMode::Dwindle);
+        assert!(!ws_axis_vertical(&state));
+        set_layout(&state, &ws, crate::config::LayoutMode::Scrolling);
+        assert_eq!(ws.tiling.mode(), crate::config::LayoutMode::Scrolling);
+        assert!(ws_axis_vertical(&state), "one scrolling workspace flips the axis");
+        let mut n = 0;
+        ws.tiling.for_each(|_| n += 1);
+        assert_eq!(n, 3, "every window survives the conversion");
+        set_layout(&state, &ws, crate::config::LayoutMode::Dwindle);
+        let mut n = 0;
+        ws.tiling.for_each(|_| n += 1);
+        assert_eq!(n, 3);
+        assert!(!ws_axis_vertical(&state));
     }
 
     #[test]

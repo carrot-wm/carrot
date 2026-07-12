@@ -26,7 +26,8 @@ pub fn toggle_floating(state: &Rc<State>, win: &Rc<Window>) {
         ws.remove_float(win);
         win.floating.set(false);
         let (cx, cy) = super::cursor_pos(state);
-        ws.tiling.insert(win, cx, cy);
+        let scfg = state.config.borrow().layout.scrolling.clone();
+        ws.tiling.insert(win, cx, cy, &scfg);
     }
     super::relayout(state, &ws);
     state.damage.trigger();
