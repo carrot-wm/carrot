@@ -141,6 +141,8 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             linked: Cell::new(false),
             closed: Cell::new(false),
             popups: RefCell::new(Vec::new()),
+            anim: RefCell::new(None),
+            last_batch: RefCell::new((Vec::new(), Vec::new())),
         });
         c.add_client_obj(ls.clone())?;
         *surface.ext.borrow_mut() = Rc::new(LayerExt { ls });
@@ -270,6 +272,13 @@ pub struct LayerSurface {
     linked: Cell<bool>,
     closed: Cell<bool>,
     popups: RefCell<Vec<Rc<super::xdg::XdgPopup>>>,
+    /// the open animation; unmap capture reuses the closing-window path
+    pub anim: RefCell<Option<(crate::anim::Anim, crate::config::Style)>>,
+    /// ops + texture keys from the last compose, for the close capture
+    pub last_batch: RefCell<(
+        Vec<crate::render::renderer::RenderOp>,
+        Vec<(crate::client::ClientId, u64)>,
+    )>,
 }
 
 impl LayerSurface {
@@ -285,6 +294,22 @@ impl LayerSurface {
 
     pub fn mapped(&self) -> bool {
         self.linked.get() && self.surface.mapped.get()
+    }
+
+    /// the edge this surface hangs off, for slide animations; anchored to
+    /// both opposing edges (or neither) means no clear home edge
+    pub fn slide_dir(&self) -> Option<crate::config::Dir> {
+        use crate::config::Dir;
+        let a = self.current.get().anchor;
+        let (top, bottom) = (a & A_TOP != 0, a & A_BOTTOM != 0);
+        let (left, right) = (a & A_LEFT != 0, a & A_RIGHT != 0);
+        match (top, bottom, left, right) {
+            (true, false, ..) => Some(Dir::Up),
+            (false, true, ..) => Some(Dir::Down),
+            (.., true, false) => Some(Dir::Left),
+            (.., false, true) => Some(Dir::Right),
+            _ => None,
+        }
     }
 
     fn schedule_configure(&self) {
@@ -615,8 +640,10 @@ impl SurfaceExt for LayerExt {
             }
             // the enter event tells the client which output shows it (scale, geometry)
             crate::tree::send_surface_output(&state, &ls.surface, ls.output.get(), true);
+            start_layer_open(&state, &ls);
             state.damage.trigger();
         } else if !mapped && ls.linked.get() {
+            capture_layer_close(&state, &ls);
             ls.unlink(&state);
             ls.reset_after_unmap();
         } else if ls.linked.get() {
@@ -624,6 +651,51 @@ impl SurfaceExt for LayerExt {
             arrange(&state);
             apply_kb_lock(&state);
         }
+    }
+}
+
+fn start_layer_open(state: &Rc<State>, ls: &Rc<LayerSurface>) {
+    let cfg = state.config.borrow().clone();
+    let Some(motion) = cfg.animations.motion(crate::config::AnimKind::LayerOpen) else {
+        *ls.anim.borrow_mut() = None;
+        return;
+    };
+    let style = match cfg.animations.layer_open.style.clone() {
+        crate::config::Style::Default => crate::config::Style::Slide { dir: None },
+        s => s,
+    };
+    state.anim_clock.touch();
+    *ls.anim.borrow_mut() = Some((
+        crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 0.0, 1.0, 0.0),
+        style,
+    ));
+}
+
+fn capture_layer_close(state: &Rc<State>, ls: &Rc<LayerSurface>) {
+    let cfg = state.config.borrow().clone();
+    let Some(motion) = cfg.animations.motion(crate::config::AnimKind::LayerClose) else {
+        return;
+    };
+    let out = state
+        .display
+        .borrow()
+        .as_ref()
+        .and_then(|d| d.outputs.borrow().get(ls.output.get()).cloned());
+    let Some(out) = out else { return };
+    let style = match cfg.animations.layer_close.style.clone() {
+        crate::config::Style::Default => crate::config::Style::Slide { dir: ls.slide_dir() },
+        crate::config::Style::Slide { dir: None } => {
+            crate::config::Style::Slide { dir: ls.slide_dir() }
+        }
+        s => s,
+    };
+    state.anim_clock.touch();
+    let anim =
+        crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 1.0, 0.0, 0.0);
+    let batch = std::mem::take(&mut *ls.last_batch.borrow_mut());
+    if let Some(cw) = crate::output::seize_batch(&out, batch, ls.rect.get(), anim, style) {
+        crate::output::push_closing_layer(&out, cw);
+        state.damage.trigger();
     }
 }
 

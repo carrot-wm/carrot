@@ -335,6 +335,9 @@ pub fn lerp_oklab(a: [f32; 4], b: [f32; 4], t: f64) -> [f32; 4] {
     if t == 0.0 {
         return a;
     }
+    if t == 1.0 {
+        return b;
+    }
     let (la, lb) = (to_oklab(a), to_oklab(b));
     let lab = [
         la[0] + (lb[0] - la[0]) * t,

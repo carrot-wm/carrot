@@ -341,6 +341,40 @@ impl Window {
         self.anims.borrow_mut().move_ = None;
     }
 
+    /// the border color this frame, easing in oklab toward `want`
+    pub fn border_color_now(&self, state: &State, want: [f32; 4]) -> [f32; 4] {
+        let now = state.anim_clock.now();
+        let cfg = state.config.borrow().clone();
+        let mut m = self.anims.borrow_mut();
+        let Some(b) = &mut m.border else {
+            // first paint settles instantly; only changes animate
+            m.border = Some(BorderAnim {
+                from: want,
+                to: want,
+                anim: crate::anim::Anim::ease(&state.anim_clock, 1.0, 1.0, 0, crate::anim::Curve::Linear),
+            });
+            return want;
+        };
+        if b.to != want {
+            match cfg.animations.motion(crate::config::AnimKind::BorderColor) {
+                Some(motion) => {
+                    // restart from the color currently on glass
+                    let cur = crate::anim::lerp_oklab(b.from, b.to, b.anim.clamped_value(now));
+                    state.anim_clock.touch();
+                    b.from = cur;
+                    b.to = want;
+                    b.anim =
+                        crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 0.0, 1.0, 0.0);
+                }
+                None => {
+                    b.from = want;
+                    b.to = want;
+                }
+            }
+        }
+        crate::anim::lerp_oklab(b.from, b.to, b.anim.clamped_value(now))
+    }
+
     pub fn configure_rect(&self) {
         let r = self.rect.get();
         match &self.kind {
@@ -1162,6 +1196,28 @@ mod tests {
         assert_eq!(win.visual_rect(&state).x1, 200);
         assert!(!win.anims_live(state.anim_clock.now()));
         assert!(win.anims.borrow().move_.is_none());
+    }
+
+    #[test]
+    fn border_color_eases_between_targets() {
+        let (state, client) = crate::client::test_utils::test_client();
+        let base = crate::shell::xdg::tests::mk_base(&client, 80);
+        let (_s, _xdg, tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 81, 82, 83);
+        let win = Rc::new(Window::new(&state, WindowKind::Xdg(tl)));
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        // first paint settles instantly
+        assert_eq!(win.border_color_now(&state, red), red);
+        // a new target starts easing: shortly after, neither endpoint
+        win.border_color_now(&state, blue);
+        let t0 = state.anim_clock.now();
+        state.anim_clock.freeze(t0 + 50_000_000);
+        let mid = win.border_color_now(&state, blue);
+        assert_ne!(mid, red);
+        assert_ne!(mid, blue);
+        // far future: settled on the new target
+        state.anim_clock.freeze(t0 + 10_000_000_000);
+        assert_eq!(win.border_color_now(&state, blue), blue);
     }
 
     #[test]

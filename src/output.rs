@@ -351,6 +351,8 @@ pub struct Output {
     pub anim_pending: Cell<bool>,
     /// an in-flight workspace switch; compose draws both scenes offset
     pub ws_switch: RefCell<Option<WsSwitch>>,
+    /// unmapped layer surfaces still animating out
+    pub closing_layers: RefCell<Vec<ClosingWindow>>,
 }
 
 #[derive(Clone)]
@@ -1485,6 +1487,7 @@ fn init_output(
         cursor_gen: Cell::new(0),
         anim_pending: Cell::new(false),
         ws_switch: RefCell::new(None),
+        closing_layers: RefCell::new(Vec::new()),
     })
 }
 
@@ -1956,6 +1959,7 @@ fn compose_ops(
     }
     if fs.is_none() {
         draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live);
+        draw_closing_list(state, out, &out.closing_layers, &mut ops);
     }
     draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
     draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
@@ -2092,7 +2096,33 @@ fn draw_layer(
             continue;
         }
         let r = ls.rect.get();
+        let mark = ops.len();
+        let lmark = live.len();
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, ops, live);
+        let anim = ls.anim.borrow().clone();
+        if let Some((a, style)) = anim {
+            use crate::config::Style;
+            let now = state.anim_clock.now();
+            if a.is_done(now) {
+                *ls.anim.borrow_mut() = None;
+            } else {
+                let p = a.clamped_value(now);
+                let (scale, alpha, d) = match &style {
+                    Style::Popin { perc } => {
+                        ((perc + (1.0 - perc) * p) as f32, p as f32, [0.0, 0.0])
+                    }
+                    Style::Fade => (1.0, p as f32, [0.0, 0.0]),
+                    Style::Slide { dir } => {
+                        let dir = dir.or_else(|| ls.slide_dir());
+                        (1.0, 1.0, slide_delta(out, r, dir, 1.0 - p))
+                    }
+                    _ => (1.0, 1.0, [0.0, 0.0]),
+                };
+                apply_batch(&mut ops[mark..], center_ndc(out, r), scale, alpha, d);
+                out.anim_pending.set(true);
+            }
+        }
+        *ls.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
     }
 }
 
@@ -2335,7 +2365,7 @@ fn draw_window(
         out.anim_pending.set(true);
     }
     if !win.fullscreen.get() {
-        let color = match focused {
+        let want = match focused {
             Some(f) => {
                 if Rc::ptr_eq(f, &surface) {
                     cfg.layout.border.active
@@ -2345,6 +2375,7 @@ fn draw_window(
             }
             None => cfg.layout.border.inactive,
         };
+        let color = win.border_color_now(state, want);
         push_borders(out, rect, cfg.layout.border.width, color, ops);
     }
     let geo = win.geometry();
@@ -2381,15 +2412,15 @@ pub struct ClosingWindow {
     pub style: crate::config::Style,
 }
 
-/// seize the window's cached final batch and its textures
-pub fn capture_closing(
+/// wrap a cached final batch, taking ownership of its textures
+pub fn seize_batch(
     out: &Rc<Output>,
-    win: &crate::tree::Window,
+    batch: (Vec<RenderOp>, Vec<(ClientId, u64)>),
     rect: Rect,
     anim: crate::anim::Anim,
     style: crate::config::Style,
 ) -> Option<ClosingWindow> {
-    let (ops, keys) = std::mem::take(&mut *win.last_batch.borrow_mut());
+    let (ops, keys) = batch;
     if ops.is_empty() {
         return None;
     }
@@ -2401,6 +2432,18 @@ pub fn capture_closing(
         }
     }
     Some(ClosingWindow { ops, keep, rect, anim, style })
+}
+
+/// seize the window's cached final batch and its textures
+pub fn capture_closing(
+    out: &Rc<Output>,
+    win: &crate::tree::Window,
+    rect: Rect,
+    anim: crate::anim::Anim,
+    style: crate::config::Style,
+) -> Option<ClosingWindow> {
+    let batch = std::mem::take(&mut *win.last_batch.borrow_mut());
+    seize_batch(out, batch, rect, anim, style)
 }
 
 fn cap_evict(list: &mut Vec<ClosingWindow>) -> Option<ClosingWindow> {
@@ -2419,15 +2462,32 @@ pub fn push_closing(out: &Rc<Output>, ws: &crate::tree::workspace::Workspace, cw
     list.push(cw);
 }
 
+pub fn push_closing_layer(out: &Rc<Output>, cw: ClosingWindow) {
+    let mut list = out.closing_layers.borrow_mut();
+    if let Some(old) = cap_evict(&mut list) {
+        out.retired_tex.borrow_mut().extend(old.keep);
+    }
+    list.push(cw);
+}
+
 fn draw_closings(
     state: &Rc<State>,
     out: &Rc<Output>,
     ws: &crate::tree::workspace::Workspace,
     ops: &mut Vec<RenderOp>,
 ) {
+    draw_closing_list(state, out, &ws.closing, ops);
+}
+
+fn draw_closing_list(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    list: &RefCell<Vec<ClosingWindow>>,
+    ops: &mut Vec<RenderOp>,
+) {
     use crate::config::Style;
     let now = state.anim_clock.now();
-    let mut list = ws.closing.borrow_mut();
+    let mut list = list.borrow_mut();
     let mut i = 0;
     while i < list.len() {
         if list[i].anim.is_done(now) {
