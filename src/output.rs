@@ -677,7 +677,7 @@ pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: boo
     let d = state.display.borrow();
     let out = d.as_ref()?.outputs.borrow().get(out_index)?.clone();
     drop(d);
-    let ops = compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never });
+    let ops = compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never }, None);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -751,6 +751,32 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
         px[d0..d0 + n].copy_from_slice(&full[s0..s0 + n]);
     }
     Some(px)
+}
+
+/// compose a workspace offscreen - shown or not - and read it back at its
+/// assigned output's size. hidden compose never embeds the cursor
+pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
+    let out_slot = state.workspaces.borrow().get(ws_index)?.output.get();
+    let out = {
+        let d = state.display.borrow();
+        let d = d.as_ref()?;
+        let outs = d.outputs.borrow();
+        outs.get(out_slot).cloned().or_else(|| outs.first().cloned())?
+    };
+    let ops = compose_ops(state, &out, CapCursor::Never, Some(ws_index));
+    let mut waits = Vec::new();
+    for fence in out.frame_fences.borrow_mut().drain(..) {
+        if let Ok(sem) = out.renderer.import_wait(fence) {
+            waits.push(sem);
+        }
+    }
+    match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+        Ok(px) => Some(px),
+        Err(e) => {
+            eprintln!("carrot: workspace copy render failed: {e}");
+            None
+        }
+    }
 }
 
 /// output-local full rect + size lookup for the screencopy protocol
@@ -1697,10 +1723,15 @@ enum CapCursor {
 }
 
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
-    compose_ops(state, out, CapCursor::Present)
+    compose_ops(state, out, CapCursor::Present, None)
 }
 
-fn compose_ops(state: &Rc<State>, out: &Rc<Output>, cursor: CapCursor) -> Vec<RenderOp> {
+fn compose_ops(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    cursor: CapCursor,
+    ws_override: Option<usize>,
+) -> Vec<RenderOp> {
     let mut ops = Vec::new();
     let mut live: Vec<(ClientId, u64)> = Vec::new();
     // a locked session shows nothing but the lock surface; an output
@@ -1730,7 +1761,7 @@ fn compose_ops(state: &Rc<State>, out: &Rc<Output>, cursor: CapCursor) -> Vec<Re
     }
     let ws = {
         let list = state.workspaces.borrow();
-        match list.get(out.ws.get()) {
+        match list.get(ws_override.unwrap_or(out.ws.get())) {
             Some(w) => w.clone(),
             None => return ops,
         }
@@ -1793,12 +1824,14 @@ fn compose_ops(state: &Rc<State>, out: &Rc<Output>, cursor: CapCursor) -> Vec<Re
     draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
     draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
     // a drag icon rides the pointer, above everything but the cursor
-    if let Some(seat) = state.seat.borrow().clone() {
-        if let Some(drag) = seat.data.drag() {
-            if let Some(icon) = drag.icon.borrow().clone() {
-                let (dx, dy) = drag.icon_off.get();
-                let (px, py) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
-                draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, &mut ops, &mut live);
+    if ws_override.is_none() {
+        if let Some(seat) = state.seat.borrow().clone() {
+            if let Some(drag) = seat.data.drag() {
+                if let Some(icon) = drag.icon.borrow().clone() {
+                    let (dx, dy) = drag.icon_off.get();
+                    let (px, py) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
+                    draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, &mut ops, &mut live);
+                }
             }
         }
     }
@@ -1806,6 +1839,10 @@ fn compose_ops(state: &Rc<State>, out: &Rc<Output>, cursor: CapCursor) -> Vec<Re
         draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
     }
 
+    // an override composes a side scene; only the present retires textures
+    if ws_override.is_some() {
+        return ops;
+    }
     // textures for gone buffers don't outlive the frame
     let mut textures = out.textures.borrow_mut();
     let stale: Vec<_> = textures
