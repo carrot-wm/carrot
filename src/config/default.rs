@@ -112,6 +112,14 @@ animations {
 // }
 
 binds {
+    // scrolling-layout verbs
+    // Mod+T { set-layout "toggle"; }
+    // Mod+BracketLeft { consume-or-expel-left; }
+    // Mod+BracketRight { consume-or-expel-right; }
+    // Mod+R { cycle-column-width; }
+    // Mod+Shift+R { cycle-column-width-back; }
+    // Mod+W { toggle-full-width; }
+    // Mod+C { center-column; }
     Mod+Return { spawn "foot"; }
     Mod+Q { close-window; }
     Mod+F { toggle-fullscreen; }

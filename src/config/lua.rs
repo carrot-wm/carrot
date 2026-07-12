@@ -15,8 +15,8 @@
 
 use super::{
     Action, Bind, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
-    LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch, SpawnCfg,
-    Vrr, WindowRule,
+    LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch,
+    SetLayoutArg, SpawnCfg, Vrr, WindowRule,
 };
 use piccolo::{Closure, Executor, Lua, Table, Value};
 
@@ -786,6 +786,21 @@ fn action_from(name: &str, args: &[LuaArg]) -> Result<Action, String> {
                 _ => return Err("adjust-split-ratio wants a signed delta".to_string()),
             },
             _ => return Err("adjust-split-ratio wants a signed delta".to_string()),
+        },
+        "consume-or-expel-left" => Action::ConsumeOrExpelLeft,
+        "consume-or-expel-right" => Action::ConsumeOrExpelRight,
+        "cycle-column-width" => Action::CycleColumnWidth,
+        "cycle-column-width-back" => Action::CycleColumnWidthBack,
+        "toggle-full-width" => Action::ToggleFullWidth,
+        "center-column" => Action::CenterColumn,
+        "set-layout" => match args.first() {
+            Some(LuaArg::S(s)) => match s.as_str() {
+                "dwindle" => Action::SetLayout(SetLayoutArg::Dwindle),
+                "scrolling" => Action::SetLayout(SetLayoutArg::Scrolling),
+                "toggle" => Action::SetLayout(SetLayoutArg::Toggle),
+                _ => return Err("set-layout is dwindle, scrolling or toggle".to_string()),
+            },
+            _ => return Err("set-layout is dwindle, scrolling or toggle".to_string()),
         },
         "quit" => Action::Quit,
         other => return Err(format!("unknown action \"{other}\"")),

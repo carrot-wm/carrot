@@ -43,9 +43,25 @@ pub enum Action {
     SwapDir(Dir),
     /// nudge the focused window's parent split; signed fraction of the span
     AdjustSplitRatio(f64),
+    // scrolling-layout verbs; harmless no-ops on a dwindle workspace
+    ConsumeOrExpelLeft,
+    ConsumeOrExpelRight,
+    CycleColumnWidth,
+    CycleColumnWidthBack,
+    ToggleFullWidth,
+    CenterColumn,
+    SetLayout(SetLayoutArg),
     Spawn(Vec<String>),
     SpawnSh(String),
     Quit,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SetLayoutArg {
+    Dwindle,
+    Scrolling,
+    Toggle,
 }
 
 #[derive(Clone, Debug, PartialEq)]
