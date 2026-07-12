@@ -27,8 +27,11 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 - Multi-pass **Kawase blur** with per-window and per-layer control
 - **Drop shadows** with configurable falloff
 - **Rounded corners**, per-window opacity, active/inactive borders
-- **Animations** - custom bezier curves, spring physics, per-property config
-  - Styles: slide, slidefadevert, popin, fade
+- **Animations** - spring physics or easing per animation kind, named custom bezier curves, hot-reloadable
+  - Animated: window open/close/move, workspace switch, layer surfaces, border color (blended in OkLab)
+  - Window styles: popin, fade, slide; workspace styles: slide, slidevert, fade, slidefade, slidefadevert
+  - Per-window `no-anim` and style overrides via window rules
+  - The animation clock samples the moment each frame reaches glass, not when it was drawn
 
 ### Window & Layer Rules
 - Match by class, title, fullscreen state, xwayland, float (regex)
