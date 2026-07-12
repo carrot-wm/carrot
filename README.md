@@ -13,6 +13,10 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 ### Tiling
 - **Dwindle layout** with directional focus, window swapping, and split ratio control
 - **Scrolling layout** - an endless horizontal strip of columns per workspace, scrolled by focus
+  - Per-workspace mode, switchable live with `set-layout` (windows re-tile with animation)
+  - Columns stack windows vertically; consume/expel moves windows between columns
+  - Width presets (cyclable), full-width toggle, fixed widths from mouse resize, center-focus modes
+  - Any scrolling workspace stacks workspaces vertically - workspace switches slide up/down
 - **Window groups** (tabbed) with a styled groupbar
 - **Floating layer** with mouse drag move/resize, centering, and PiP mode
 - Fullscreen (real, bordered, and borderless), pin (visible on all workspaces)

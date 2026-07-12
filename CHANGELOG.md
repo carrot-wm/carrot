@@ -63,3 +63,5 @@
 - Animations (Window Open/Close/Move, Workspace Switch, Layer Surfaces, Border Color)
 - Per-Kind Animation Config (Springs, Easings, Custom Bezier Curves, Styles)
 - Animation Clock Locked to Predicted Presentation Time
+- Scrolling Layout (Per-Workspace Columns, Animated View, Width Presets)
+- Runtime Layout Switching (set-layout, Vertical Workspace Axis Rule)
