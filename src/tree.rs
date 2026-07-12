@@ -154,6 +154,12 @@ pub struct Window {
     /// window-rule `opacity`, multiplied into every sampled quad
     pub rule_opacity: Cell<Option<f32>>,
     pub anims: RefCell<WinAnims>,
+    /// the ops + texture keys this window produced at its last compose;
+    /// the close animation seizes them when the surface goes away
+    pub last_batch: RefCell<(
+        Vec<crate::render::renderer::RenderOp>,
+        Vec<(crate::client::ClientId, u64)>,
+    )>,
 }
 
 // -- window animations: the visuals chasing the target rect --
@@ -190,6 +196,7 @@ impl Window {
             rule_immediate: Cell::new(false),
             rule_opacity: Cell::new(None),
             anims: RefCell::new(WinAnims::default()),
+            last_batch: RefCell::new((Vec::new(), Vec::new())),
         }
     }
 
@@ -760,6 +767,50 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
         }
     }
     let old = win.rect.get();
+    // the close animation seizes the window's last composed batch before
+    // the tree forgets it
+    {
+        let cfg = state.config.borrow().clone();
+        let fx = crate::config::rule_effects(
+            &cfg,
+            &win.app_id(),
+            &win.title(),
+            win.x11_opt().is_some(),
+            false,
+        );
+        if !fx.no_anim && !win.fullscreen.get() {
+            if let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowClose) {
+                let out = state
+                    .display
+                    .borrow()
+                    .as_ref()
+                    .and_then(|d| d.outputs.borrow().get(ws.output.get()).cloned());
+                if let Some(out) = out {
+                    state.anim_clock.touch();
+                    let style = match fx
+                        .animation
+                        .clone()
+                        .unwrap_or_else(|| cfg.animations.window_close.style.clone())
+                    {
+                        crate::config::Style::Default => crate::config::Style::Popin { perc: 0.8 },
+                        s => s,
+                    };
+                    let anim = crate::config::build_anim(
+                        &state.anim_clock,
+                        motion,
+                        &cfg.animations,
+                        1.0,
+                        0.0,
+                        0.0,
+                    );
+                    let rect = win.visual_rect(state);
+                    if let Some(cw) = crate::output::capture_closing(&out, win, rect, anim, style) {
+                        crate::output::push_closing(&out, &ws, cw);
+                    }
+                }
+            }
+        }
+    }
     if win.floating.get() {
         ws.remove_float(win);
     } else {

@@ -1869,6 +1869,7 @@ fn compose_ops(
             return;
         }
         let mark = ops.len();
+        let lmark = live.len();
         let rect = win.visual_rect(state);
         if win.anims_live(state.anim_clock.now()) {
             out.anim_pending.set(true);
@@ -1908,6 +1909,7 @@ fn compose_ops(
                 apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d);
             }
         }
+        *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
     };
 
     // paint order: background, bottom, tiled, fullscreen, floats, top,
@@ -1917,6 +1919,7 @@ fn compose_ops(
         draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
         draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
         ws.tiling.for_each(|win| draw(win, &mut ops, &mut live));
+        draw_closings(state, out, &ws, &mut ops);
     }
     if let Some(fs) = &fs {
         draw(fs, &mut ops, &mut live);
@@ -2259,7 +2262,89 @@ fn draw_buffer(
     });
 }
 
-/// four fills just outside the window box
+// -- closing windows: the final batch outlives the surface --
+
+pub struct ClosingWindow {
+    pub ops: Vec<RenderOp>,
+    /// ownership moved out of out.textures; retired when the anim ends
+    pub keep: Vec<Texture>,
+    pub rect: Rect,
+    pub anim: crate::anim::Anim,
+    pub style: crate::config::Style,
+}
+
+/// seize the window's cached final batch and its textures
+pub fn capture_closing(
+    out: &Rc<Output>,
+    win: &crate::tree::Window,
+    rect: Rect,
+    anim: crate::anim::Anim,
+    style: crate::config::Style,
+) -> Option<ClosingWindow> {
+    let (ops, keys) = std::mem::take(&mut *win.last_batch.borrow_mut());
+    if ops.is_empty() {
+        return None;
+    }
+    let mut keep = Vec::new();
+    let mut textures = out.textures.borrow_mut();
+    for k in &keys {
+        if let Some((t, _)) = textures.remove(k) {
+            keep.push(t);
+        }
+    }
+    Some(ClosingWindow { ops, keep, rect, anim, style })
+}
+
+fn cap_evict(list: &mut Vec<ClosingWindow>) -> Option<ClosingWindow> {
+    if list.len() >= 8 {
+        return Some(list.remove(0));
+    }
+    None
+}
+
+/// bounded stash; the evicted entry's textures go to the retire queue
+pub fn push_closing(out: &Rc<Output>, ws: &crate::tree::workspace::Workspace, cw: ClosingWindow) {
+    let mut list = ws.closing.borrow_mut();
+    if let Some(old) = cap_evict(&mut list) {
+        out.retired_tex.borrow_mut().extend(old.keep);
+    }
+    list.push(cw);
+}
+
+fn draw_closings(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    ws: &crate::tree::workspace::Workspace,
+    ops: &mut Vec<RenderOp>,
+) {
+    use crate::config::Style;
+    let now = state.anim_clock.now();
+    let mut list = ws.closing.borrow_mut();
+    let mut i = 0;
+    while i < list.len() {
+        if list[i].anim.is_done(now) {
+            let cw = list.remove(i);
+            out.retired_tex.borrow_mut().extend(cw.keep);
+            continue;
+        }
+        i += 1;
+    }
+    for c in list.iter() {
+        // presence runs 1 -> 0
+        let p = c.anim.clamped_value(now);
+        let mark = ops.len();
+        ops.extend(c.ops.iter().cloned());
+        let (scale, alpha, d) = match &c.style {
+            Style::Fade => (1.0, p as f32, [0.0, 0.0]),
+            Style::Slide { dir } => (1.0, 1.0, slide_delta(out, c.rect, *dir, 1.0 - p)),
+            // popin and everything else: shrink toward 80% while fading
+            _ => ((0.8 + 0.2 * p) as f32, p as f32, [0.0, 0.0]),
+        };
+        apply_batch(&mut ops[mark..], center_ndc(out, c.rect), scale, alpha, d);
+        out.anim_pending.set(true);
+    }
+}
+
 // -- op-batch transforms: open/close styles, workspace slides --
 
 /// scale about an ndc center, multiply alpha, then translate; the whole
@@ -2323,6 +2408,7 @@ fn slide_delta(out: &Output, r: Rect, dir: Option<crate::config::Dir>, remaining
     ]
 }
 
+/// four fills just outside the window box
 fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Vec<RenderOp>) {
     let sides = [
         Rect { x1: r.x1 - b, y1: r.y1 - b, x2: r.x2 + b, y2: r.y1 },
@@ -2348,6 +2434,23 @@ fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_cap_evicts_oldest() {
+        let clock = crate::anim::AnimClock::new();
+        let mk = |x: i32| ClosingWindow {
+            ops: vec![RenderOp::Fill { pos: [0.0; 2], size: [1.0; 2], color: [1.0; 4] }],
+            keep: Vec::new(),
+            rect: Rect { x1: x, y1: 0, x2: x + 10, y2: 10 },
+            anim: crate::anim::Anim::ease(&clock, 1.0, 0.0, 150, crate::anim::Curve::Linear),
+            style: crate::config::Style::Fade,
+        };
+        let mut list: Vec<ClosingWindow> = (0..8).map(mk).collect();
+        let evicted = cap_evict(&mut list);
+        assert_eq!(evicted.map(|c| c.rect.x1), Some(0), "oldest goes first");
+        assert_eq!(list.len(), 7);
+        assert!(cap_evict(&mut list).is_none(), "under the cap nothing evicts");
+    }
 
     #[test]
     fn apply_batch_scales_about_center_and_fades() {

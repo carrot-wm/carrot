@@ -12,6 +12,8 @@ pub struct Workspace {
     /// z order: last is topmost
     pub floats: RefCell<Vec<Rc<Window>>>,
     pub fullscreen: RefCell<Option<Rc<Window>>>,
+    /// unmapped windows still animating out; capped, compose prunes
+    pub closing: RefCell<Vec<crate::output::ClosingWindow>>,
 }
 
 impl Workspace {

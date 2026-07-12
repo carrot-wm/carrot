@@ -36,6 +36,7 @@ fn push_bytes<T>(v: &T) -> &[u8] {
 // -- ops --
 
 /// all coordinates are final vulkan NDC; the shaders are passthroughs
+#[derive(Clone)]
 pub enum RenderOp {
     Fill {
         pos: [f32; 2],
