@@ -37,9 +37,15 @@ pub enum Pick {
 enum Source {
     Output(String),
     Window { win: Weak<Window>, ident: u64, app_id: String, title: String },
-    /// follows the workspace across outputs, streaming only while it
-    /// is on glass; reachable through the picker, not the portal types
+    /// follows the workspace across outputs; reachable through the
+    /// picker, not the portal types
     Workspace(usize),
+}
+
+enum Cap {
+    Out(usize),
+    Ws(usize),
+    Win(Rc<Window>),
 }
 
 pub struct Cast {
@@ -62,6 +68,8 @@ pub struct Cast {
     resize_req: Rc<AsyncQueue<(u32, u32)>>,
     /// the pump lost the daemon; the present tail sweeps us out
     dead: Rc<Cell<bool>>,
+    /// a hidden-source commit landed; the tick owes a frame
+    dirty: Cell<bool>,
     _pump: SpawnedFuture<()>,
     _resizer: SpawnedFuture<()>,
 }
@@ -136,6 +144,7 @@ pub async fn start(
         resize_target: Cell::new((width, height)),
         resize_req,
         dead,
+        dirty: Cell::new(false),
         _pump: pump,
         _resizer: resizer,
     });
@@ -329,10 +338,6 @@ impl Cast {
     }
 
     fn feed(&self, state: &Rc<State>, presented: &str) {
-        enum Cap {
-            Out(usize),
-            Win(Rc<Window>),
-        }
         let (cap, w, h) = match &self.source {
             Source::Output(name) => {
                 if name != presented {
@@ -385,6 +390,10 @@ impl Cast {
                 (Cap::Out(idx), w, h)
             }
         };
+        self.push_frame(state, cap, w, h);
+    }
+
+    fn push_frame(&self, state: &Rc<State>, cap: Cap, w: u32, h: u32) {
         {
             let n = self.node.borrow();
             if w != n.width || h != n.height {
@@ -409,6 +418,7 @@ impl Cast {
                 };
                 crate::output::screencopy(state, idx, region, self.cursor)
             }
+            Cap::Ws(index) => crate::output::workspace_copy(state, index),
             Cap::Win(win) => crate::output::window_capture(state, &win),
         };
         let Some(px) = px else { return };
@@ -417,5 +427,97 @@ impl Cast {
             dst[..n].copy_from_slice(&px[..n]);
         });
         self.last.set(now);
+    }
+
+    /// the present tail composes this source right now; the tick stays out
+    fn on_glass(&self, state: &Rc<State>) -> bool {
+        match &self.source {
+            Source::Output(_) => true,
+            Source::Window { win, .. } => match win.upgrade() {
+                Some(win) => match crate::tree::workspace_of(state, &win) {
+                    Some(ws) => ws_shown(state, &ws),
+                    None => true,
+                },
+                None => true,
+            },
+            Source::Workspace(index) => match state.workspaces.borrow().get(*index) {
+                Some(ws) => ws_shown(state, ws),
+                None => true,
+            },
+        }
+    }
+
+    /// tick-driven feed for a source that is off glass
+    fn feed_hidden(&self, state: &Rc<State>) {
+        self.dirty.set(false);
+        let ms = (Time::now().nsec() / 1_000_000) as u32;
+        match &self.source {
+            Source::Output(_) => {}
+            Source::Window { win, .. } => {
+                let Some(win) = win.upgrade() else {
+                    self.dead.set(true);
+                    return;
+                };
+                if !win.surface().mapped.get() {
+                    return;
+                }
+                let rect = win.draw_rect(state);
+                if rect.is_empty() {
+                    return;
+                }
+                self.push_frame(state, Cap::Win(win.clone()), rect.width() as u32, rect.height() as u32);
+                fire_tree(&win.surface(), ms);
+            }
+            Source::Workspace(index) => {
+                let Some(ws) = state.workspaces.borrow().get(*index).cloned() else {
+                    self.dead.set(true);
+                    return;
+                };
+                let (w, h) = {
+                    let d = state.display.borrow();
+                    let Some(d) = d.as_ref() else { return };
+                    let outs = d.outputs.borrow();
+                    let Some(out) = outs.get(ws.output.get()).or_else(|| outs.first()) else {
+                        return;
+                    };
+                    (out.width, out.height)
+                };
+                self.push_frame(state, Cap::Ws(*index), w, h);
+                ws.for_each(|win| fire_tree(&win.surface(), ms));
+            }
+        }
+    }
+}
+
+/// is this workspace the one on glass on its assigned output
+fn ws_shown(state: &Rc<State>, ws: &Rc<Workspace>) -> bool {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return false };
+    let outs = d.outputs.borrow();
+    let Some(out) = outs.get(ws.output.get()) else { return false };
+    state
+        .workspaces
+        .borrow()
+        .get(out.ws.get())
+        .is_some_and(|shown| Rc::ptr_eq(shown, ws))
+}
+
+/// frame callbacks for a whole surface tree: the tick is the only
+/// heartbeat a fully hidden client has
+fn fire_tree(s: &Rc<crate::surface::WlSurface>, ms: u32) {
+    s.fire_frame_callbacks(ms);
+    let children = s.children.borrow();
+    if let Some(ch) = &*children {
+        let subs: Vec<_> = ch
+            .below
+            .iter()
+            .chain(ch.above.iter())
+            .filter(|e| !e.pending.get())
+            .map(|e| e.sub.clone())
+            .collect();
+        drop(children);
+        for sub in subs {
+            fire_tree(&sub.surface, ms);
+        }
     }
 }
