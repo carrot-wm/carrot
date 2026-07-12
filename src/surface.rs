@@ -110,6 +110,8 @@ pub struct WlSurface {
     /// own rect union child extents, in local coords
     pub(crate) extents: Cell<Rect>,
     pub(crate) frame_callbacks: RefCell<Vec<FrameCallback>>,
+    /// presentation feedbacks of the committed content, waiting for a flip
+    pub(crate) latched_feedbacks: RefCell<Vec<crate::protocol::presentation::Feedback>>,
     pub(crate) children: RefCell<Option<Box<ParentData>>>,
     pub(crate) mapped: Cell<bool>,
     pub(crate) destroyed: Cell<bool>,
@@ -145,6 +147,7 @@ impl WlSurface {
             size: Cell::new((0, 0)),
             extents: Cell::new(Rect::default()),
             frame_callbacks: RefCell::new(Vec::new()),
+            latched_feedbacks: RefCell::new(Vec::new()),
             tearing: Cell::new(false),
             tearing_control: Cell::new(false),
             children: RefCell::new(None),

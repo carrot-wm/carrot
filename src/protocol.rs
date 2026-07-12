@@ -15,6 +15,7 @@ pub mod image_copy_capture;
 pub mod interfaces;
 pub mod output;
 pub mod pointer_constraints;
+pub mod presentation;
 pub mod primary_selection;
 pub mod relative_pointer;
 pub mod screencopy;

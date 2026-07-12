@@ -22,6 +22,7 @@ pub struct PendingState {
     pub opaque_region: Option<Option<Rc<Region>>>,
     pub input_region: Option<Option<Rc<Region>>>,
     pub frame_callbacks: Vec<FrameCallback>,
+    pub presentation_feedbacks: Vec<crate::protocol::presentation::Feedback>,
     pub damage_full: bool,
     pub surface_damage: Vec<Rect>,
     pub buffer_damage: Vec<Rect>,
@@ -75,6 +76,7 @@ impl PendingState {
             self.tearing = next.tearing.take();
         }
         self.frame_callbacks.append(&mut next.frame_callbacks);
+        self.presentation_feedbacks.append(&mut next.presentation_feedbacks);
         if next.damage_full {
             self.set_full_damage();
         } else {
@@ -125,6 +127,7 @@ impl PendingState {
         self.opaque_region = None;
         self.input_region = None;
         self.frame_callbacks.clear();
+        self.presentation_feedbacks.clear();
         self.damage_full = false;
         self.surface_damage.clear();
         self.buffer_damage.clear();
@@ -313,6 +316,13 @@ impl WlSurface {
         self.frame_callbacks
             .borrow_mut()
             .append(&mut pending.frame_callbacks);
+        // a newer commit supersedes content that never reached glass
+        for fb in self.latched_feedbacks.borrow_mut().drain(..) {
+            fb.discarded();
+        }
+        self.latched_feedbacks
+            .borrow_mut()
+            .append(&mut pending.presentation_feedbacks);
         if let Some(r) = pending.input_region.take() {
             *self.input_region.borrow_mut() = r;
         }
