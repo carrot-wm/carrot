@@ -2330,9 +2330,21 @@ fn ws_scene(
 ) {
     let fs = ws.fullscreen.borrow().clone();
     if fs.is_none() {
+        let mark = ops.len();
         ws.tiling
             .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live));
         draw_closings(state, out, ws, ops);
+        if ws.tiling.mode() == crate::config::LayoutMode::Scrolling {
+            let now = state.anim_clock.now();
+            let dx = ws.tiling.strip.draw_offset_px(now);
+            if dx.abs() >= 0.5 {
+                let d = [(dx / out.width as f64 * 2.0) as f32, 0.0];
+                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, 1.0, d);
+                out.anim_pending.set(true);
+            } else {
+                *ws.tiling.strip.view_anim.borrow_mut() = None;
+            }
+        }
     }
     if let Some(f) = &fs {
         draw_window(state, out, focused, cfg, screen, f, ops, live);
