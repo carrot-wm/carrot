@@ -57,6 +57,8 @@ pub struct SeatGlobal {
     remap_held: RefCell<HashMap<u32, u32>>,
     /// a matched release-kind bind waits here; any other press disarms
     armed_release: RefCell<Option<(u32, crate::config::Action)>>,
+    /// last fire per chord, for cooldown-ms binds
+    bind_cooldowns: RefCell<std::collections::HashMap<(u32, u32), u64>>,
     // clipboard state rides on the seat: devices, sources, selection
     pub data: crate::protocol::data_device::DataDevices,
     pub primary: crate::protocol::primary_selection::PrimaryDevices,
@@ -125,6 +127,7 @@ impl SeatGlobal {
             last_press_serial: Cell::new(0),
             remap_held: RefCell::new(HashMap::new()),
             armed_release: RefCell::new(None),
+            bind_cooldowns: RefCell::new(std::collections::HashMap::new()),
             data: Default::default(),
             primary: Default::default(),
             data_control: Default::default(),
@@ -145,6 +148,20 @@ impl SeatGlobal {
         *self.grab.borrow_mut() = None;
         *self.armed_release.borrow_mut() = None;
         self.cancel_repeat();
+    }
+
+    /// cooldown-ms gate; a bind on cooldown swallows its trigger
+    fn cooldown_clear(&self, b: &crate::config::Bind) -> bool {
+        let Some(cd) = b.cooldown_ms else { return true };
+        let now = crate::util::Time::now().nsec();
+        let mut map = self.bind_cooldowns.borrow_mut();
+        match map.get(&(b.mods, b.key)) {
+            Some(&last) if now < last + cd as u64 * 1_000_000 => false,
+            _ => {
+                map.insert((b.mods, b.key), now);
+                true
+            }
+        }
     }
 
     pub fn cancel_repeat(&self) {
@@ -171,7 +188,7 @@ impl SeatGlobal {
                 };
                 let (rate, delay) = {
                     let c = state.config.borrow();
-                    (c.repeat_rate.max(1) as u64, c.repeat_delay.max(1) as u64)
+                    (c.input.keyboard.repeat_rate.max(1) as u64, c.input.keyboard.repeat_delay.max(1) as u64)
                 };
                 let wait_ns = if first {
                     delay * 1_000_000
@@ -199,11 +216,10 @@ impl SeatGlobal {
             const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
             let held_mods = self.mods.get().depressed & MASK;
             let cfg = state.config.borrow().clone();
-            let hit = cfg.binds.iter().find(|b| {
-                matches!(b.kind, crate::config::BindKind::Repeat)
-                    && b.mods == held_mods
-                    && b.key == key
-            });
+            let hit = cfg
+                .binds
+                .iter()
+                .find(|b| b.repeat && b.mods == held_mods && b.key == key);
             if let Some(b) = hit {
                 crate::ipc::dispatch_action(state, &b.action);
                 return;
@@ -276,12 +292,12 @@ impl SeatGlobal {
     pub fn apply_input_config(&self, state: &Rc<State>) {
         let cfg = state.config.borrow().clone();
         let mut rebuilt = false;
-        if cfg.input.layout != *self.kb_layout.borrow() {
-            match Keymap::new(cfg.input.layout.as_deref()) {
+        if cfg.input.keyboard.xkb.layout != *self.kb_layout.borrow() {
+            match Keymap::new(cfg.input.keyboard.xkb.layout.as_deref()) {
                 Ok(map) => {
                     *self.kb_state.borrow_mut() = map.create_state();
                     *self.keymap.borrow_mut() = map;
-                    *self.kb_layout.borrow_mut() = cfg.input.layout.clone();
+                    *self.kb_layout.borrow_mut() = cfg.input.keyboard.xkb.layout.clone();
                     self.mods.set(Mods::default());
                     rebuilt = true;
                 }
@@ -289,7 +305,7 @@ impl SeatGlobal {
                 Err(e) => eprintln!("carrot: keymap: {e}"),
             }
         }
-        if cfg.input.numlock && (rebuilt || !self.numlock_done.get()) {
+        if cfg.input.keyboard.numlock && (rebuilt || !self.numlock_done.get()) {
             self.latch_numlock();
         }
         self.numlock_done.set(true);
@@ -406,7 +422,7 @@ impl wl_seat::Handler for WlSeat {
                 (0, 0)
             } else {
                 let c = self.client.state.config.borrow();
-                (c.repeat_rate, c.repeat_delay)
+                (c.input.keyboard.repeat_rate, c.input.keyboard.repeat_delay)
             };
             self.client
                 .event(|o| wl_keyboard::repeat_info::send(o, kb.id, rate, delay));
@@ -958,32 +974,29 @@ impl SeatGlobal {
             // configured binds, exact-set match; vt switching stays
             // hardcoded above so a broken config can't strand the seat
             let cfg = state.config.borrow().clone();
-            use crate::config::BindKind;
-            // a locked session only honors lock-safe binds
+            // a locked session only honors binds that opted in
             let locked = crate::protocol::session_lock::locked(state);
             // a press of anything else disarms a waiting release bind
             let mut armed = None;
             for b in cfg.binds.iter() {
                 if held_mods == b.mods && key == b.key {
-                    if locked && b.kind != BindKind::LockSafe {
+                    if locked && !b.allow_when_locked {
                         continue;
                     }
-                    match b.kind {
-                        BindKind::Mouse => continue,
-                        BindKind::Release => {
-                            armed = Some((key, b.action.clone()));
-                            continue;
-                        }
-                        BindKind::Repeat => {
-                            // re-fires from the repeat loop while held
-                            self.arm_repeat(key);
-                            return KeyAction::Act(b.action.clone());
-                        }
-                        BindKind::Press | BindKind::LockSafe => {
-                            self.cancel_repeat();
-                            return KeyAction::Act(b.action.clone());
-                        }
+                    if b.on_release {
+                        armed = Some((key, b.action.clone()));
+                        continue;
                     }
+                    if !self.cooldown_clear(b) {
+                        continue;
+                    }
+                    if b.repeat {
+                        // re-fires from the repeat loop while held
+                        self.arm_repeat(key);
+                        return KeyAction::Act(b.action.clone());
+                    }
+                    self.cancel_repeat();
+                    return KeyAction::Act(b.action.clone());
                 }
             }
             *self.armed_release.borrow_mut() = armed;
@@ -1302,12 +1315,14 @@ impl SeatGlobal {
             const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
             let held_mods = self.mods.get().depressed & MASK;
             let cfg = state.config.borrow().clone();
-            let hit = cfg.binds.iter().find(|b| {
-                matches!(b.kind, crate::config::BindKind::Mouse)
-                    && b.mods == held_mods
-                    && b.key == button
-            });
+            let hit = cfg
+                .binds
+                .iter()
+                .find(|b| b.mods == held_mods && b.key == button);
             if let Some(b) = hit {
+                if !self.cooldown_clear(b) {
+                    return;
+                }
                 crate::ipc::dispatch_action(state, &b.action);
                 return;
             }
@@ -1758,14 +1773,18 @@ mod tests {
 
     #[test]
     fn release_binds_fire_on_keyup_and_disarm_on_other_presses() {
-        use crate::config::{Action, Bind, BindKind, Config};
+        use crate::config::{Action, Bind};
         let (state, _client, seat, _s) = setup();
-        let mut cfg = Config::default();
+        let mut cfg = crate::config::empty();
         cfg.binds.push(Bind {
             mods: 0,
             key: 30,
             action: Action::Quit,
-            kind: BindKind::Release,
+            on_release: true,
+            repeat: false,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
         });
         *state.config.borrow_mut() = Rc::new(cfg);
         // press arms, keyup fires

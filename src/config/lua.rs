@@ -1,41 +1,45 @@
 // lua config via piccolo - pure rust, zero c, always compiled in. the
 // script builds a global `carrot` table and the walk below turns it into
-// the same Config kdl produces. parity rule: unknown keys are fatal,
-// never silently ignored.
+// the same Config kdl produces, through the same leaf validators. parity
+// rule: unknown keys are fatal, never silently ignored. errors accumulate
+// per section so one typo doesn't hide the rest.
 //
 // carrot = {
-//   general = { gaps_in = 5, border_size = 2, active_border = "89b4fa" },
-//   input   = { accel_profile = "flat", repeat_rate = 35 },
-//   devices = { ["turtle-beach"] = { accel_speed = -0.86 } },
-//   outputs = { ["DP-3"] = { mode = "2560x1440@480", vrr = "off" } },
-//   binds   = { { "Meta", "Return", "exec", "foot" },
-//               { "Meta", "1", "workspace", 1 } },
+//   input  = { keyboard = { repeat_rate = 35 }, mouse = { accel_profile = "flat" },
+//              devices = { ["razer viper"] = { dpi = 1600 } } },
+//   layout = { gaps_in = 5, border = { width = 2, active_color = "#89b4fa" } },
+//   outputs = { ["DP-3"] = { mode = "2560x1440@480", vrr = "always" } },
+//   binds  = { { chord = "Mod+Return", action = "spawn", args = { "foot" } },
+//              { chord = "Mod+1", action = "focus-workspace", args = { 1 } } },
 // }
 
 use super::{
-    Action, AnimationCfg, Bind, BindKind, Config, DeviceRule, Dir, GpuCfg, LayerRule, OutputCfg,
-    RemapProfile, WindowRule,
+    Action, Bind, Config, DeviceRule, Dir, LayerRule, LayoutMode, ModKey, OutputCfg,
+    PointerClassCfg, RemapProfile, RuleMatch, SpawnCfg, Vrr, WindowRule,
 };
 use piccolo::{Closure, Executor, Lua, Table, Value};
 
-pub fn parse(src: &str) -> Result<Config, String> {
+pub fn parse(src: &str) -> Result<Config, Vec<String>> {
     let mut lua = Lua::core();
     let ex = lua
         .try_enter(|ctx| {
             let closure = Closure::load(ctx, Some("carrot.lua"), src.as_bytes())?;
             Ok(ctx.stash(Executor::start(ctx, closure.into(), ())))
         })
-        .map_err(|e| format!("lua: {e}"))?;
-    lua.execute::<()>(&ex).map_err(|e| format!("lua: {e}"))?;
+        .map_err(|e| vec![format!("lua: {e}")])?;
+    lua.execute::<()>(&ex).map_err(|e| vec![format!("lua: {e}")])?;
     lua.try_enter(|ctx| {
         let root = match ctx.get_global("carrot") {
             Value::Table(t) => t,
-            _ => return Ok(Err("script must define a global `carrot` table".to_string())),
+            _ => {
+                return Ok(Err(vec![
+                    "lua: script must define a global `carrot` table".to_string(),
+                ]))
+            }
         };
         Ok(build(root))
     })
-    .map_err(|e| format!("lua: {e}"))?
-    .map_err(|e| format!("lua: {e}"))
+    .map_err(|e| vec![format!("lua: {e}")])?
 }
 
 // -- value shims --
@@ -74,10 +78,8 @@ fn need_str(v: &Value, key: &str) -> Result<String, String> {
     vstr(v).ok_or_else(|| format!("`{key}` wants a string"))
 }
 
-fn need_int(v: &Value, key: &str) -> Result<i32, String> {
-    vint(v)
-        .map(|n| n as i32)
-        .ok_or_else(|| format!("`{key}` wants an integer"))
+fn need_int(v: &Value, key: &str) -> Result<i64, String> {
+    vint(v).ok_or_else(|| format!("`{key}` wants an integer"))
 }
 
 fn need_num(v: &Value, key: &str) -> Result<f64, String> {
@@ -85,67 +87,7 @@ fn need_num(v: &Value, key: &str) -> Result<f64, String> {
 }
 
 fn need_bool(v: &Value, key: &str) -> Result<bool, String> {
-    vbool(v).ok_or_else(|| format!("`{key}` wants true/false"))
-}
-
-// hex forms: rgb, rgba, rrggbb, rrggbbaa
-fn color(s: &str, key: &str) -> Result<[f32; 4], String> {
-    let s = s.trim_start_matches('#');
-    let err = || format!("`{key}`: \"{s}\" is not a hex color");
-    let b = s.as_bytes();
-    let nib = |c: u8| (c as char).to_digit(16).ok_or_else(err);
-    let (r, g, bl, a) = match b.len() {
-        3 | 4 => {
-            let mut v = [255u32; 4];
-            for (i, c) in b.iter().enumerate() {
-                let n = nib(*c)?;
-                v[i] = n * 16 + n;
-            }
-            (v[0], v[1], v[2], v[3])
-        }
-        6 | 8 => {
-            let mut v = [255u32; 4];
-            for i in 0..b.len() / 2 {
-                v[i] = nib(b[i * 2])? * 16 + nib(b[i * 2 + 1])?;
-            }
-            (v[0], v[1], v[2], v[3])
-        }
-        _ => return Err(err()),
-    };
-    Ok([
-        r as f32 / 255.0,
-        g as f32 / 255.0,
-        bl as f32 / 255.0,
-        a as f32 / 255.0,
-    ])
-}
-
-// -- the walk --
-
-fn build(root: Table) -> Result<Config, String> {
-    let mut cfg = Config::default();
-    for (k, v) in root.iter() {
-        let Some(key) = vstr(&k) else {
-            return Err("carrot table keys must be strings".to_string());
-        };
-        match key.as_str() {
-            "general" => general(&v, &mut cfg)?,
-            "input" => input(&v, &mut cfg)?,
-            "devices" => devices(&v, &mut cfg)?,
-            "outputs" => outputs(&v, &mut cfg)?,
-            "binds" => binds(&v, &mut cfg)?,
-            "decorations" => decorations(&v, &mut cfg)?,
-            "animations" => animations(&v, &mut cfg)?,
-            "window_rules" => window_rules(&v, &mut cfg)?,
-            "layer_rules" => layer_rules(&v, &mut cfg)?,
-            "gpus" => gpus(&v, &mut cfg)?,
-            "submaps" => submaps(&v, &mut cfg)?,
-            "specials" => specials(&v, &mut cfg)?,
-            "remaps" => remaps(&v, &mut cfg)?,
-            other => return Err(format!("unknown section `{other}`")),
-        }
-    }
-    Ok(cfg)
+    vbool(v).ok_or_else(|| format!("`{key}` wants true or false"))
 }
 
 fn table<'gc>(v: &Value<'gc>, key: &str) -> Result<Table<'gc>, String> {
@@ -153,24 +95,6 @@ fn table<'gc>(v: &Value<'gc>, key: &str) -> Result<Table<'gc>, String> {
         Value::Table(t) => Ok(*t),
         _ => Err(format!("`{key}` wants a table")),
     }
-}
-
-// positional {a, b, ...} of exactly N numbers; index-addressed because
-// lua table iteration has no defined order
-fn num_array<const N: usize>(v: &Value, key: &str) -> Result<[f64; N], String> {
-    let err = || format!("`{key}` wants {N} numbers");
-    let t = table(v, key).map_err(|_| err())?;
-    let mut out = [0.0f64; N];
-    let mut seen = 0usize;
-    for (k, v) in t.iter() {
-        let i = vint(&k).filter(|i| (1..=N as i64).contains(i)).ok_or_else(err)?;
-        out[(i - 1) as usize] = vnum(&v).ok_or_else(err)?;
-        seen += 1;
-    }
-    if seen != N {
-        return Err(err());
-    }
-    Ok(out)
 }
 
 fn str_array(v: &Value, key: &str) -> Result<Vec<String>, String> {
@@ -185,64 +109,151 @@ fn str_array(v: &Value, key: &str) -> Result<Vec<String>, String> {
     Ok(out.into_iter().map(|(_, s)| s).collect())
 }
 
-fn accel_profile(p: String, key: &str) -> Result<String, String> {
-    match p.as_str() {
-        "flat" | "adaptive" => Ok(p),
-        _ => Err(format!("`{key}` is flat or adaptive")),
+/// name-keyed sub-tables walked in sorted order; lua iteration has no
+/// defined order and reloads must be deterministic
+fn named_entries<'gc>(v: &Value<'gc>, what: &str) -> Result<Vec<(String, Value<'gc>)>, String> {
+    let mut out = Vec::new();
+    for (k, v) in table(v, what)?.iter() {
+        let name = vstr(&k).ok_or_else(|| format!("{what} keys are strings"))?;
+        out.push((name, v));
     }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
-fn general(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (k, v) in table(v, "general")?.iter() {
-        let key = vstr(&k).ok_or("general keys must be strings")?;
-        match key.as_str() {
-            "gaps_in" => cfg.gaps_in = need_int(&v, &key)?,
-            "gaps_out" => cfg.gaps_out = need_int(&v, &key)?,
-            "border_size" => cfg.border = need_int(&v, &key)?,
-            "active_border" => cfg.border_focused = color(&need_str(&v, &key)?, &key)?,
-            "inactive_border" => cfg.border_unfocused = color(&need_str(&v, &key)?, &key)?,
-            "allow_tearing" => cfg.allow_tearing = need_bool(&v, &key)?,
-            "software_cursor" => cfg.software_cursor = need_bool(&v, &key)?,
-            "float_above_fullscreen" => cfg.float_above_fullscreen = need_bool(&v, &key)?,
-            "picker" => cfg.picker = Some(need_str(&v, &key)?),
-            "layout" => {
-                cfg.layout = need_str(&v, &key)?;
-                if cfg.layout != "dwindle" {
-                    eprintln!(
-                        "carrot: config: layout \"{}\" not implemented yet, using dwindle",
-                        cfg.layout
-                    );
-                }
-            }
-            other => return Err(format!("general: unknown key `{other}`")),
+/// index-keyed arrays walked in index order
+fn indexed_entries<'gc>(v: &Value<'gc>, what: &str) -> Result<Vec<Value<'gc>>, String> {
+    let mut out: Vec<(i64, Value)> = Vec::new();
+    for (k, v) in table(v, what)?.iter() {
+        let i = vint(&k).ok_or_else(|| format!("{what} is an array"))?;
+        out.push((i, v));
+    }
+    out.sort_by_key(|(i, _)| *i);
+    Ok(out.into_iter().map(|(_, v)| v).collect())
+}
+
+// -- the walk --
+
+fn build(root: Table) -> Result<Config, Vec<String>> {
+    let mut cfg = Config::default();
+    let mut errs: Vec<String> = Vec::new();
+    // a script that speaks a repeated section at all replaces the defaults
+    for (k, _) in root.iter() {
+        match vstr(&k).as_deref() {
+            Some("binds") => cfg.binds.clear(),
+            Some("outputs") => cfg.outputs.clear(),
+            Some("window_rules") => cfg.rules.clear(),
+            Some("layer_rules") => cfg.layer_rules.clear(),
+            Some("remaps") => cfg.remaps.clear(),
+            Some("spawn_at_startup") => cfg.spawns.clear(),
+            Some("environment") => cfg.environment.clear(),
+            _ => {}
         }
     }
-    Ok(())
+    for (k, v) in root.iter() {
+        let Some(key) = vstr(&k) else {
+            errs.push("lua: carrot table keys must be strings".to_string());
+            continue;
+        };
+        let r = match key.as_str() {
+            "input" => input(&v, &mut cfg),
+            "outputs" => outputs(&v, &mut cfg),
+            "layout" => layout(&v, &mut cfg),
+            "cursor" => cursor(&v, &mut cfg),
+            "environment" => environment(&v, &mut cfg),
+            "spawn_at_startup" => spawns(&v, &mut cfg),
+            "prefer_no_csd" => need_bool(&v, "prefer_no_csd").map(|b| cfg.prefer_no_csd = b),
+            "screencast" => screencast(&v, &mut cfg),
+            "binds" => binds(&v, &mut cfg),
+            "switch_events" => Err("switch_events: not implemented yet".to_string()),
+            "window_rules" => window_rules(&v, &mut cfg),
+            "layer_rules" => layer_rules(&v, &mut cfg),
+            "remaps" => remaps(&v, &mut cfg),
+            "debug" => debug(&v, &mut cfg),
+            other => Err(format!("unknown section `{other}`")),
+        };
+        if let Err(e) = r {
+            errs.push(format!("lua: {key}: {e}"));
+        }
+    }
+    super::resolve_mod(&mut cfg.binds, cfg.input.mod_key);
+    if errs.is_empty() { Ok(cfg) } else { Err(errs) }
 }
 
 fn input(v: &Value, cfg: &mut Config) -> Result<(), String> {
     for (k, v) in table(v, "input")?.iter() {
         let key = vstr(&k).ok_or("input keys must be strings")?;
         match key.as_str() {
-            "accel_profile" => {
-                cfg.input.accel_profile = Some(accel_profile(need_str(&v, &key)?, &key)?)
+            "keyboard" => keyboard(&v, cfg)?,
+            "touchpad" => pointer_class(&v, "touchpad")
+                .map(|p| cfg.input.touchpad = p)?,
+            "mouse" => pointer_class(&v, "mouse").map(|p| cfg.input.mouse = p)?,
+            "devices" => devices(&v, cfg)?,
+            "mod_key" => {
+                cfg.input.mod_key = match need_str(&v, &key)?.as_str() {
+                    "super" => ModKey::Super,
+                    "alt" => ModKey::Alt,
+                    _ => return Err("mod_key is \"super\" or \"alt\"".to_string()),
+                };
             }
-            "natural_scroll" => cfg.input.natural_scroll = need_bool(&v, &key)?,
-            "tap" => cfg.input.tap = need_bool(&v, &key)?,
-            "dwt" => cfg.input.dwt = need_bool(&v, &key)?,
-            "layout" => cfg.input.layout = Some(need_str(&v, &key)?),
-            "numlock" => cfg.input.numlock = need_bool(&v, &key)?,
-            "repeat_rate" => cfg.repeat_rate = need_int(&v, &key)?,
-            "repeat_delay" => cfg.repeat_delay = need_int(&v, &key)?,
-            other => return Err(format!("input: unknown key `{other}`")),
+            other => return Err(format!("unknown key `{other}`")),
         }
     }
     Ok(())
 }
 
+fn keyboard(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    let kb = &mut cfg.input.keyboard;
+    for (k, v) in table(v, "keyboard")?.iter() {
+        let key = vstr(&k).ok_or("keyboard keys must be strings")?;
+        match key.as_str() {
+            "xkb" => {
+                for (k, v) in table(&v, "xkb")?.iter() {
+                    let key = vstr(&k).ok_or("xkb keys must be strings")?;
+                    match key.as_str() {
+                        "layout" => kb.xkb.layout = Some(need_str(&v, &key)?),
+                        "variant" => kb.xkb.variant = Some(need_str(&v, &key)?),
+                        "options" => kb.xkb.options = Some(need_str(&v, &key)?),
+                        other => return Err(format!("unknown xkb key `{other}`")),
+                    }
+                }
+            }
+            "repeat_rate" => {
+                kb.repeat_rate = super::int_in(need_int(&v, &key)?, "repeat_rate", 1, 200)? as i32;
+            }
+            "repeat_delay" => {
+                kb.repeat_delay =
+                    super::int_in(need_int(&v, &key)?, "repeat_delay", 1, 5000)? as i32;
+            }
+            "numlock" => kb.numlock = need_bool(&v, &key)?,
+            other => return Err(format!("unknown keyboard key `{other}`")),
+        }
+    }
+    Ok(())
+}
+
+fn pointer_class(v: &Value, what: &str) -> Result<PointerClassCfg, String> {
+    let mut out = PointerClassCfg::default();
+    for (k, v) in table(v, what)?.iter() {
+        let key = vstr(&k).ok_or("keys must be strings")?;
+        match key.as_str() {
+            "accel_profile" => {
+                out.accel_profile = Some(super::accel_profile(&need_str(&v, &key)?)?);
+            }
+            "accel_speed" => {
+                out.accel_speed =
+                    Some(super::f64_in(need_num(&v, &key)?, "accel_speed", -1.0, 1.0)?);
+            }
+            "natural_scroll" => out.natural_scroll = need_bool(&v, &key)?,
+            "tap" | "dwt" => return Err(format!("{key}: not implemented yet")),
+            other => return Err(format!("unknown {what} key `{other}`")),
+        }
+    }
+    Ok(out)
+}
+
 fn devices(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (name, v) in table(v, "devices")?.iter() {
-        let name = vstr(&name).ok_or("devices keys are device names")?;
+    for (name, v) in named_entries(v, "devices")? {
         let mut rule = DeviceRule {
             name: name.clone(),
             accel_speed: None,
@@ -253,53 +264,73 @@ fn devices(v: &Value, cfg: &mut Config) -> Result<(), String> {
         for (k, v) in table(&v, &name)?.iter() {
             let key = vstr(&k).ok_or("device keys must be strings")?;
             match key.as_str() {
-                "accel_speed" => rule.accel_speed = Some(need_num(&v, &key)?),
+                "accel_speed" => {
+                    rule.accel_speed =
+                        Some(super::f64_in(need_num(&v, &key)?, "accel_speed", -1.0, 1.0)?);
+                }
                 "accel_profile" => {
-                    rule.accel_profile = Some(accel_profile(need_str(&v, &key)?, &key)?)
+                    rule.accel_profile = Some(super::accel_profile(&need_str(&v, &key)?)?);
                 }
                 "natural_scroll" => rule.natural_scroll = Some(need_bool(&v, &key)?),
-                "dpi" => rule.dpi = Some(need_num(&v, &key)?),
+                "dpi" => {
+                    rule.dpi = Some(super::f64_in(need_num(&v, &key)?, "dpi", 100.0, 40000.0)?);
+                }
                 other => return Err(format!("device \"{name}\": unknown key `{other}`")),
             }
         }
-        cfg.devices.push(rule);
+        cfg.input.devices.push(rule);
     }
     Ok(())
 }
 
 fn outputs(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (name, v) in table(v, "outputs")?.iter() {
-        let name = vstr(&name).ok_or("outputs keys are connector names")?;
+    for (name, v) in named_entries(v, "outputs")? {
         let mut out = OutputCfg {
             name: name.clone(),
-            vrr: None,
-            gpu: None,
+            vrr: Vrr::Off,
             scale: None,
             mode: None,
+            position: None,
+            off: false,
+            allow_tearing: false,
         };
         for (k, v) in table(&v, &name)?.iter() {
             let key = vstr(&k).ok_or("output keys must be strings")?;
             match key.as_str() {
-                "vrr" => {
-                    let m = need_str(&v, &key)?;
-                    match m.as_str() {
-                        "off" | "automatic" | "always" => out.vrr = Some(m),
-                        _ => {
-                            return Err(format!(
-                                "output \"{name}\": vrr is off, automatic or always"
-                            ))
-                        }
-                    }
-                }
-                "gpu" => out.gpu = Some(need_str(&v, &key)?),
-                "scale" => out.scale = Some(need_num(&v, &key)?),
                 "mode" => {
-                    let s = need_str(&v, &key)?;
+                    let m = need_str(&v, &key)?;
                     out.mode = Some(
-                        super::parse_mode(&s)
-                            .ok_or_else(|| format!("output \"{name}\": bad mode \"{s}\""))?,
+                        super::parse_mode(&m)
+                            .ok_or_else(|| "mode looks like \"2560x1440@240\"".to_string())?,
                     );
                 }
+                "scale" => {
+                    out.scale = Some(super::f64_in(need_num(&v, &key)?, "scale", 0.25, 4.0)?);
+                }
+                "position" => {
+                    let (mut x, mut y) = (None, None);
+                    for (k, v) in table(&v, &key)?.iter() {
+                        match vstr(&k).as_deref() {
+                            Some("x") => x = vint(&v),
+                            Some("y") => y = vint(&v),
+                            _ => return Err("position wants x and y".to_string()),
+                        }
+                    }
+                    match (x, y) {
+                        (Some(x), Some(y)) => out.position = Some((x as i32, y as i32)),
+                        _ => return Err("position wants x and y".to_string()),
+                    }
+                }
+                "vrr" => {
+                    out.vrr = match need_str(&v, &key)?.as_str() {
+                        "off" => Vrr::Off,
+                        "on-demand" => Vrr::OnDemand,
+                        "always" => Vrr::Always,
+                        _ => return Err("vrr is off, on-demand or always".to_string()),
+                    };
+                }
+                "off" => out.off = need_bool(&v, &key)?,
+                "allow_tearing" => out.allow_tearing = need_bool(&v, &key)?,
                 other => return Err(format!("output \"{name}\": unknown key `{other}`")),
             }
         }
@@ -308,397 +339,413 @@ fn outputs(v: &Value, cfg: &mut Config) -> Result<(), String> {
     Ok(())
 }
 
-// positional { mods, key, action, arg? }; optional `type` picks when the bind fires
-fn binds(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (idx, v) in table(v, "binds")?.iter() {
-        let n = vint(&idx).unwrap_or(0);
-        if let Some(b) = bind_entry(&v, n)? {
-            cfg.binds.push(b);
-        }
-    }
-    Ok(())
-}
-
-fn bind_entry<'gc>(v: &Value<'gc>, n: i64) -> Result<Option<Bind>, String> {
-    let t = table(v, "binds entry")?;
-    let mut args: [Value<'gc>; 4] = [Value::Nil; 4];
-    let mut kind = BindKind::Press;
-    for (k, v) in t.iter() {
-        if let Some(i) = vint(&k) {
-            if !(1..=4).contains(&i) {
-                return Err(format!("bind {n}: wants mods, key, action, arg"));
-            }
-            args[(i - 1) as usize] = v;
-        } else if vstr(&k).as_deref() == Some("type") {
-            kind = match vstr(&v).as_deref() {
-                Some("press") => BindKind::Press,
-                Some("release") => BindKind::Release,
-                Some("repeat") => BindKind::Repeat,
-                Some("lock-safe") => BindKind::LockSafe,
-                Some("mouse") => BindKind::Mouse,
-                _ => {
-                    return Err(format!(
-                        "bind {n}: type is press, release, repeat, lock-safe or mouse"
-                    ))
-                }
-            };
-        } else {
-            return Err(format!("bind {n}: unknown bind key"));
-        }
-    }
-    {
-        let mods_s = vstr(&args[0]).ok_or_else(|| format!("bind {n}: mods wants a string"))?;
-        let key_s = vstr(&args[1]).ok_or_else(|| format!("bind {n}: key wants a string"))?;
-        let act_s = vstr(&args[2]).ok_or_else(|| format!("bind {n}: action wants a string"))?;
-        let arg = args[3];
-        let mods = super::parse_mods(&mods_s).map_err(|e| format!("bind {n}: {e}"))?;
-        let key = super::keycode(&key_s.to_lowercase())
-            .ok_or_else(|| format!("bind {n}: unknown key \"{key_s}\""))?;
-        let ws_arg = || -> Result<usize, String> {
-            vint(&arg)
-                .map(|w| (w as usize).saturating_sub(1))
-                .ok_or_else(|| format!("bind {n}: workspace binds need a number"))
-        };
-        let dir_arg = || -> Result<Dir, String> {
-            match vstr(&arg).as_deref() {
-                Some("left" | "l") => Ok(Dir::Left),
-                Some("right" | "r") => Ok(Dir::Right),
-                Some("up" | "u") => Ok(Dir::Up),
-                Some("down" | "d") => Ok(Dir::Down),
-                _ => Err(format!("bind {n}: direction is left, right, up or down")),
-            }
-        };
-        let action = match act_s.as_str() {
-            "exec" | "spawn" => Action::Spawn(
-                vstr(&arg).ok_or_else(|| format!("bind {n}: exec wants a command string"))?,
-            ),
-            "workspace" => {
-                // string "+1"/"-1" (or "r+1") jumps relative; numbers stay absolute
-                let rel = vstr(&arg)
-                    .map(|a| a.strip_prefix('r').unwrap_or(&a).to_string())
-                    .filter(|a| a.starts_with(['+', '-']));
-                match rel {
-                    Some(r) => Action::WorkspaceRel(r.parse::<i32>().map_err(|_| {
-                        format!("bind {n}: relative workspace wants \"+N\" or \"-N\"")
-                    })?),
-                    None => Action::Workspace(ws_arg()?),
-                }
-            }
-            "movetoworkspace" | "move-to-workspace" => Action::MoveToWorkspace(ws_arg()?),
-            "sendtoworkspace" | "send-to-workspace" => Action::SendToWorkspace(ws_arg()?),
-            "close" | "close-window" => Action::CloseWindow,
-            "fullscreen" | "fullscreen-bordered" | "fullscreen-borderless"
-            | "toggle-fullscreen" => Action::ToggleFullscreen,
-            "float" | "toggle-floating" => Action::ToggleFloating,
-            "focus-next" => Action::FocusNext,
-            "focus-prev" => Action::FocusPrev,
-            "focus-left" => Action::FocusDir(Dir::Left),
-            "focus-right" => Action::FocusDir(Dir::Right),
-            "focus-up" => Action::FocusDir(Dir::Up),
-            "focus-down" => Action::FocusDir(Dir::Down),
-            "swap-left" => Action::SwapDir(Dir::Left),
-            "swap-right" => Action::SwapDir(Dir::Right),
-            "swap-up" => Action::SwapDir(Dir::Up),
-            "swap-down" => Action::SwapDir(Dir::Down),
-            "focus" => Action::FocusDir(dir_arg()?),
-            "swap" => Action::SwapDir(dir_arg()?),
-            "split-ratio" => Action::SplitRatio(
-                vnum(&arg)
-                    .or_else(|| vstr(&arg).and_then(|s| s.parse().ok()))
-                    .ok_or_else(|| format!("bind {n}: split-ratio wants a signed number"))?,
-            ),
-            "quit" => Action::Quit,
-            // the rest of the dispatcher set; recognized so configs keep parsing
-            known @ ("screenshot" | "move" | "resize" | "center" | "pin" | "toggle-group"
-            | "group-next" | "group-prev" | "special" | "workspace-group" | "submap") => {
-                eprintln!("carrot: config: bind action \"{known}\" not implemented yet, ignored");
-                return Ok(None);
-            }
-            other => return Err(format!("bind {n}: unknown action \"{other}\"")),
-        };
-        Ok(Some(Bind { mods, key, action, kind }))
-    }
-}
-
-// -- decorations --
-
-fn decorations(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (k, v) in table(v, "decorations")?.iter() {
-        let key = vstr(&k).ok_or("decorations keys must be strings")?;
+fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    let l = &mut cfg.layout;
+    for (k, v) in table(v, "layout")?.iter() {
+        let key = vstr(&k).ok_or("layout keys must be strings")?;
         match key.as_str() {
-            "rounding" => cfg.decoration.rounding = need_int(&v, &key)?,
-            "blur" => {
-                for (k, v) in table(&v, &key)?.iter() {
-                    let key = vstr(&k).ok_or("blur keys must be strings")?;
+            "mode" => {
+                l.mode = match need_str(&v, &key)?.as_str() {
+                    "dwindle" => LayoutMode::Dwindle,
+                    _ => return Err("mode is \"dwindle\"".to_string()),
+                };
+            }
+            "gaps_in" => l.gaps_in = super::int_in(need_int(&v, &key)?, "gaps_in", 0, 500)? as i32,
+            "gaps_out" => {
+                l.gaps_out = super::int_in(need_int(&v, &key)?, "gaps_out", 0, 500)? as i32;
+            }
+            "border" => {
+                for (k, v) in table(&v, "border")?.iter() {
+                    let key = vstr(&k).ok_or("border keys must be strings")?;
                     match key.as_str() {
-                        "enabled" => cfg.decoration.blur.enabled = need_bool(&v, &key)?,
-                        "size" => cfg.decoration.blur.size = need_int(&v, &key)?,
-                        "passes" => cfg.decoration.blur.passes = need_int(&v, &key)?,
-                        other => return Err(format!("blur: unknown key `{other}`")),
-                    }
-                }
-            }
-            "shadow" => {
-                for (k, v) in table(&v, &key)?.iter() {
-                    let key = vstr(&k).ok_or("shadow keys must be strings")?;
-                    match key.as_str() {
-                        "enabled" => cfg.decoration.shadow.enabled = need_bool(&v, &key)?,
-                        "range" => cfg.decoration.shadow.range = need_int(&v, &key)?,
-                        other => return Err(format!("shadow: unknown key `{other}`")),
-                    }
-                }
-            }
-            other => return Err(format!("decorations: unknown key `{other}`")),
-        }
-    }
-    Ok(())
-}
-
-// -- animations --
-
-// lua tables have no iteration order, so the name-keyed maps below sort by
-// name to keep reloads deterministic
-fn animations(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (k, v) in table(v, "animations")?.iter() {
-        let key = vstr(&k).ok_or("animations keys must be strings")?;
-        match key.as_str() {
-            "beziers" => {
-                for (name, v) in table(&v, &key)?.iter() {
-                    let name = vstr(&name).ok_or("beziers keys are curve names")?;
-                    let pts = num_array::<4>(&v, &name)?;
-                    cfg.animations.beziers.push((name, pts));
-                }
-                cfg.animations.beziers.sort_by(|a, b| a.0.cmp(&b.0));
-            }
-            "springs" => {
-                for (name, v) in table(&v, &key)?.iter() {
-                    let name = vstr(&name).ok_or("springs keys are curve names")?;
-                    let pts = num_array::<3>(&v, &name)?;
-                    cfg.animations.springs.push((name, pts));
-                }
-                cfg.animations.springs.sort_by(|a, b| a.0.cmp(&b.0));
-            }
-            "animations" => {
-                for (name, v) in table(&v, &key)?.iter() {
-                    let name = vstr(&name).ok_or("animations keys are names")?;
-                    let mut a = AnimationCfg {
-                        enabled: true,
-                        speed: 1.0,
-                        curve: String::new(),
-                        style: None,
-                    };
-                    for (k, v) in table(&v, &name)?.iter() {
-                        let key = vstr(&k).ok_or("animation keys must be strings")?;
-                        match key.as_str() {
-                            "enabled" => a.enabled = need_bool(&v, &key)?,
-                            "speed" => a.speed = need_num(&v, &key)?,
-                            "curve" => a.curve = need_str(&v, &key)?,
-                            "style" => a.style = Some(need_str(&v, &key)?),
-                            other => {
-                                return Err(format!(
-                                    "animation \"{name}\": unknown key `{other}`"
-                                ))
-                            }
+                        "width" => {
+                            l.border.width =
+                                super::int_in(need_int(&v, &key)?, "width", 0, 100)? as i32;
                         }
+                        "active_color" => l.border.active = super::color(&need_str(&v, &key)?)?,
+                        "inactive_color" => {
+                            l.border.inactive = super::color(&need_str(&v, &key)?)?;
+                        }
+                        other => return Err(format!("unknown border key `{other}`")),
                     }
-                    cfg.animations.animations.push((name, a));
                 }
-                cfg.animations.animations.sort_by(|a, b| a.0.cmp(&b.0));
             }
-            other => return Err(format!("animations: unknown key `{other}`")),
+            "float_above_fullscreen" => l.float_above_fullscreen = need_bool(&v, &key)?,
+            "focus_ring" | "shadow" | "struts" => {
+                return Err(format!("{key}: not implemented yet"));
+            }
+            other => return Err(format!("unknown layout key `{other}`")),
         }
     }
     Ok(())
 }
 
-// -- rules --
+fn cursor(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    for (k, v) in table(v, "cursor")?.iter() {
+        let key = vstr(&k).ok_or("cursor keys must be strings")?;
+        match key.as_str() {
+            "xcursor_theme" => cfg.cursor.xcursor_theme = Some(need_str(&v, &key)?),
+            "xcursor_size" => {
+                cfg.cursor.xcursor_size =
+                    Some(super::int_in(need_int(&v, &key)?, "xcursor_size", 1, 512)? as u32);
+            }
+            "software" => cfg.cursor.software = need_bool(&v, &key)?,
+            other => return Err(format!("unknown cursor key `{other}`")),
+        }
+    }
+    Ok(())
+}
+
+/// NAME = "value" sets, NAME = false clears for spawned children
+fn environment(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    for (name, v) in named_entries(v, "environment")? {
+        match (vstr(&v), vbool(&v)) {
+            (Some(s), _) => cfg.environment.push((name, Some(s))),
+            (None, Some(false)) => cfg.environment.push((name, None)),
+            _ => return Err(format!("`{name}` wants a string or false")),
+        }
+    }
+    Ok(())
+}
+
+/// array entries: a table is argv, a string runs through sh
+fn spawns(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    for item in indexed_entries(v, "spawn_at_startup")? {
+        cfg.spawns.push(spawn_cfg(&item, "spawn_at_startup")?);
+    }
+    Ok(())
+}
+
+fn spawn_cfg(v: &Value, key: &str) -> Result<SpawnCfg, String> {
+    match v {
+        Value::Table(_) => {
+            let argv = str_array(v, key)?;
+            if argv.is_empty() {
+                return Err(format!("`{key}` spawn needs a command"));
+            }
+            Ok(SpawnCfg::Argv(argv))
+        }
+        _ => Ok(SpawnCfg::Sh(need_str(v, key)?)),
+    }
+}
+
+fn screencast(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    for (k, v) in table(v, "screencast")?.iter() {
+        let key = vstr(&k).ok_or("screencast keys must be strings")?;
+        match key.as_str() {
+            "picker" => cfg.screencast.picker = Some(need_str(&v, &key)?),
+            other => return Err(format!("unknown screencast key `{other}`")),
+        }
+    }
+    Ok(())
+}
+
+// { chord = "Mod+Return", action = "spawn", args = { "foot" },
+//   on = "release", ["repeat"] = true, allow_when_locked = true,
+//   cooldown_ms = 200, title = "Terminal" }
+fn binds(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    for (n, item) in indexed_entries(v, "binds")?.into_iter().enumerate() {
+        let whine = |e: String| format!("bind {}: {e}", n + 1);
+        let mut chord_s = None;
+        let mut action_s = None;
+        let mut args: Vec<LuaArg> = Vec::new();
+        let mut b = Bind {
+            mods: 0,
+            key: 0,
+            action: Action::Quit,
+            on_release: false,
+            repeat: false,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
+        };
+        for (k, v) in table(&item, "bind")?.iter() {
+            let key = vstr(&k).ok_or("bind keys must be strings")?;
+            match key.as_str() {
+                "chord" => chord_s = Some(need_str(&v, &key).map_err(whine)?),
+                "action" => action_s = Some(need_str(&v, &key).map_err(whine)?),
+                "args" => args = lua_args(&v).map_err(whine)?,
+                "on" => match need_str(&v, &key).map_err(whine)?.as_str() {
+                    "press" => b.on_release = false,
+                    "release" => b.on_release = true,
+                    _ => return Err(whine("on is press or release".to_string())),
+                },
+                "repeat" => b.repeat = need_bool(&v, &key).map_err(whine)?,
+                "allow_when_locked" => {
+                    b.allow_when_locked = need_bool(&v, &key).map_err(whine)?;
+                }
+                "cooldown_ms" => {
+                    let cd = need_int(&v, &key).map_err(whine)?;
+                    if !(1..=60_000).contains(&cd) {
+                        return Err(whine("cooldown_ms is 1..60000".to_string()));
+                    }
+                    b.cooldown_ms = Some(cd as u32);
+                }
+                "title" => b.title = Some(need_str(&v, &key).map_err(whine)?),
+                other => return Err(whine(format!("unknown bind key `{other}`"))),
+            }
+        }
+        let chord_s = chord_s.ok_or_else(|| whine("needs a chord".to_string()))?;
+        let action_s = action_s.ok_or_else(|| whine("needs an action".to_string()))?;
+        let (mods, key) = super::chord(&chord_s).map_err(whine)?;
+        b.mods = mods;
+        b.key = key;
+        b.action =
+            action_from(&action_s, &args).map_err(|e| whine(format!("({chord_s}): {e}")))?;
+        if cfg.binds.iter().any(|x| x.mods == b.mods && x.key == b.key) {
+            return Err(whine(format!("chord {chord_s} duplicated")));
+        }
+        cfg.binds.push(b);
+    }
+    Ok(())
+}
+
+/// action args: strings and numbers, in order
+enum LuaArg {
+    S(String),
+    N(f64),
+}
+
+fn lua_args(v: &Value) -> Result<Vec<LuaArg>, String> {
+    let mut out: Vec<(i64, LuaArg)> = Vec::new();
+    for (k, v) in table(v, "args")?.iter() {
+        let i = vint(&k).ok_or("args is an array")?;
+        match (vstr(&v), vnum(&v)) {
+            (Some(s), _) => out.push((i, LuaArg::S(s))),
+            (None, Some(n)) => out.push((i, LuaArg::N(n))),
+            _ => return Err("args are strings or numbers".to_string()),
+        }
+    }
+    out.sort_by_key(|(i, _)| *i);
+    Ok(out.into_iter().map(|(_, a)| a).collect())
+}
+
+fn action_from(name: &str, args: &[LuaArg]) -> Result<Action, String> {
+    let str_args = || -> Vec<String> {
+        args.iter()
+            .map(|a| match a {
+                LuaArg::S(s) => s.clone(),
+                LuaArg::N(n) => n.to_string(),
+            })
+            .collect()
+    };
+    let ws = || -> Result<usize, String> {
+        match args.first() {
+            Some(LuaArg::N(n)) if *n >= 1.0 => Ok(*n as usize - 1),
+            _ => Err("workspace actions take a number from 1".to_string()),
+        }
+    };
+    Ok(match name {
+        "spawn" => {
+            let a = str_args();
+            if a.is_empty() {
+                return Err("spawn needs a command".to_string());
+            }
+            Action::Spawn(a)
+        }
+        "spawn-sh" => match args {
+            [LuaArg::S(cmd)] => Action::SpawnSh(cmd.clone()),
+            _ => return Err("spawn-sh takes one shell string".to_string()),
+        },
+        "focus-workspace" => match args.first() {
+            Some(LuaArg::S(rel)) if rel.starts_with(['+', '-']) => Action::FocusWorkspaceRel(
+                rel.parse::<i32>()
+                    .map_err(|_| "relative workspace wants \"+N\" or \"-N\"".to_string())?,
+            ),
+            _ => Action::FocusWorkspace(ws()?),
+        },
+        "move-to-workspace" => Action::MoveToWorkspace(ws()?),
+        "send-to-workspace" => Action::SendToWorkspace(ws()?),
+        "close-window" => Action::CloseWindow,
+        "toggle-fullscreen" => Action::ToggleFullscreen,
+        "toggle-floating" => Action::ToggleFloating,
+        "focus-next" => Action::FocusNext,
+        "focus-prev" => Action::FocusPrev,
+        "focus-left" => Action::FocusDir(Dir::Left),
+        "focus-right" => Action::FocusDir(Dir::Right),
+        "focus-up" => Action::FocusDir(Dir::Up),
+        "focus-down" => Action::FocusDir(Dir::Down),
+        "swap-left" => Action::SwapDir(Dir::Left),
+        "swap-right" => Action::SwapDir(Dir::Right),
+        "swap-up" => Action::SwapDir(Dir::Up),
+        "swap-down" => Action::SwapDir(Dir::Down),
+        "adjust-split-ratio" => match args.first() {
+            Some(LuaArg::N(d)) if d.is_finite() && d.abs() <= 1.0 => Action::AdjustSplitRatio(*d),
+            Some(LuaArg::S(s)) => match s.parse::<f64>() {
+                Ok(d) if d.is_finite() && d.abs() <= 1.0 => Action::AdjustSplitRatio(d),
+                _ => return Err("adjust-split-ratio wants a signed delta".to_string()),
+            },
+            _ => return Err("adjust-split-ratio wants a signed delta".to_string()),
+        },
+        "quit" => Action::Quit,
+        other => return Err(format!("unknown action \"{other}\"")),
+    })
+}
+
+fn matcher(v: &Value, what: &str) -> Result<RuleMatch, String> {
+    let mut m = RuleMatch::default();
+    let mut any = false;
+    for (k, v) in table(v, what)?.iter() {
+        let key = vstr(&k).ok_or("matcher keys must be strings")?;
+        any = true;
+        match key.as_str() {
+            "app_id" => m.app_id = Some(super::regex(&need_str(&v, &key)?)?),
+            "title" => m.title = Some(super::regex(&need_str(&v, &key)?)?),
+            "is_xwayland" => m.is_xwayland = Some(need_bool(&v, &key)?),
+            "is_floating" => m.is_floating = Some(need_bool(&v, &key)?),
+            "is_fullscreen" => m.is_fullscreen = Some(need_bool(&v, &key)?),
+            other => return Err(format!("unknown matcher `{other}`")),
+        }
+    }
+    if !any {
+        return Err("an empty match matches nothing it should".to_string());
+    }
+    Ok(m)
+}
 
 fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    let mut rules: Vec<(i64, WindowRule)> = Vec::new();
-    for (idx, v) in table(v, "window_rules")?.iter() {
-        let n = vint(&idx).ok_or("window_rules is an array of tables")?;
-        let mut r = WindowRule::default();
-        for (k, v) in table(&v, "window_rules entry")?.iter() {
-            let key = vstr(&k).ok_or("window rule keys must be strings")?;
+    for (n, item) in indexed_entries(v, "window_rules")?.into_iter().enumerate() {
+        let whine = |e: String| format!("rule {}: {e}", n + 1);
+        let mut rule = WindowRule::default();
+        for (k, v) in table(&item, "window_rule")?.iter() {
+            let key = vstr(&k).ok_or("rule keys must be strings")?;
             match key.as_str() {
-                "match_class" => r.match_class = Some(need_str(&v, &key)?),
-                "match_title" => r.match_title = Some(need_str(&v, &key)?),
-                "match_fullscreen" => r.match_fullscreen = Some(need_bool(&v, &key)?),
-                "match_xwayland" => r.match_xwayland = Some(need_bool(&v, &key)?),
-                "match_floating" => r.match_floating = Some(need_bool(&v, &key)?),
-                "floating" => r.floating = need_bool(&v, &key)?,
-                "tile" => r.tile = need_bool(&v, &key)?,
-                "workspace" => {
-                    r.workspace = Some((need_int(&v, &key)? as usize).saturating_sub(1))
-                }
-                "immediate" => r.immediate = need_bool(&v, &key)?,
-                "idle_inhibit" => r.idle_inhibit = Some(need_str(&v, &key)?),
-                "opacity" => r.opacity = Some(need_num(&v, &key)?),
-                "size" => {
-                    let wh = num_array::<2>(&v, &key)?;
-                    r.size = Some((wh[0] as i32, wh[1] as i32));
-                }
-                "center" => r.center = need_bool(&v, &key)?,
-                "rounding" => r.rounding = Some(need_int(&v, &key)?),
-                "blur" => r.blur = Some(need_bool(&v, &key)?),
-                "shadow" => r.shadow = Some(need_bool(&v, &key)?),
-                "dim" => r.dim = Some(need_num(&v, &key)?),
-                "pin" => r.pin = need_bool(&v, &key)?,
-                "keep_aspect_ratio" => r.keep_aspect_ratio = need_bool(&v, &key)?,
-                "focus_steal" => r.focus_steal = need_bool(&v, &key)?,
-                "redirect_mode" => {
-                    let m = need_str(&v, &key)?;
-                    if m != "redirect" && m != "passthrough" {
-                        return Err(format!(
-                            "window rule {n}: redirect_mode is redirect or passthrough"
-                        ));
+                "match" => {
+                    for m in indexed_entries(&v, "match").map_err(whine)? {
+                        rule.matches.push(matcher(&m, "match").map_err(whine)?);
                     }
-                    r.redirect_mode = Some(m);
                 }
-                "redirect_keys" => r.redirect_keys = str_array(&v, &key)?,
-                other => return Err(format!("window rule {n}: unknown key `{other}`")),
+                "exclude" => {
+                    for m in indexed_entries(&v, "exclude").map_err(whine)? {
+                        rule.excludes.push(matcher(&m, "exclude").map_err(whine)?);
+                    }
+                }
+                "open_floating" => {
+                    rule.open_floating = Some(need_bool(&v, &key).map_err(whine)?);
+                }
+                "open_on_workspace" => {
+                    let n = need_int(&v, &key).map_err(whine)?;
+                    if n < 1 {
+                        return Err(whine("open_on_workspace counts from 1".to_string()));
+                    }
+                    rule.open_on_workspace = Some(n as usize - 1);
+                }
+                "default_size" => {
+                    let dims = indexed_entries(&v, "default_size").map_err(whine)?;
+                    let dims: Vec<i64> = dims.iter().filter_map(vint).collect();
+                    match dims.as_slice() {
+                        [w, h] if *w > 0 && *h > 0 => {
+                            rule.default_size = Some((*w as i32, *h as i32));
+                        }
+                        _ => return Err(whine("default_size is { w, h }".to_string())),
+                    }
+                }
+                "open_centered" => rule.open_centered = need_bool(&v, &key).map_err(whine)?,
+                "opacity" => {
+                    rule.opacity = Some(
+                        super::f64_in(need_num(&v, &key).map_err(whine)?, "opacity", 0.0, 1.0)
+                            .map_err(whine)?,
+                    );
+                }
+                "allow_tearing" => {
+                    rule.allow_tearing = need_bool(&v, &key).map_err(whine)?;
+                }
+                other => return Err(whine(format!("unknown rule key `{other}`"))),
             }
         }
-        for pat in [&r.match_class, &r.match_title] {
-            if let Some(p) = pat {
-                regex_lite::Regex::new(p)
-                    .map_err(|e| format!("window rule {n}: bad regex \"{p}\": {e}"))?;
-            }
+        if rule.matches.is_empty() {
+            return Err(whine("needs a match".to_string()));
         }
-        rules.push((n, r));
+        cfg.rules.push(rule);
     }
-    rules.sort_by_key(|(n, _)| *n);
-    cfg.rules.extend(rules.into_iter().map(|(_, r)| r));
     Ok(())
 }
 
 fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    let mut rules: Vec<(i64, LayerRule)> = Vec::new();
-    for (idx, v) in table(v, "layer_rules")?.iter() {
-        let n = vint(&idx).ok_or("layer_rules is an array of tables")?;
-        let mut r = LayerRule::default();
-        for (k, v) in table(&v, "layer_rules entry")?.iter() {
-            let key = vstr(&k).ok_or("layer rule keys must be strings")?;
+    for (n, item) in indexed_entries(v, "layer_rules")?.into_iter().enumerate() {
+        let whine = |e: String| format!("layer rule {}: {e}", n + 1);
+        let mut rule = LayerRule::default();
+        for (k, v) in table(&item, "layer_rule")?.iter() {
+            let key = vstr(&k).ok_or("rule keys must be strings")?;
             match key.as_str() {
-                "match_namespace" => r.match_namespace = Some(need_str(&v, &key)?),
-                "animation" => r.animation = Some(need_str(&v, &key)?),
-                "blur" => r.blur = Some(need_bool(&v, &key)?),
-                "ignore_alpha" => r.ignore_alpha = Some(need_num(&v, &key)?),
-                other => return Err(format!("layer rule {n}: unknown key `{other}`")),
+                "match" => {
+                    for m in str_array(&v, "match").map_err(whine)? {
+                        rule.matches.push(super::regex(&m).map_err(whine)?);
+                    }
+                }
+                other => return Err(whine(format!("unknown key `{other}`"))),
             }
         }
-        rules.push((n, r));
-    }
-    rules.sort_by_key(|(n, _)| *n);
-    cfg.layer_rules.extend(rules.into_iter().map(|(_, r)| r));
-    Ok(())
-}
-
-// -- gpus, submaps, specials, remaps --
-
-fn gpus(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (name, v) in table(v, "gpus")?.iter() {
-        let name = vstr(&name).ok_or("gpus keys are card names")?;
-        let mut gpu = GpuCfg { name: name.clone(), skip_renderer: false };
-        for (k, v) in table(&v, &name)?.iter() {
-            let key = vstr(&k).ok_or("gpu keys must be strings")?;
-            match key.as_str() {
-                "skip_renderer" => gpu.skip_renderer = need_bool(&v, &key)?,
-                other => return Err(format!("gpu \"{name}\": unknown key `{other}`")),
-            }
+        if rule.matches.is_empty() {
+            return Err(whine("needs a match".to_string()));
         }
-        cfg.gpus.push(gpu);
+        cfg.layer_rules.push(rule);
     }
-    cfg.gpus.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(())
 }
 
-fn submaps(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (name, v) in table(v, "submaps")?.iter() {
-        let name = vstr(&name).ok_or("submaps keys are submap names")?;
-        let mut entries: Vec<(i64, Bind)> = Vec::new();
-        for (idx, v) in table(&v, &name)?.iter() {
-            let n = vint(&idx).ok_or_else(|| format!("submap \"{name}\" is a bind array"))?;
-            if let Some(b) = bind_entry(&v, n)? {
-                entries.push((n, b));
-            }
-        }
-        entries.sort_by_key(|(n, _)| *n);
-        cfg.submaps
-            .push((name, entries.into_iter().map(|(_, b)| b).collect()));
-    }
-    cfg.submaps.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(())
-}
-
-// name = "command" spawns on first toggle; name = true is a bare scratchpad
-fn specials(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (name, v) in table(v, "specials")?.iter() {
-        let name = vstr(&name).ok_or("specials keys are scratchpad names")?;
-        let spawn = match (vstr(&v), vbool(&v)) {
-            (Some(s), _) => Some(s),
-            (None, Some(true)) => None,
-            _ => {
-                return Err(format!(
-                    "special \"{name}\" wants a spawn string or true"
-                ))
-            }
-        };
-        cfg.specials.push((name, spawn));
-    }
-    cfg.specials.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(())
-}
-
+// ordered array; profile order is precedence, same as file order in kdl
 fn remaps(v: &Value, cfg: &mut Config) -> Result<(), String> {
-    for (name, v) in table(v, "remaps")?.iter() {
-        let name = vstr(&name).ok_or("remaps keys are profile names")?;
-        let mut p = RemapProfile { name: name.clone(), ..Default::default() };
-        for (k, v) in table(&v, &name)?.iter() {
+    for (n, item) in indexed_entries(v, "remaps")?.into_iter().enumerate() {
+        let whine = |e: String| format!("remap {}: {e}", n + 1);
+        let mut p = RemapProfile::default();
+        for (k, v) in table(&item, "remap")?.iter() {
             let key = vstr(&k).ok_or("remap keys must be strings")?;
             match key.as_str() {
-                "class" => p.class = Some(need_str(&v, &key)?),
-                "title" => p.title = Some(need_str(&v, &key)?),
-                "type" => {
-                    let t = need_str(&v, &key)?;
-                    if t != "x11" && t != "wayland" {
-                        return Err(format!(
-                            "remap \"{name}\": type is \"x11\" or \"wayland\""
-                        ));
+                "name" => p.name = need_str(&v, &key).map_err(whine)?,
+                "match" => {
+                    for (k, v) in table(&v, "match").map_err(whine)?.iter() {
+                        let key = vstr(&k).ok_or("matcher keys must be strings")?;
+                        match key.as_str() {
+                            "app_id" => p.app_id = Some(need_str(&v, &key).map_err(whine)?),
+                            "title" => p.title = Some(need_str(&v, &key).map_err(whine)?),
+                            "is_xwayland" => {
+                                p.is_xwayland = Some(need_bool(&v, &key).map_err(whine)?);
+                            }
+                            "pid" => p.pid = Some(need_int(&v, &key).map_err(whine)? as i32),
+                            "workspace" => {
+                                p.workspace =
+                                    Some(need_int(&v, &key).map_err(whine)?.max(1) as usize);
+                            }
+                            other => return Err(whine(format!("unknown matcher `{other}`"))),
+                        }
                     }
-                    p.win_type = Some(t);
                 }
-                "pid" => p.pid = Some(need_int(&v, &key)?),
-                "workspace" => p.workspace = Some(need_int(&v, &key)?.max(1) as usize),
                 "maps" => {
-                    let mut entries: Vec<(i64, (u32, u32))> = Vec::new();
-                    for (idx, v) in table(&v, &key)?.iter() {
-                        let n = vint(&idx)
-                            .ok_or_else(|| format!("remap \"{name}\": maps is an array"))?;
-                        let pair = str_array(&v, &key)?;
+                    for pair in indexed_entries(&v, "maps").map_err(whine)? {
+                        let pair = str_array(&pair, "maps").map_err(whine)?;
                         let [from, to] = pair.as_slice() else {
-                            return Err(format!("remap \"{name}\": map wants two key names"));
+                            return Err(whine("map entries are { \"From\", \"To\" }".to_string()));
                         };
-                        let f = super::keycode(&from.to_lowercase()).ok_or_else(|| {
-                            format!("remap \"{name}\": unknown key \"{from}\"")
-                        })?;
-                        let t = super::keycode(&to.to_lowercase()).ok_or_else(|| {
-                            format!("remap \"{name}\": unknown key \"{to}\"")
-                        })?;
-                        entries.push((n, (f, t)));
+                        let f = super::keycode(&from.to_lowercase())
+                            .ok_or_else(|| whine(format!("unknown key \"{from}\"")))?;
+                        let t = super::keycode(&to.to_lowercase())
+                            .ok_or_else(|| whine(format!("unknown key \"{to}\"")))?;
+                        p.maps.push((f, t));
                     }
-                    entries.sort_by_key(|(n, _)| *n);
-                    p.maps = entries.into_iter().map(|(_, m)| m).collect();
                 }
-                other => return Err(format!("remap \"{name}\": unknown key `{other}`")),
+                other => return Err(whine(format!("unknown key `{other}`"))),
             }
         }
         if p.maps.is_empty() {
-            return Err(format!("remap \"{name}\" has no map entries"));
+            return Err(whine("has no map entries".to_string()));
         }
         cfg.remaps.push(p);
     }
-    cfg.remaps.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(())
+}
+
+fn debug(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    for (k, v) in table(v, "debug")?.iter() {
+        let key = vstr(&k).ok_or("debug keys must be strings")?;
+        match key.as_str() {
+            "render_drm_device" => cfg.debug.render_drm_device = Some(need_str(&v, &key)?),
+            "ignore_drm_devices" => {
+                cfg.debug.ignore_drm_devices = str_array(&v, &key)?;
+            }
+            other => return Err(format!("unknown debug key `{other}`")),
+        }
+    }
     Ok(())
 }
 
@@ -707,265 +754,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_lua_config_builds_the_same_shape() {
-        let cfg = parse(
-            r#"
-            carrot = {
-                general = {
-                    gaps_in = 5, gaps_out = 10, border_size = 2,
-                    active_border = "89b4fa", inactive_border = "585b70",
-                    allow_tearing = true, software_cursor = true,
-                },
-                input = { accel_profile = "flat", natural_scroll = true, repeat_rate = 35 },
-                devices = { ["turtle-beach"] = { accel_speed = -0.86 } },
-                outputs = { ["DP-3"] = { mode = "2560x1440@480" } },
-                binds = {
-                    { "Meta", "Return", "exec", "foot" },
-                    { "Meta", "1", "workspace", 1 },
-                },
-            }
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.gaps_in, 5);
-        assert_eq!(cfg.border, 2);
-        assert!(cfg.allow_tearing && cfg.software_cursor);
-        assert_eq!(cfg.input.accel_profile.as_deref(), Some("flat"));
-        assert_eq!(cfg.repeat_rate, 35);
-        assert_eq!(cfg.devices[0].accel_speed, Some(-0.86));
-        assert_eq!(cfg.outputs[0].mode, Some((2560, 1440, Some(480))));
-        // defaults come first, both parsers append; ours are the tail
-        let base = Config::default().binds.len();
-        assert_eq!(cfg.binds.len(), base + 2);
-        assert_eq!(cfg.binds[base].action, Action::Spawn("foot".to_string()));
-        assert_eq!(cfg.binds[base + 1].action, Action::Workspace(0));
-    }
-
-    // kdl is the reference: every section spelled in both languages must
-    // land on the identical Config
-    #[test]
-    fn kdl_and_lua_reach_the_same_config() {
-        let kdl = super::super::parse(
+    fn lua_and_kdl_parse_to_the_same_config() {
+        let kdl = crate::config::parse(
             r##"
-            general {
+            input {
+                keyboard { repeat-rate 35; repeat-delay 250 }
+                mouse { accel-profile "flat"; natural-scroll }
+                device "turtle-beach" { accel-speed -0.86 }
+            }
+            layout {
                 gaps-in 4
                 gaps-out 8
-                border-size 2
-                active-border "89b4fa"
-                inactive-border "585b70cc"
-                float-above-fullscreen #true
-                layout "dwindle"
+                border { width 2; active-color "#89b4fa"; inactive-color "#585b70" }
+            }
+            output "DP-3" { mode "2560x1440@480"; variable-refresh-rate }
+            screencast { picker "fuzzel-pick" }
+            binds {
+                Mod+Return { spawn "foot"; }
+                Mod+1 { focus-workspace 1; }
+                XF86AudioMute allow-when-locked=#true { spawn-sh "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"; }
+            }
+            window-rule {
+                match app-id=#"^steam_app_"# title=#"Isaac"#
+                open-floating #true
                 allow-tearing #true
-                software-cursor #true
-            }
-            input {
-                repeat-rate 35
-                repeat-delay 250
-                accel-profile "adaptive"
-                natural-scroll #true
-                tap #true
-                dwt #true
-                layout "de"
-                numlock #true
-            }
-            device "turtle-beach" {
-                accel-speed -0.86
-                accel-profile "flat"
-                natural-scroll #false
-                dpi 1600.0
-            }
-            bind "Meta" "Return" "exec" "foot"
-            bind "Meta" "1" "workspace" "1"
-            bind "Meta+Shift" "q" "close" type="release"
-            decoration {
-                rounding 8
-                blur { enabled #true; size 6; passes 3 }
-                shadow { enabled #true; range 24 }
-            }
-            animations {
-                bezier "ease" 0.25 0.1 0.25 1.0
-                spring "pop" 1.0 200.0 20.0
-                animation "windows" { enabled #true; speed 2.0; curve "ease"; style "popin" }
-            }
-            window-rule {
-                match class="^foot$" title="^scratch$" fullscreen=#false xwayland=#false floating=#true
-                floating #true
-                workspace 3
-                immediate #true
-                idle-inhibit "focus"
-                opacity 0.9
-                size 800 600
-                center #true
-                rounding 4
-                blur #false
-                shadow #false
-                dim 0.2
-                pin #true
-                keep-aspect-ratio #true
-                focus-steal #true
-                input-redirect "passthrough" "f13" "f14"
-            }
-            window-rule {
-                match class="^steam_app_.*$"
-                tile #true
-            }
-            layer-rule {
-                match namespace="^launcher$"
-                animation "fade"
-                blur #true
-                ignore-alpha 0.2
-            }
-            output "DP-3" {
-                mode "2560x1440@480"
-                vrr "automatic"
-                gpu "card1"
-                scale 1.5
-            }
-            gpu "card1" { skip-renderer #true }
-            special "term" { spawn "foot -a term" }
-            special "zzz"
-            submap "resize" {
-                bind "" "h" "focus-left"
             }
             remap "isaac" {
-                class "steam_app_250900"
-                title "Isaac"
-                type "x11"
-                pid 4242
-                workspace 2
+                match app-id="steam_app_250900"
                 map "Alt_R" "Left"
-                map "Slash" "Up"
             }
             "##,
         )
         .unwrap();
         let lua = parse(
-            r#"
+            r##"
             carrot = {
-                general = {
-                    gaps_in = 4, gaps_out = 8, border_size = 2,
-                    active_border = "89b4fa", inactive_border = "585b70cc",
-                    float_above_fullscreen = true, layout = "dwindle",
-                    allow_tearing = true, software_cursor = true,
-                },
                 input = {
-                    repeat_rate = 35, repeat_delay = 250,
-                    accel_profile = "adaptive", natural_scroll = true,
-                    tap = true, dwt = true, layout = "de", numlock = true,
+                    keyboard = { repeat_rate = 35, repeat_delay = 250 },
+                    mouse = { accel_profile = "flat", natural_scroll = true },
+                    devices = { ["turtle-beach"] = { accel_speed = -0.86 } },
                 },
-                devices = {
-                    ["turtle-beach"] = {
-                        accel_speed = -0.86, accel_profile = "flat",
-                        natural_scroll = false, dpi = 1600.0,
-                    },
+                layout = {
+                    gaps_in = 4,
+                    gaps_out = 8,
+                    border = { width = 2, active_color = "#89b4fa", inactive_color = "#585b70" },
                 },
+                outputs = { ["DP-3"] = { mode = "2560x1440@480", vrr = "always" } },
+                screencast = { picker = "fuzzel-pick" },
                 binds = {
-                    { "Meta", "Return", "exec", "foot" },
-                    { "Meta", "1", "workspace", 1 },
-                    { "Meta+Shift", "q", "close", type = "release" },
-                },
-                decorations = {
-                    rounding = 8,
-                    blur = { enabled = true, size = 6, passes = 3 },
-                    shadow = { enabled = true, range = 24 },
-                },
-                animations = {
-                    beziers = { ease = { 0.25, 0.1, 0.25, 1.0 } },
-                    springs = { pop = { 1.0, 200.0, 20.0 } },
-                    animations = {
-                        windows = { enabled = true, speed = 2.0, curve = "ease", style = "popin" },
-                    },
+                    { chord = "Mod+Return", action = "spawn", args = { "foot" } },
+                    { chord = "Mod+1", action = "focus-workspace", args = { 1 } },
+                    { chord = "XF86AudioMute", action = "spawn-sh",
+                      args = { "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" },
+                      allow_when_locked = true },
                 },
                 window_rules = {
-                    {
-                        match_class = "^foot$", match_title = "^scratch$",
-                        match_fullscreen = false, match_xwayland = false, match_floating = true,
-                        floating = true, workspace = 3, immediate = true,
-                        idle_inhibit = "focus", opacity = 0.9, size = { 800, 600 },
-                        center = true, rounding = 4, blur = false, shadow = false,
-                        dim = 0.2, pin = true, keep_aspect_ratio = true, focus_steal = true,
-                        redirect_mode = "passthrough", redirect_keys = { "f13", "f14" },
-                    },
-                    { match_class = "^steam_app_.*$", tile = true },
-                },
-                layer_rules = {
-                    {
-                        match_namespace = "^launcher$", animation = "fade",
-                        blur = true, ignore_alpha = 0.2,
-                    },
-                },
-                outputs = {
-                    ["DP-3"] = { mode = "2560x1440@480", vrr = "automatic", gpu = "card1", scale = 1.5 },
-                },
-                gpus = { card1 = { skip_renderer = true } },
-                specials = { term = "foot -a term", zzz = true },
-                submaps = {
-                    resize = { { "", "h", "focus-left" } },
+                    { match = { { app_id = "^steam_app_", title = "Isaac" } },
+                      open_floating = true, allow_tearing = true },
                 },
                 remaps = {
-                    isaac = {
-                        class = "steam_app_250900", title = "Isaac", type = "x11",
-                        pid = 4242, workspace = 2,
-                        maps = { { "Alt_R", "Left" }, { "Slash", "Up" } },
-                    },
+                    { name = "isaac", match = { app_id = "steam_app_250900" },
+                      maps = { { "Alt_R", "Left" } } },
                 },
             }
-            "#,
+            "##,
         )
         .unwrap();
         assert_eq!(kdl, lua);
     }
 
     #[test]
-    fn new_lua_sections_fail_loud() {
-        assert!(parse("carrot = { decorations = { runding = 1 } }").is_err());
-        assert!(parse("carrot = { animations = { bezier = {} } }").is_err());
-        assert!(
-            parse(r#"carrot = { animations = { beziers = { e = { 0.1, 0.2 } } } }"#).is_err(),
-            "a bezier wants four numbers"
-        );
-        assert!(
-            parse(r#"carrot = { window_rules = { { match_class = "[unclosed" } } }"#).is_err(),
-            "bad regex must fail at parse"
-        );
-        assert!(
-            parse(r#"carrot = { window_rules = { { redirect_mode = "sometimes" } } }"#).is_err()
-        );
-        assert!(parse(r#"carrot = { layer_rules = { { blurr = true } } }"#).is_err());
-        assert!(parse(r#"carrot = { gpus = { card0 = { skip = true } } }"#).is_err());
-        assert!(parse(r#"carrot = { specials = { s = false } }"#).is_err());
-        assert!(
-            parse(r#"carrot = { remaps = { r = { class = "x" } } }"#).is_err(),
-            "a remap with no maps is dead weight"
-        );
-        assert!(
-            parse(r#"carrot = { remaps = { r = { maps = { { "a", "nope" } } } } }"#).is_err(),
-            "unknown key names must fail"
-        );
-        assert!(
-            parse(r#"carrot = { input = { accel_profile = "warp" } }"#).is_err(),
-            "accel profile is flat or adaptive"
-        );
-        assert!(
-            parse(r#"carrot = { outputs = { ["DP-1"] = { vrr = "sometimes" } } }"#).is_err()
-        );
-        assert!(
-            parse(r#"carrot = { binds = { { "Meta", "q", "close", type = "hold" } } }"#).is_err()
-        );
-    }
-
-    #[test]
-    fn lua_fails_loud() {
-        // real logic runs before the table lands
-        assert!(parse("this is not lua").is_err());
-        assert!(parse("x = 1").is_err(), "no carrot table");
-        assert!(
-            parse("carrot = { generall = {} }").is_err(),
-            "typo'd section must not be ignored"
-        );
-        assert!(
-            parse("carrot = { general = { gaps_in = 'five' } }").is_err(),
-            "wrong type must not be ignored"
-        );
+    fn lua_errors_are_loud_and_accumulate() {
+        let errs = parse("carrot = { nonsense = 1 }").unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("unknown section")), "{errs:?}");
+        let errs = parse(
+            "carrot = { layout = { gaps_in = \"soup\" }, cursor = { sizes = 1 } }",
+        )
+        .unwrap_err();
+        assert_eq!(errs.len(), 2, "both sections report: {errs:?}");
     }
 }

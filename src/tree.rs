@@ -740,14 +740,14 @@ pub fn tiling_area_for(state: &Rc<State>, ws: &Workspace) -> Rect {
 // outer gap on screen-flush edges, inner gap on shared edges, then the border
 // insets all four sides; never below 1px
 fn apply_gaps(r: Rect, area: Rect, cfg: &crate::config::Config) -> Rect {
-    let left = if r.x1 <= area.x1 { cfg.gaps_out } else { cfg.gaps_in };
-    let top = if r.y1 <= area.y1 { cfg.gaps_out } else { cfg.gaps_in };
-    let right = if r.x2 >= area.x2 { cfg.gaps_out } else { cfg.gaps_in };
-    let bottom = if r.y2 >= area.y2 { cfg.gaps_out } else { cfg.gaps_in };
-    let x1 = r.x1 + left + cfg.border;
-    let y1 = r.y1 + top + cfg.border;
-    let x2 = (r.x2 - right - cfg.border).max(x1 + 1);
-    let y2 = (r.y2 - bottom - cfg.border).max(y1 + 1);
+    let left = if r.x1 <= area.x1 { cfg.layout.gaps_out } else { cfg.layout.gaps_in };
+    let top = if r.y1 <= area.y1 { cfg.layout.gaps_out } else { cfg.layout.gaps_in };
+    let right = if r.x2 >= area.x2 { cfg.layout.gaps_out } else { cfg.layout.gaps_in };
+    let bottom = if r.y2 >= area.y2 { cfg.layout.gaps_out } else { cfg.layout.gaps_in };
+    let x1 = r.x1 + left + cfg.layout.border.width;
+    let y1 = r.y1 + top + cfg.layout.border.width;
+    let x2 = (r.x2 - right - cfg.layout.border.width).max(x1 + 1);
+    let y2 = (r.y2 - bottom - cfg.layout.border.width).max(y1 + 1);
     Rect { x1, y1, x2, y2 }
 }
 
@@ -788,7 +788,7 @@ pub fn window_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<Window>, Rc<Wl
         None
     };
     if let Some(fs) = &fs {
-        if state.config.borrow().float_above_fullscreen {
+        if state.config.borrow().layout.float_above_fullscreen {
             if let Some(hit) = check_floats(&ws) {
                 return Some(hit);
             }

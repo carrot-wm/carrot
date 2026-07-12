@@ -1355,6 +1355,7 @@ impl Object for XdgPopup {
 
 // the answer is always server_side: carrot draws the borders, clients
 // keep their pixels to themselves
+const DECO_CLIENT_SIDE: u32 = 1;
 const DECO_SERVER_SIDE: u32 = 2;
 
 pub struct XdgDecorationManagerGlobal;
@@ -1405,6 +1406,7 @@ impl zxdg_decoration_manager_v1::Handler for XdgDecorationManager {
             client: self.client.clone(),
             version: self.version,
             toplevel,
+            requested: std::cell::Cell::new(None),
         });
         self.client.add_client_obj(deco.clone())?;
         deco.announce();
@@ -1435,15 +1437,22 @@ pub struct XdgDecoration {
     pub client: Rc<Client>,
     pub version: u32,
     toplevel: Rc<XdgToplevel>,
+    /// the client's set_mode wish; None means it left the choice to us
+    requested: std::cell::Cell<Option<u32>>,
 }
 
 impl XdgDecoration {
     // decoration configure first, then the xdg_surface configure that
     // makes it take effect
     fn announce(&self) {
-        self.client.event(|o| {
-            zxdg_toplevel_decoration_v1::configure::send(o, self.id, DECO_SERVER_SIDE)
-        });
+        // prefer-no-csd overrides the client's wish; otherwise it decides
+        let mode = if self.client.state.config.borrow().prefer_no_csd {
+            DECO_SERVER_SIDE
+        } else {
+            self.requested.get().unwrap_or(DECO_SERVER_SIDE)
+        };
+        self.client
+            .event(|o| zxdg_toplevel_decoration_v1::configure::send(o, self.id, mode));
         self.toplevel.xdg.schedule_configure();
     }
 }
@@ -1459,8 +1468,10 @@ impl zxdg_toplevel_decoration_v1::Handler for XdgDecoration {
 
     fn set_mode(
         &self,
-        _req: zxdg_toplevel_decoration_v1::set_mode::Request,
+        req: zxdg_toplevel_decoration_v1::set_mode::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.requested
+            .set((req.mode == DECO_CLIENT_SIDE).then_some(DECO_CLIENT_SIDE));
         self.announce();
         Ok(())
     }
@@ -1469,6 +1480,7 @@ impl zxdg_toplevel_decoration_v1::Handler for XdgDecoration {
         &self,
         _req: zxdg_toplevel_decoration_v1::unset_mode::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.requested.set(None);
         self.announce();
         Ok(())
     }
@@ -1661,7 +1673,7 @@ pub(crate) mod tests {
         let win = tl.window.borrow().clone().unwrap();
         let g = {
             let c = state.config.borrow();
-            c.gaps_out + c.border
+            c.layout.gaps_out + c.layout.border.width
         };
         assert_eq!(win.rect.get(), Rect { x1: g, y1: g, x2: 800 - g, y2: 600 - g });
         // the relayout configure carries the tile size
@@ -1762,7 +1774,7 @@ pub(crate) mod tests {
         let win = t1.window.borrow().clone().unwrap();
         let g = {
             let c = state.config.borrow();
-            c.gaps_out + c.border
+            c.layout.gaps_out + c.layout.border.width
         };
         assert_eq!(win.rect.get(), Rect { x1: g, y1: g, x2: 800 - g, y2: 600 - g });
         assert!(win.rect.get().width() > w1_rect.width());
@@ -2450,11 +2462,11 @@ pub(crate) mod tests {
         let (state, _client, seat, tl1, tl2) = grab_setup();
         let win1 = tl1.window.borrow().clone().unwrap();
         *seat.kb_focus.borrow_mut() = Some(tl2.xdg.surface.clone());
-        crate::ipc::dispatch_action(&state, &crate::config::Action::SplitRatio(0.2));
+        crate::ipc::dispatch_action(&state, &crate::config::Action::AdjustSplitRatio(0.2));
         assert_eq!(win1.rect.get().x2, 240, "the second tile grew");
         // the ratio bottoms out instead of collapsing the sibling
         for _ in 0..5 {
-            crate::ipc::dispatch_action(&state, &crate::config::Action::SplitRatio(0.2));
+            crate::ipc::dispatch_action(&state, &crate::config::Action::AdjustSplitRatio(0.2));
         }
         assert_eq!(win1.rect.get().x2, 80);
     }

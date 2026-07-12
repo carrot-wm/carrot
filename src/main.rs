@@ -243,14 +243,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     // config before anything can consume it; a broken file is fatal here
     // and only here - reloads reject instead
+    // a broken file never strands the session: the embedded default takes
+    // over and every error is printed + kept for ipc subscribers
     match config::load() {
-        Ok(c) => *state.config.borrow_mut() = std::rc::Rc::new(c),
-        Err(e) => {
-            eprintln!("carrot: config: {e}");
-            state.clear();
-            engine.clear();
-            return Err(e.into());
+        config::Loaded::Ok(c) | config::Loaded::FirstRun(c) => {
+            *state.config.borrow_mut() = std::rc::Rc::new(c);
         }
+        config::Loaded::Fallback { errors } => {
+            *state.config.borrow_mut() = std::rc::Rc::new(config::Config::default());
+            let ev = serde_json::json!({ "event": "config-loaded", "failed": true,
+                                         "errors": errors, "cold-keys-pending": [] });
+            *state.last_config_event.borrow_mut() = Some(ev.to_string());
+        }
+    }
+    for sp in state.config.borrow().spawns.clone().iter() {
+        ipc::run_spawn(&state, sp);
     }
     if let Some(seat) = state.seat.borrow().clone() {
         seat.apply_input_config(&state);

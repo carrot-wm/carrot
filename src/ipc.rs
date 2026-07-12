@@ -143,6 +143,7 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
         Ok("windows") => Ok(windows_json(state)),
         Ok("clients") => Ok(clients_json(state)),
         Ok("reload") => reload(state).map(|_| json!(true)),
+        Ok("binds") => Ok(binds_json(state)),
         Ok("dump-shadow") => dump_shadow(state),
         Ok("dpms-off") => {
             crate::output::dpms(state, false);
@@ -159,8 +160,8 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
 
 pub fn dispatch_action(state: &Rc<State>, action: &Action) {
     match action {
-        Action::Workspace(n) => crate::tree::switch_workspace(state, *n),
-        Action::WorkspaceRel(d) => crate::tree::switch_workspace_rel(state, *d),
+        Action::FocusWorkspace(n) => crate::tree::switch_workspace(state, *n),
+        Action::FocusWorkspaceRel(d) => crate::tree::switch_workspace_rel(state, *d),
         Action::SendToWorkspace(n) => crate::tree::send_to_workspace(state, *n, false),
         Action::MoveToWorkspace(n) => crate::tree::send_to_workspace(state, *n, true),
         Action::ToggleFullscreen => {
@@ -184,7 +185,7 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
         Action::FocusPrev => crate::tree::focus_cycle(state, -1),
         Action::FocusDir(d) => crate::tree::focus_dir(state, *d),
         Action::SwapDir(d) => crate::tree::swap_dir(state, *d),
-        Action::SplitRatio(d) => {
+        Action::AdjustSplitRatio(d) => {
             if let Some(win) = crate::tree::focused_window(state) {
                 if !win.floating.get()
                     && !win.fullscreen.get()
@@ -197,19 +198,28 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
                 }
             }
         }
-        Action::Spawn(cmd) => spawn(state, cmd),
+        Action::Spawn(argv) => spawn_argv(state, argv),
+        Action::SpawnSh(cmd) => spawn_sh(state, cmd),
         Action::Quit => state.ring.stop(),
     }
 }
 
 // reap first so dead children never pile up as zombies, then detach the
 // new one into its own session
-fn spawn(state: &Rc<State>, cmd: &str) {
+fn spawn_cmd(state: &Rc<State>, mut c: std::process::Command, what: &str) {
     use rustix::process::{WaitOptions, wait};
     while let Ok(Some(_)) = wait(WaitOptions::NOHANG) {}
     use std::os::unix::process::CommandExt;
-    let mut c = std::process::Command::new("/bin/sh");
-    c.arg("-c").arg(cmd);
+    for (name, val) in state.config.borrow().environment.iter() {
+        match val {
+            Some(v) => {
+                c.env(name, v);
+            }
+            None => {
+                c.env_remove(name);
+            }
+        }
+    }
     if let Some(xw) = state.xwayland.borrow().as_ref() {
         c.env("DISPLAY", format!(":{}", xw.display));
     }
@@ -222,13 +232,79 @@ fn spawn(state: &Rc<State>, cmd: &str) {
     }
     match c.spawn() {
         Ok(_) => {}
-        Err(e) => eprintln!("carrot: spawn \"{cmd}\": {e}"),
+        Err(e) => eprintln!("carrot: spawn \"{what}\": {e}"),
     }
 }
 
+fn spawn_argv(state: &Rc<State>, argv: &[String]) {
+    let Some((bin, rest)) = argv.split_first() else { return };
+    let mut c = std::process::Command::new(bin);
+    c.args(rest);
+    spawn_cmd(state, c, bin);
+}
+
+fn spawn_sh(state: &Rc<State>, cmd: &str) {
+    let mut c = std::process::Command::new("/bin/sh");
+    c.arg("-c").arg(cmd);
+    spawn_cmd(state, c, cmd);
+}
+
+pub fn run_spawn(state: &Rc<State>, s: &crate::config::SpawnCfg) {
+    match s {
+        crate::config::SpawnCfg::Argv(argv) => spawn_argv(state, argv),
+        crate::config::SpawnCfg::Sh(cmd) => spawn_sh(state, cmd),
+    }
+}
+
+/// emit the config status and keep it for late subscribers
+pub fn config_event(state: &Rc<State>, failed: bool, errors: &[String], cold: &[String]) {
+    let ev = json!({ "event": "config-loaded", "failed": failed,
+                     "errors": errors, "cold-keys-pending": cold });
+    *state.last_config_event.borrow_mut() = Some(ev.to_string());
+    emit(state, &ev);
+}
+
+// a failed reload keeps the running config, never a default
 pub fn reload(state: &Rc<State>) -> Result<(), String> {
-    let cfg = crate::config::load()?;
-    let sw = cfg.software_cursor;
+    let path = crate::config::config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("{}: {e}", path.display());
+            config_event(state, true, std::slice::from_ref(&msg), &[]);
+            return Err(msg);
+        }
+    };
+    let parsed = if path.extension().is_some_and(|e| e == "lua") {
+        crate::config::lua::parse(&text)
+    } else {
+        crate::config::parse(&text)
+    };
+    let cfg = match parsed {
+        Ok(c) => c,
+        Err(errors) => {
+            config_event(state, true, &errors, &[]);
+            return Err(errors.join("; "));
+        }
+    };
+    // cold keys: swapped in, but the running session won't reflect them
+    let mut cold: Vec<String> = Vec::new();
+    {
+        let old = state.config.borrow().clone();
+        if old.outputs != cfg.outputs {
+            cold.push("outputs".to_string());
+        }
+        if old.debug != cfg.debug {
+            cold.push("debug".to_string());
+        }
+        if old.spawns != cfg.spawns {
+            cold.push("spawn-at-startup".to_string());
+        }
+    }
+    for k in &cold {
+        eprintln!("carrot: config: {k}: needs restart");
+    }
+    let sw = cfg.cursor.software;
     *state.config.borrow_mut() = Rc::new(cfg);
     if let Some(seat) = state.seat.borrow().clone() {
         seat.apply_input_config(state);
@@ -240,7 +316,7 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
     crate::tree::relayout(state, &ws);
     crate::shell::layer::arrange(state);
     state.damage.trigger();
-    emit(state, &json!({ "config-reloaded": true }));
+    config_event(state, false, &[], &cold);
     Ok(())
 }
 
@@ -398,6 +474,12 @@ async fn subscribe(state: &Rc<State>, fd: &Rc<OwnedFd>) {
     // snapshot first, deltas after
     sub.push(&json!({ "workspaces": workspaces_json(state) }));
     sub.push(&json!({ "windows": windows_json(state) }));
+    // the config status is stateful: late subscribers get the last one
+    if let Some(ev) = state.last_config_event.borrow().as_deref() {
+        if let Ok(v) = serde_json::from_str::<Value>(ev) {
+            sub.push(&v);
+        }
+    }
     state.ipc_subs.borrow_mut().push(sub.clone());
     loop {
         sub.kick.triggered().await;
@@ -439,4 +521,24 @@ pub fn emit<T: Serialize>(state: &Rc<State>, event: &T) {
             sub.push(&v);
         }
     }
+}
+
+/// every bind with its wire-twin action; shells render hotkey overlays
+/// from this instead of a compositor-drawn one
+fn binds_json(state: &Rc<State>) -> Value {
+    let cfg = state.config.borrow().clone();
+    let list: Vec<Value> = cfg
+        .binds
+        .iter()
+        .map(|b| {
+            json!({
+                "mods": b.mods,
+                "key": b.key,
+                "action": b.action,
+                "title": b.title,
+                "allow-when-locked": b.allow_when_locked,
+            })
+        })
+        .collect();
+    json!(list)
 }

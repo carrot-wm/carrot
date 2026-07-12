@@ -413,7 +413,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                     out.usable.set(out.rect());
                     out.ws.set(outputs.len().min(8));
                     x += out.width as i32;
-                    seed_cursor(&out);
+                    seed_cursor(state, &out);
                     let refresh = out
                         .conn
                         .pipe
@@ -662,7 +662,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                 display.sw_hot.set(hot);
             }
         }
-        if state.config.borrow().software_cursor {
+        if state.config.borrow().cursor.software {
             display.set_software_cursor(state, true);
         }
         // heads on OTHER cards are a phase-11 (multi-gpu) problem; say so
@@ -964,10 +964,10 @@ fn warn_other_cards(active: &std::path::Path) {
 }
 
 /// seed the cursor plane: system theme, else built-in arrow
-fn seed_cursor(out: &Rc<Output>) {
+fn seed_cursor(state: &Rc<State>, out: &Rc<Output>) {
     if let Some(p) = out.conn.pipe.borrow().as_ref() {
         if let Some(cur) = &p.cursor {
-            match crate::input::cursor_theme::load("left_ptr") {
+            match crate::input::cursor_theme::load("left_ptr", &state.config.borrow().cursor) {
                 Some(img) => {
                     cur.write(&img.pixels, img.width, img.height);
                     cur.hotspot.set(img.hotspot);
@@ -1178,7 +1178,7 @@ fn rescan(state: &Rc<State>) {
         match init_output(&d.dev, &d.core, &d.renderer, conn, d.devnum) {
             Ok(out) => {
                 let out = Rc::new(out);
-                seed_cursor(&out);
+                seed_cursor(state, &out);
                 register_output_global(state, d, &out);
                 let st = state.clone();
                 let o = out.clone();
@@ -1716,23 +1716,22 @@ fn vrr_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
         .outputs
         .iter()
         .find(|o| o.name == out.conn.name)
-        .and_then(|o| o.vrr.as_deref())
-        .unwrap_or("off")
-        .to_string();
-    if mode == "off" {
+        .map(|o| o.vrr)
+        .unwrap_or(crate::config::Vrr::Off);
+    if mode == crate::config::Vrr::Off {
         return false;
     }
     if !out.conn.vrr_capable {
         if !out.vrr_warned.replace(true) {
             eprintln!(
-                "carrot: {}: vrr \"{mode}\" configured but the panel is not vrr capable",
+                "carrot: {}: vrr configured but the panel is not vrr capable",
                 out.conn.name
             );
         }
         return false;
     }
-    match mode.as_str() {
-        "always" => true,
+    match mode {
+        crate::config::Vrr::Always => true,
         // automatic: a fullscreen window is what's on glass
         _ => state
             .workspaces
@@ -1746,7 +1745,14 @@ fn vrr_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
 /// surface asked for async presentation; pending cursor changes ride the
 /// sync path so they aren't lost
 fn tearing_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
-    if !out.dev.supports_async_flip || !state.config.borrow().allow_tearing {
+    let allowed = state
+        .config
+        .borrow()
+        .outputs
+        .iter()
+        .find(|o| o.name == out.conn.name)
+        .is_some_and(|o| o.allow_tearing);
+    if !out.dev.supports_async_flip || !allowed {
         return false;
     }
     if out.conn.cursor_changed() {
@@ -1841,14 +1847,14 @@ fn compose_ops(
             let color = match &focused {
                 Some(f) => {
                     if Rc::ptr_eq(f, &surface) {
-                        cfg.border_focused
+                        cfg.layout.border.active
                     } else {
-                        cfg.border_unfocused
+                        cfg.layout.border.inactive
                     }
                 }
-                None => cfg.border_unfocused,
+                None => cfg.layout.border.inactive,
             };
-            push_borders(out, rect, cfg.border, color, ops);
+            push_borders(out, rect, cfg.layout.border.width, color, ops);
         }
         let geo = win.geometry();
         let alpha = win.rule_opacity.get().unwrap_or(1.0);
@@ -1869,7 +1875,7 @@ fn compose_ops(
     if let Some(fs) = &fs {
         draw(fs, &mut ops, &mut live);
     }
-    if fs.is_none() || cfg.float_above_fullscreen {
+    if fs.is_none() || cfg.layout.float_above_fullscreen {
         for win in ws.floats.borrow().iter() {
             draw(win, &mut ops, &mut live);
         }

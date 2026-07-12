@@ -60,7 +60,7 @@ fn visible(state: &Rc<State>, s: &Rc<WlSurface>) -> bool {
     if root.role.get() == crate::surface::SurfaceRole::LayerSurface {
         return true;
     }
-    let float_above = state.config.borrow().float_above_fullscreen;
+    let float_above = state.config.borrow().layout.float_above_fullscreen;
     for ws in crate::tree::visible_workspaces(state) {
         if ws
             .fullscreen

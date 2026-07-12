@@ -1,13 +1,17 @@
-// kdl v2 config. parse errors are fatal at startup and rejected on reload -
-// never silently fall back to defaults. reload parses fresh, diffs, applies;
-// each key is hot (apply live) or cold (log that a restart is needed).
+// kdl v2 config. the embedded default is the single source of defaults:
+// written to disk on first run, the startup fallback when the user file
+// fails to parse (every error still prints), and Config::default(). a
+// failed reload keeps the running config. each key is hot (apply live)
+// or cold (log that a restart is needed).
 
 use serde::{Deserialize, Serialize};
 pub(crate) use ::kdl::{KdlDocument, KdlNode};
 
+pub mod default;
 pub mod kdl;
 pub mod lua;
 
+pub use default::DEFAULT_CONFIG;
 pub use kdl::parse;
 
 // action names double as the ipc vocabulary; every bind has a wire twin
@@ -24,11 +28,12 @@ pub enum Dir {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
-    Workspace(usize),
+    FocusWorkspace(usize),
     /// signed jump from the active workspace, wrapping
-    WorkspaceRel(i32),
-    SendToWorkspace(usize),
+    FocusWorkspaceRel(i32),
+    /// move the window; focus follows unless told otherwise
     MoveToWorkspace(usize),
+    SendToWorkspace(usize),
     ToggleFullscreen,
     ToggleFloating,
     CloseWindow,
@@ -37,149 +42,150 @@ pub enum Action {
     FocusDir(Dir),
     SwapDir(Dir),
     /// nudge the focused window's parent split; signed fraction of the span
-    SplitRatio(f64),
-    Spawn(String),
+    AdjustSplitRatio(f64),
+    Spawn(Vec<String>),
+    SpawnSh(String),
     Quit,
-}
-
-// press is the only kind the seat fires today; the rest parse and wait
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum BindKind {
-    Press,
-    Release,
-    Repeat,
-    LockSafe,
-    Mouse,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bind {
     pub mods: u32,
+    /// evdev code; mouse buttons live at 0x110+ in the same space
     pub key: u32,
     pub action: Action,
-    pub kind: BindKind,
+    pub on_release: bool,
+    pub repeat: bool,
+    pub allow_when_locked: bool,
+    pub cooldown_ms: Option<u32>,
+    /// shown by shell-drawn hotkey overlays via the ipc bind list
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct XkbCfg {
+    pub layout: Option<String>,
+    pub variant: Option<String>,
+    pub options: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyboardCfg {
+    pub xkb: XkbCfg,
+    pub repeat_rate: i32,
+    pub repeat_delay: i32,
+    pub numlock: bool,
+}
+
+impl Default for KeyboardCfg {
+    fn default() -> KeyboardCfg {
+        // kernel-ish repeat timings; a keyboard that never repeats reads
+        // as broken, not unset
+        KeyboardCfg { xkb: XkbCfg::default(), repeat_rate: 25, repeat_delay: 600, numlock: false }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct PointerClassCfg {
+    pub accel_profile: Option<String>,
+    pub accel_speed: Option<f64>,
+    pub natural_scroll: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum ModKey {
+    #[default]
+    Super,
+    Alt,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct InputCfg {
-    pub accel_profile: Option<String>,
-    pub natural_scroll: bool,
-    pub tap: bool,
-    pub dwt: bool,
-    pub layout: Option<String>,
-    pub numlock: bool,
+    pub keyboard: KeyboardCfg,
+    pub touchpad: PointerClassCfg,
+    pub mouse: PointerClassCfg,
+    pub devices: Vec<DeviceRule>,
+    pub mod_key: ModKey,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct BlurCfg {
-    pub enabled: bool,
-    pub size: i32,
-    pub passes: i32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShadowCfg {
-    pub enabled: bool,
-    pub range: i32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DecorationCfg {
-    pub rounding: i32,
-    pub blur: BlurCfg,
-    pub shadow: ShadowCfg,
-}
-
-impl Default for DecorationCfg {
-    fn default() -> DecorationCfg {
-        DecorationCfg {
-            rounding: 0,
-            blur: BlurCfg { enabled: false, size: 8, passes: 2 },
-            shadow: ShadowCfg { enabled: false, range: 20 },
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AnimationCfg {
-    pub enabled: bool,
-    pub speed: f64,
-    pub curve: String,
-    // slide, slidefadevert, popin, fade
-    pub style: Option<String>,
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum LayoutMode {
+    #[default]
+    Dwindle,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
-pub struct AnimationsCfg {
-    // name -> cubic bezier control points
-    pub beziers: Vec<(String, [f64; 4])>,
-    // name -> mass, stiffness, damping
-    pub springs: Vec<(String, [f64; 3])>,
-    pub animations: Vec<(String, AnimationCfg)>,
+pub struct BorderCfg {
+    pub width: i32,
+    pub active: [f32; 4],
+    pub inactive: [f32; 4],
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
-pub struct WindowRule {
-    // selectors; class and title are regexes
-    pub match_class: Option<String>,
-    pub match_title: Option<String>,
-    pub match_fullscreen: Option<bool>,
-    pub match_xwayland: Option<bool>,
-    pub match_floating: Option<bool>,
-    // effects
-    pub floating: bool,
-    pub tile: bool,
-    pub workspace: Option<usize>,
-    pub immediate: bool,
-    pub idle_inhibit: Option<String>,
-    pub opacity: Option<f64>,
-    pub size: Option<(i32, i32)>,
-    pub center: bool,
-    pub rounding: Option<i32>,
-    pub blur: Option<bool>,
-    pub shadow: Option<bool>,
-    pub dim: Option<f64>,
-    pub pin: bool,
-    pub keep_aspect_ratio: bool,
-    pub focus_steal: bool,
-    // "redirect" (background only) or "passthrough" (both), plus the keys
-    pub redirect_mode: Option<String>,
-    pub redirect_keys: Vec<String>,
+pub struct LayoutCfg {
+    pub mode: LayoutMode,
+    pub gaps_in: i32,
+    pub gaps_out: i32,
+    pub border: BorderCfg,
+    pub float_above_fullscreen: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
-pub struct LayerRule {
-    pub match_namespace: Option<String>,
-    pub animation: Option<String>,
-    pub blur: Option<bool>,
-    pub ignore_alpha: Option<f64>,
+pub struct CursorCfg {
+    pub xcursor_theme: Option<String>,
+    pub xcursor_size: Option<u32>,
+    /// composite the cursor instead of using the hardware plane; the
+    /// escape hatch for planes that misbehave (joined-pipe modes)
+    pub software: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ScreencastCfg {
+    /// the consent picker command; unset means click-to-select
+    pub picker: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpawnCfg {
+    Argv(Vec<String>),
+    Sh(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct DebugCfg {
+    pub render_drm_device: Option<String>,
+    /// secondary gpus to leave alone entirely
+    pub ignore_drm_devices: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum Vrr {
+    #[default]
+    Off,
+    OnDemand,
+    Always,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputCfg {
+    /// connector name ("DP-3") or "make model serial" string
     pub name: String,
-    pub vrr: Option<String>,
-    pub gpu: Option<String>,
+    pub vrr: Vrr,
     pub scale: Option<f64>,
     /// "2560x1440@240" or "2560x1440"; picks the closest advertised mode
     pub mode: Option<(u32, u32, Option<u32>)>,
-}
-
-/// secondary gpus can skip bringing up a renderer (import-only)
-#[derive(Clone, Debug, PartialEq)]
-pub struct GpuCfg {
-    pub name: String,
-    pub skip_renderer: bool,
+    pub position: Option<(i32, i32)>,
+    pub off: bool,
+    pub allow_tearing: bool,
 }
 
 /// focus-activated key translations; criteria AND together
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct RemapProfile {
     pub name: String,
-    pub class: Option<String>,
+    pub app_id: Option<String>,
     pub title: Option<String>,
-    /// "x11" or "wayland"
-    pub win_type: Option<String>,
+    pub is_xwayland: Option<bool>,
     pub pid: Option<i32>,
     /// 1-based, as written in config
     pub workspace: Option<usize>,
@@ -199,36 +205,78 @@ pub struct DeviceRule {
     pub dpi: Option<f64>,
 }
 
+/// selectors regex-match; a rule needs at least one match child. AND
+/// within a match node, OR across nodes, excludes veto
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct RuleMatch {
+    pub app_id: Option<String>,
+    pub title: Option<String>,
+    pub is_xwayland: Option<bool>,
+    pub is_floating: Option<bool>,
+    pub is_fullscreen: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WindowRule {
+    pub matches: Vec<RuleMatch>,
+    pub excludes: Vec<RuleMatch>,
+    // open-time effects
+    pub open_floating: Option<bool>,
+    pub open_on_workspace: Option<usize>,
+    pub default_size: Option<(i32, i32)>,
+    pub open_centered: bool,
+    // dynamic effects
+    pub opacity: Option<f64>,
+    pub allow_tearing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct LayerRule {
+    pub matches: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    pub gaps_in: i32,
-    pub gaps_out: i32,
-    pub border: i32,
-    pub border_focused: [f32; 4],
-    pub border_unfocused: [f32; 4],
-    pub repeat_rate: i32,
-    pub repeat_delay: i32,
-    pub float_above_fullscreen: bool,
-    pub layout: String,
-    pub allow_tearing: bool,
-    /// composite the cursor instead of using the hardware plane; the
-    /// escape hatch for planes that misbehave (joined-pipe modes)
-    pub software_cursor: bool,
     pub input: InputCfg,
-    pub devices: Vec<DeviceRule>,
-    pub decoration: DecorationCfg,
-    pub animations: AnimationsCfg,
+    pub outputs: Vec<OutputCfg>,
+    pub layout: LayoutCfg,
+    pub cursor: CursorCfg,
+    /// NAME "value" sets, NAME #null clears, for spawned children
+    pub environment: Vec<(String, Option<String>)>,
+    pub spawns: Vec<SpawnCfg>,
+    pub prefer_no_csd: bool,
+    pub screencast: ScreencastCfg,
+    pub binds: Vec<Bind>,
     pub rules: Vec<WindowRule>,
     pub layer_rules: Vec<LayerRule>,
-    pub outputs: Vec<OutputCfg>,
-    pub gpus: Vec<GpuCfg>,
-    pub binds: Vec<Bind>,
     pub remaps: Vec<RemapProfile>,
-    pub submaps: Vec<(String, Vec<Bind>)>,
-    /// named scratchpads; the command spawns on first toggle
-    pub specials: Vec<(String, Option<String>)>,
-    /// the screencast consent picker; unset casts the focused target
-    pub picker: Option<String>,
+    pub debug: DebugCfg,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        default::embedded().clone()
+    }
+}
+
+/// the truly empty config the parser accumulates into; the embedded
+/// default is parsed on top of this, user files on top of a default clone
+pub(crate) fn empty() -> Config {
+    Config {
+        input: InputCfg::default(),
+        outputs: Vec::new(),
+        layout: LayoutCfg::default(),
+        cursor: CursorCfg::default(),
+        environment: Vec::new(),
+        spawns: Vec::new(),
+        prefer_no_csd: false,
+        screencast: ScreencastCfg::default(),
+        binds: Vec::new(),
+        rules: Vec::new(),
+        layer_rules: Vec::new(),
+        remaps: Vec::new(),
+        debug: DebugCfg::default(),
+    }
 }
 
 // mod bits match the seat's exact-set matcher
@@ -236,40 +284,8 @@ pub const M_SHIFT: u32 = 1 << 0;
 pub const M_CTRL: u32 = 1 << 2;
 pub const M_ALT: u32 = 1 << 3;
 pub const M_SUPER: u32 = 1 << 6;
-
-// neutral zeros only - carrot ships no opinions; every visible choice
-// comes from the user's file. kernel repeat timings are the one
-// exception (a keyboard that never repeats reads as broken, not unset)
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            gaps_in: 0,
-            gaps_out: 0,
-            border: 0,
-            border_focused: [0.0; 4],
-            border_unfocused: [0.0; 4],
-            repeat_rate: 25,
-            repeat_delay: 600,
-            float_above_fullscreen: false,
-            layout: "dwindle".to_string(),
-            allow_tearing: false,
-            software_cursor: false,
-            input: InputCfg::default(),
-            devices: Vec::new(),
-            decoration: DecorationCfg::default(),
-            animations: AnimationsCfg::default(),
-            rules: Vec::new(),
-            layer_rules: Vec::new(),
-            outputs: Vec::new(),
-            gpus: Vec::new(),
-            binds: Vec::new(),
-            remaps: Vec::new(),
-            submaps: Vec::new(),
-            specials: Vec::new(),
-            picker: None,
-        }
-    }
-}
+/// "Mod" in a chord; resolved against input.mod-key once the file is read
+pub(crate) const M_MOD: u32 = 1 << 15;
 
 fn config_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -290,23 +306,119 @@ pub fn config_path() -> std::path::PathBuf {
     if lua.exists() { lua } else { kdl }
 }
 
-// a missing file means defaults; an unreadable or unparsable one is an error
-pub fn load() -> Result<Config, String> {
+pub enum Loaded {
+    Ok(Config),
+    /// no file existed; the embedded default was written out and used
+    FirstRun(Config),
+    /// the file failed to parse; the session runs on the embedded default
+    Fallback { errors: Vec<String> },
+}
+
+pub fn load() -> Loaded {
     let path = config_path();
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match std::fs::write(&path, DEFAULT_CONFIG) {
+                Ok(()) => eprintln!("carrot: config: wrote default to {}", path.display()),
+                Err(e) => eprintln!("carrot: config: cannot write {}: {e}", path.display()),
+            }
+            return Loaded::FirstRun(default::embedded().clone());
+        }
+        Err(e) => {
+            return Loaded::Fallback { errors: vec![format!("{}: {e}", path.display())] };
+        }
     };
     let parsed = if path.extension().is_some_and(|e| e == "lua") {
         lua::parse(&text)
     } else {
         parse(&text)
     };
-    parsed.map_err(|e| format!("{}: {e}", path.display()))
+    match parsed {
+        Ok(cfg) => Loaded::Ok(cfg),
+        Err(errors) => {
+            let errors: Vec<String> = errors
+                .into_iter()
+                .map(|e| format!("{}: {e}", path.display()))
+                .collect();
+            for e in &errors {
+                eprintln!("carrot: config: {e}");
+            }
+            Loaded::Fallback { errors }
+        }
+    }
 }
 
-fn parse_mode(s: &str) -> Option<(u32, u32, Option<u32>)> {
+// -- shared leaf validators; both config languages come through here --
+
+/// accumulated parse errors, each pre-rendered as "line:col: msg"
+#[derive(Default)]
+pub struct Errors {
+    pub list: Vec<String>,
+}
+
+impl Errors {
+    pub fn push(&mut self, rendered: String) {
+        self.list.push(rendered);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+}
+
+pub(crate) fn color(s: &str) -> Result<[f32; 4], String> {
+    let Some(hex) = s.strip_prefix('#') else {
+        return Err(format!("color \"{s}\" needs a leading #"));
+    };
+    let expand = |c: u8| -> String {
+        let ch = c as char;
+        format!("{ch}{ch}")
+    };
+    let full: String = match hex.len() {
+        3 | 4 => hex.bytes().map(expand).collect(),
+        6 | 8 => hex.to_string(),
+        _ => return Err(format!("color \"{s}\" is #rgb, #rgba, #rrggbb or #rrggbbaa")),
+    };
+    let byte = |i: usize| -> Result<f32, String> {
+        u8::from_str_radix(&full[i..i + 2], 16)
+            .map(|v| v as f32 / 255.0)
+            .map_err(|_| format!("color \"{s}\" is #rgb, #rgba, #rrggbb or #rrggbbaa"))
+    };
+    let a = if full.len() == 8 { byte(6)? } else { 1.0 };
+    Ok([byte(0)?, byte(2)?, byte(4)?, a])
+}
+
+pub(crate) fn int_in(v: i64, name: &str, lo: i64, hi: i64) -> Result<i64, String> {
+    if v < lo || v > hi {
+        return Err(format!("{name} is {lo}..{hi}, got {v}"));
+    }
+    Ok(v)
+}
+
+pub(crate) fn f64_in(v: f64, name: &str, lo: f64, hi: f64) -> Result<f64, String> {
+    if !v.is_finite() || v < lo || v > hi {
+        return Err(format!("{name} is {lo}..{hi}, got {v}"));
+    }
+    Ok(v)
+}
+
+pub(crate) fn accel_profile(p: &str) -> Result<String, String> {
+    match p {
+        "flat" | "adaptive" => Ok(p.to_string()),
+        _ => Err("accel-profile is flat or adaptive".to_string()),
+    }
+}
+
+pub(crate) fn regex(s: &str) -> Result<String, String> {
+    regex_lite::Regex::new(s).map_err(|e| format!("bad regex \"{s}\": {e}"))?;
+    Ok(s.to_string())
+}
+
+pub(crate) fn parse_mode(s: &str) -> Option<(u32, u32, Option<u32>)> {
     let (res, hz) = match s.split_once('@') {
         Some((r, h)) => (r, Some(h.parse().ok()?)),
         None => (s, None),
@@ -315,24 +427,50 @@ fn parse_mode(s: &str) -> Option<(u32, u32, Option<u32>)> {
     Some((w.parse().ok()?, h.parse().ok()?, hz))
 }
 
-fn parse_mods(spec: &str) -> Result<u32, String> {
-    let mut mods = 0;
+/// "Mod+Shift+Return" -> (mods with M_MOD placeholder, evdev code)
+pub(crate) fn chord(spec: &str) -> Result<(u32, u32), String> {
+    let mut mods = 0u32;
+    let mut key = None;
     for part in spec.split('+') {
         match part.to_ascii_lowercase().as_str() {
             "shift" => mods |= M_SHIFT,
             "ctrl" | "control" => mods |= M_CTRL,
             "alt" => mods |= M_ALT,
-            "super" | "meta" | "mod" | "logo" => mods |= M_SUPER,
-            "" => {}
-            other => return Err(format!("unknown modifier \"{other}\"")),
+            "super" | "meta" | "logo" => mods |= M_SUPER,
+            "mod" => mods |= M_MOD,
+            "" => return Err(format!("chord \"{spec}\" has an empty part")),
+            k => {
+                if key.is_some() {
+                    return Err(format!("chord \"{spec}\" has two keys"));
+                }
+                key = Some(
+                    keycode(k).ok_or_else(|| format!("unknown key \"{part}\""))?,
+                );
+            }
         }
     }
-    Ok(mods)
+    match key {
+        Some(k) => Ok((mods, k)),
+        None => Err(format!("chord \"{spec}\" has no key")),
+    }
+}
+
+/// resolve M_MOD placeholders once input.mod-key is known
+pub(crate) fn resolve_mod(binds: &mut [Bind], mod_key: ModKey) {
+    let bit = match mod_key {
+        ModKey::Super => M_SUPER,
+        ModKey::Alt => M_ALT,
+    };
+    for b in binds {
+        if b.mods & M_MOD != 0 {
+            b.mods = (b.mods & !M_MOD) | bit;
+        }
+    }
 }
 
 // the full evdev keyboard map, KEY_* names lowercased, plus the common
 // aliases; straight from input-event-codes.h
-fn keycode(name: &str) -> Option<u32> {
+pub(crate) fn keycode(name: &str) -> Option<u32> {
     let k = match name {
         "esc" | "escape" => 1,
         "1" => 2, "2" => 3, "3" => 4, "4" => 5, "5" => 6,
@@ -366,7 +504,9 @@ fn keycode(name: &str) -> Option<u32> {
         "home" => 102, "up" => 103, "pageup" => 104, "left" => 105,
         "right" => 106, "end" => 107, "down" => 108, "pagedown" => 109,
         "insert" => 110, "delete" => 111, "macro" => 112,
-        "mute" => 113, "volumedown" => 114, "volumeup" => 115,
+        "mute" | "xf86audiomute" => 113,
+        "volumedown" | "xf86audiolowervolume" => 114,
+        "volumeup" | "xf86audioraisevolume" => 115,
         "power" => 116, "kpequal" => 117, "kpplusminus" => 118,
         "pause" => 119, "scale" => 120, "kpcomma" => 121,
         "hangeul" | "hanguel" => 122, "hanja" => 123, "yen" => 124,
@@ -381,7 +521,9 @@ fn keycode(name: &str) -> Option<u32> {
         "cyclewindows" => 154, "mail" => 155, "bookmarks" => 156,
         "computer" => 157, "back" => 158, "forward" => 159,
         "closecd" => 160, "ejectcd" => 161, "ejectclosecd" => 162,
-        "nextsong" => 163, "playpause" => 164, "previoussong" => 165,
+        "nextsong" | "xf86audionext" => 163,
+        "playpause" | "xf86audioplay" => 164,
+        "previoussong" | "xf86audioprev" => 165,
         "stopcd" => 166, "record" => 167, "rewind" => 168, "phone" => 169,
         "iso" => 170, "config" => 171, "homepage" => 172, "refresh" => 173,
         "exit" => 174, "move" => 175, "edit" => 176,
@@ -398,7 +540,8 @@ fn keycode(name: &str) -> Option<u32> {
         "sound" => 213, "question" => 214, "email" => 215, "chat" => 216,
         "search" => 217, "connect" => 218, "finance" => 219, "sport" => 220,
         "shop" => 221, "alterase" => 222, "cancel" => 223,
-        "brightnessdown" => 224, "brightnessup" => 225, "media" => 226,
+        "brightnessdown" | "xf86monbrightnessdown" => 224,
+        "brightnessup" | "xf86monbrightnessup" => 225, "media" => 226,
         "switchvideomode" => 227, "kbdillumtoggle" => 228,
         "kbdillumdown" => 229, "kbdillumup" => 230,
         "send" => 231, "reply" => 232, "forwardmail" => 233, "save" => 234,
@@ -408,10 +551,11 @@ fn keycode(name: &str) -> Option<u32> {
         "brightness_cycle" => 243, "brightness_auto" | "brightness_zero" => 244,
         "display_off" => 245, "wwan" | "wimax" => 246, "rfkill" => 247,
         "micmute" => 248,
-        // mouse buttons, for type="mouse" binds
-        "btn_left" | "mouse_left" => 272, "btn_right" | "mouse_right" => 273,
-        "btn_middle" | "mouse_middle" => 274,
-        "btn_side" => 275, "btn_extra" => 276,
+        // mouse buttons share the code space; chords say Mod+MouseLeft
+        "btn_left" | "mouse_left" | "mouseleft" => 272,
+        "btn_right" | "mouse_right" | "mouseright" => 273,
+        "btn_middle" | "mouse_middle" | "mousemiddle" => 274,
+        "btn_side" | "mouseside" => 275, "btn_extra" | "mouseextra" => 276,
         _ => return None,
     };
     Some(k)
@@ -429,52 +573,62 @@ pub struct RuleFx {
     pub center: bool,
 }
 
-pub fn rule_effects(
-    cfg: &Config,
-    class: &str,
+fn matcher_hits(
+    m: &RuleMatch,
+    app_id: &str,
     title: &str,
     xwayland: bool,
     fullscreen: bool,
-) -> RuleFx {
-    let mut fx = RuleFx::default();
-    let matches_re = |pat: &Option<String>, hay: &str| -> bool {
+    floating: bool,
+) -> bool {
+    let re_hits = |pat: &Option<String>, hay: &str| -> bool {
         match pat {
             None => true,
             // validated at parse time; a stale failure just never matches
             Some(p) => regex_lite::Regex::new(p).is_ok_and(|re| re.is_match(hay)),
         }
     };
+    re_hits(&m.app_id, app_id)
+        && re_hits(&m.title, title)
+        && m.is_xwayland.is_none_or(|w| w == xwayland)
+        && m.is_fullscreen.is_none_or(|w| w == fullscreen)
+        && m.is_floating.is_none_or(|w| w == floating)
+}
+
+pub fn rule_effects(
+    cfg: &Config,
+    app_id: &str,
+    title: &str,
+    xwayland: bool,
+    fullscreen: bool,
+) -> RuleFx {
+    let mut fx = RuleFx::default();
     for r in cfg.rules.iter() {
-        if !matches_re(&r.match_class, class) || !matches_re(&r.match_title, title) {
+        let hit = r
+            .matches
+            .iter()
+            .any(|m| matcher_hits(m, app_id, title, xwayland, fullscreen, false));
+        let vetoed = r
+            .excludes
+            .iter()
+            .any(|m| matcher_hits(m, app_id, title, xwayland, fullscreen, false));
+        if !hit || vetoed {
             continue;
         }
-        if let Some(want) = r.match_xwayland {
-            if want != xwayland {
-                continue;
-            }
+        if let Some(f) = r.open_floating {
+            fx.floating = Some(f);
         }
-        if let Some(want) = r.match_fullscreen {
-            if want != fullscreen {
-                continue;
-            }
-        }
-        if r.floating {
-            fx.floating = Some(true);
-        }
-        if r.tile {
-            fx.floating = Some(false);
-        }
-        if let Some(ws) = r.workspace {
+        if let Some(ws) = r.open_on_workspace {
             fx.workspace = Some(ws);
         }
-        fx.immediate |= r.immediate;
+        fx.immediate |= r.allow_tearing;
         if let Some(o) = r.opacity {
             fx.opacity = Some(o);
         }
-        if let Some(sz) = r.size {
+        if let Some(sz) = r.default_size {
             fx.size = Some(sz);
         }
-        fx.center |= r.center;
+        fx.center |= r.open_centered;
     }
     fx
 }
@@ -483,7 +637,7 @@ pub fn rule_effects(
 /// matches. criteria AND; first matching profile wins
 pub fn resolve_remap(
     cfg: &Config,
-    class: &str,
+    app_id: &str,
     title: &str,
     is_x11: bool,
     pid: i32,
@@ -491,8 +645,8 @@ pub fn resolve_remap(
     key: u32,
 ) -> Option<u32> {
     for p in cfg.remaps.iter() {
-        if let Some(c) = &p.class {
-            if c != class {
+        if let Some(c) = &p.app_id {
+            if c != app_id {
                 continue;
             }
         }
@@ -501,9 +655,8 @@ pub fn resolve_remap(
                 continue;
             }
         }
-        if let Some(ty) = &p.win_type {
-            let want_x11 = ty == "x11";
-            if want_x11 != is_x11 {
+        if let Some(want) = p.is_xwayland {
+            if want != is_x11 {
                 continue;
             }
         }
@@ -531,19 +684,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_run_writes_and_fallback_survives() {
+        // one test owns the env var; first-run and fallback in sequence
+        let dir = std::env::temp_dir().join(format!("carrot-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        match load() {
+            Loaded::FirstRun(c) => assert!(!c.binds.is_empty(), "the default has binds"),
+            _ => panic!("expected first run"),
+        }
+        assert!(dir.join("carrot/carrot.kdl").exists(), "default written to disk");
+        std::fs::write(dir.join("carrot/carrot.kdl"), "nonsense {").unwrap();
+        match load() {
+            Loaded::Fallback { errors } => assert!(!errors.is_empty(), "errors reported"),
+            _ => panic!("expected fallback"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
     fn rules_match_by_regex_and_merge_in_order() {
         let cfg = parse(
             r##"
             window-rule {
-                match class="^steam_app_.*$"
-                immediate #true
+                match app-id=#"^steam_app_.*$"#
+                allow-tearing #true
                 opacity 0.9
             }
             window-rule {
-                match class="^steam_app_250900$"
-                floating #true
-                size 800 600
-                workspace 3
+                match app-id=#"^steam_app_250900$"#
+                open-floating #true
+                default-size 800 600
+                open-on-workspace 3
             }
             "##,
         )
@@ -554,14 +727,35 @@ mod tests {
         assert_eq!(fx.floating, Some(true), "second rule stacked");
         assert_eq!(fx.size, Some((800, 600)));
         assert_eq!(fx.workspace, Some(2), "parser stores 0-based");
-        // non-matching class gets nothing
+        // non-matching app id gets nothing
         let fx = rule_effects(&cfg, "foot", "shell", false, false);
         assert_eq!(fx, RuleFx::default());
     }
 
     #[test]
+    fn excludes_veto_matches() {
+        let cfg = parse(
+            r##"
+            window-rule {
+                match app-id=#"^steam_app_"#
+                exclude title=#"Isaac"#
+                open-floating #true
+            }
+            "##,
+        )
+        .unwrap();
+        let fx = rule_effects(&cfg, "steam_app_1", "Dead Cells", true, false);
+        assert_eq!(fx.floating, Some(true));
+        let fx = rule_effects(&cfg, "steam_app_1", "Isaac", true, false);
+        assert_eq!(fx, RuleFx::default());
+    }
+
+    #[test]
     fn a_bad_rule_regex_fails_the_parse() {
-        assert!(parse(r##"window-rule { match class="[unclosed" floating #true }"##).is_err());
+        assert!(
+            parse(r##"window-rule { match app-id=#"[unclosed"# ; open-floating #true }"##)
+                .is_err()
+        );
     }
 
     #[test]
@@ -569,7 +763,7 @@ mod tests {
         let cfg = parse(
             r##"
             remap "binding-of-isaac" {
-                class "steam_app_250900"
+                match app-id="steam_app_250900"
                 map "Alt_R" "Left"
                 map "Compose" "Down"
                 map "Ctrl_R" "Right"
@@ -580,16 +774,16 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.remaps.len(), 1);
         let p = &cfg.remaps[0];
-        assert_eq!(p.class.as_deref(), Some("steam_app_250900"));
+        assert_eq!(p.app_id.as_deref(), Some("steam_app_250900"));
         assert_eq!(p.maps.len(), 4);
-        // alt_r(100) -> left(105) under the matching class
+        // alt_r(100) -> left(105) under the matching app id
         assert_eq!(
             resolve_remap(&cfg, "steam_app_250900", "Isaac", true, 1, 1, 100),
             Some(105)
         );
-        // wrong class: untouched
+        // wrong app id: untouched
         assert_eq!(resolve_remap(&cfg, "foot", "shell", false, 1, 1, 100), None);
-        // unmapped key under the right class: untouched
+        // unmapped key under the right app id: untouched
         assert_eq!(resolve_remap(&cfg, "steam_app_250900", "x", true, 1, 1, 30), None);
         // slash(53) -> up(103)
         assert_eq!(
@@ -603,9 +797,7 @@ mod tests {
         let cfg = parse(
             r##"
             remap "narrow" {
-                class "foot"
-                workspace 3
-                type "wayland"
+                match app-id="foot" workspace=3 is-xwayland=#false
                 map "a" "b"
             }
             "##,
@@ -621,60 +813,33 @@ mod tests {
     #[test]
     fn move_and_send_to_workspace_differ() {
         let cfg = parse(
-            "bind \"Meta+Shift\" \"1\" \"movetoworkspace\" \"3\"\nbind \"Meta+Ctrl\" \"1\" \"send-to-workspace\" \"3\"\n",
+            "binds {\n    Mod+Shift+1 { move-to-workspace 3; }\n    Mod+Ctrl+1 { send-to-workspace 3; }\n}\n",
         )
         .unwrap();
-        let n = cfg.binds.len();
-        assert_eq!(cfg.binds[n - 2].action, Action::MoveToWorkspace(2));
-        assert_eq!(cfg.binds[n - 1].action, Action::SendToWorkspace(2));
+        assert_eq!(cfg.binds.len(), 2);
+        assert_eq!(cfg.binds[0].action, Action::MoveToWorkspace(2));
+        assert_eq!(cfg.binds[1].action, Action::SendToWorkspace(2));
     }
 
     #[test]
-    fn defaults_are_neutral() {
-        // no hardcoded config ships with carrot: no binds, no visible
-        // choices; everything comes from the user's file
-        let c = Config::default();
-        assert_eq!((c.gaps_in, c.gaps_out, c.border), (0, 0, 0));
-        assert_eq!(c.layout, "dwindle");
-        assert!(!c.allow_tearing);
-        assert!(c.binds.is_empty());
-        assert!(c.rules.is_empty() && c.outputs.is_empty() && c.devices.is_empty());
-        assert!(c.remaps.is_empty());
-        assert!(c.picker.is_none());
-    }
-
-    #[test]
-    fn picker_command_parses() {
-        let cfg = parse("general {\n    picker \"fuzzel-pick\"\n}\n").unwrap();
-        assert_eq!(cfg.picker.as_deref(), Some("fuzzel-pick"));
-    }
-
-    #[test]
-    fn errors_are_loud_and_positioned() {
-        let err = parse("general {\n    gaps-in \"soup\"\n}").unwrap_err();
-        assert!(err.contains("2:5"), "{err}");
-        assert!(err.contains("integer"), "{err}");
-        let err = parse("no-such-key").unwrap_err();
-        assert!(err.contains("unknown key"), "{err}");
-        let err = parse("bind \"Meta\" \"nope\" \"close\"").unwrap_err();
-        assert!(err.contains("unknown key \"nope\""), "{err}");
-        let err = parse("general {\n    allow-tearing yes\n}").unwrap_err();
-        assert!(err.contains("#true or #false"), "{err}");
-        let err = parse("bind \"Meta\" \"q\" \"close\" type=\"sometimes\"").unwrap_err();
-        assert!(err.contains("bind type"), "{err}");
+    fn mod_resolves_against_mod_key() {
+        let cfg = parse("input { mod-key \"alt\" }\nbinds { Mod+Q { close-window; } }").unwrap();
+        assert_eq!(cfg.binds[0].mods, M_ALT, "mod-key wins even declared first");
+        let cfg = parse("binds { Mod+Q { close-window; } }").unwrap();
+        assert_eq!(cfg.binds[0].mods, M_SUPER, "super is the default mod");
     }
 
     #[test]
     fn actions_roundtrip_as_json() {
-        let a = Action::Workspace(3);
+        let a = Action::FocusWorkspace(3);
         let j = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), a);
         let j = serde_json::to_string(&Action::ToggleFullscreen).unwrap();
         assert_eq!(j, "\"toggle-fullscreen\"");
-        let j = serde_json::to_string(&Action::SplitRatio(-0.1)).unwrap();
-        assert_eq!(j, "{\"split-ratio\":-0.1}");
-        let j = serde_json::to_string(&Action::WorkspaceRel(-1)).unwrap();
-        assert_eq!(j, "{\"workspace-rel\":-1}");
+        let j = serde_json::to_string(&Action::AdjustSplitRatio(-0.1)).unwrap();
+        assert_eq!(j, "{\"adjust-split-ratio\":-0.1}");
+        let j = serde_json::to_string(&Action::FocusWorkspaceRel(-1)).unwrap();
+        assert_eq!(j, "{\"focus-workspace-rel\":-1}");
         let j = serde_json::to_string(&Action::FocusDir(Dir::Left)).unwrap();
         assert_eq!(j, "{\"focus-dir\":\"left\"}");
         let j = serde_json::to_string(&Action::SwapDir(Dir::Down)).unwrap();
@@ -682,11 +847,23 @@ mod tests {
     }
 
     #[test]
-    fn split_ratio_binds_parse_signed_deltas() {
-        let cfg = parse(r##"bind "Meta" "r" "split-ratio" "+0.1""##).unwrap();
-        assert_eq!(cfg.binds[0].action, Action::SplitRatio(0.1));
-        let cfg = parse(r##"bind "Meta" "e" "split-ratio" "-0.1""##).unwrap();
-        assert_eq!(cfg.binds[0].action, Action::SplitRatio(-0.1));
-        assert!(parse(r##"bind "Meta" "r" "split-ratio""##).is_err());
+    fn colors_accept_all_four_widths() {
+        assert_eq!(color("#fff").unwrap(), [1.0, 1.0, 1.0, 1.0]);
+        // the a nibble doubles: 0xa -> 0xaa
+        assert_eq!((color("#f00a").unwrap()[3] * 255.0).round(), 170.0);
+        assert!(color("89b4fa").is_err(), "leading # is required now");
+        assert!(color("#89b4fa").is_ok());
+        assert!(color("#89b4fa80").is_ok());
+    }
+
+    #[test]
+    fn chords_parse_and_reject() {
+        let (m, k) = chord("Mod+Shift+Return").unwrap();
+        assert_eq!(m, M_MOD | M_SHIFT);
+        assert_eq!(k, 28);
+        let (_, k) = chord("Mod+MouseLeft").unwrap();
+        assert_eq!(k, 272);
+        assert!(chord("Mod+Shift").is_err(), "no key");
+        assert!(chord("Q+W").is_err(), "two keys");
     }
 }

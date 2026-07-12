@@ -343,6 +343,9 @@ pub(crate) mod test_utils {
         let ring = Ring::new(&eng, 32).unwrap();
         let wheel = Wheel::new(&eng, &ring).unwrap();
         let state = State::new(&eng, &ring, wheel);
+        // tests assume the neutral config; the embedded default is pinned
+        // by its own tests in config/default.rs
+        *state.config.borrow_mut() = std::rc::Rc::new(crate::config::empty());
         let (a, _b) = socketpair(
             AddressFamily::UNIX,
             SocketType::STREAM,

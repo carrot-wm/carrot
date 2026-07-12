@@ -52,6 +52,8 @@ pub struct State {
     pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
     /// live portal screencasts, fed from the present tail
     pub casts: RefCell<Vec<Rc<crate::portal::cast::Cast>>>,
+    /// the last config-loaded ipc event, replayed to new subscribers
+    pub last_config_event: RefCell<Option<String>>,
     /// a hidden-cast source committed; the cast tick task drains it
     pub cast_kick: AsyncEvent,
     /// the tick task, spawned with the first cast
@@ -106,6 +108,7 @@ impl State {
             ext_toplevel_lists: RefCell::new(Vec::new()),
             icc_sessions: RefCell::new(Vec::new()),
             casts: RefCell::new(Vec::new()),
+            last_config_event: RefCell::new(None),
             cast_kick: AsyncEvent::default(),
             cast_tick: std::cell::Cell::new(None),
             cast_pick: RefCell::new(None),

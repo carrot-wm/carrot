@@ -294,7 +294,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
                         s.restore.borrow().clone(),
                     )
                 };
-                let picker_cmd = state.config.borrow().picker.clone();
+                let picker_cmd = state.config.borrow().screencast.picker.clone();
                 // the node id comes from the daemon; the cast task replies
                 let (serial, dest) = (call.serial, call.sender.clone());
                 let me = me.clone();

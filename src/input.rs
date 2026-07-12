@@ -124,10 +124,10 @@ pub async fn start(state: &Rc<State>, session: &Rc<LogindSession>) -> InputStack
 /// overrides it. accel scales the cursor, not the raw relative deltas.
 fn device_factors(state: &Rc<State>, mgr: &evdev::Manager, devnum: u64) -> (f64, f64, bool, bool) {
     let cfg = state.config.borrow().clone();
-    let mut speed = 0.0f64;
+    let mut speed = cfg.input.mouse.accel_speed.unwrap_or(0.0);
     let mut dpi = 1000.0f64;
-    let mut natural = cfg.input.natural_scroll;
-    let mut adaptive = cfg.input.accel_profile.as_deref() == Some("adaptive");
+    let mut natural = cfg.input.mouse.natural_scroll;
+    let mut adaptive = cfg.input.mouse.accel_profile.as_deref() == Some("adaptive");
     if let Some(dev) = mgr.devices.borrow().iter().find(|d| d.devnum == devnum) {
         dpi = dev.dpi;
         let name: String = dev
@@ -136,7 +136,7 @@ fn device_factors(state: &Rc<State>, mgr: &evdev::Manager, devnum: u64) -> (f64,
             .chars()
             .map(|c| if c == ' ' || c == '_' { '-' } else { c })
             .collect();
-        for r in cfg.devices.iter() {
+        for r in cfg.input.devices.iter() {
             if !r.name.is_empty() && name.contains(&r.name) {
                 if let Some(s) = r.accel_speed {
                     speed = s;

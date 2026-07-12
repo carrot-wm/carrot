@@ -12,11 +12,15 @@ pub struct CursorImage {
     pub hotspot: (i32, i32),
 }
 
-pub fn load(name: &str) -> Option<CursorImage> {
-    let theme = std::env::var("XCURSOR_THEME").ok();
-    let size: u32 = std::env::var("XCURSOR_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
+pub fn load(name: &str, cfg: &crate::config::CursorCfg) -> Option<CursorImage> {
+    // the config wins; the env keeps working for everything it already did
+    let theme = cfg
+        .xcursor_theme
+        .clone()
+        .or_else(|| std::env::var("XCURSOR_THEME").ok());
+    let size: u32 = cfg
+        .xcursor_size
+        .or_else(|| std::env::var("XCURSOR_SIZE").ok().and_then(|s| s.parse().ok()))
         .unwrap_or(24);
     let paths = search_paths();
     let file = theme
