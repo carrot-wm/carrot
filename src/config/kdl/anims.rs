@@ -3,13 +3,7 @@
 use super::{children, Cx};
 use crate::config::*;
 
-// which styles a kind accepts
-#[derive(Copy, Clone, PartialEq)]
-enum Family {
-    Win,        // popin, fade, slide
-    Ws,         // slide, slidevert, fade, slidefade, slidefadevert
-    MotionOnly, // no style at all
-}
+use crate::config::StyleFamily as Family;
 
 pub(super) fn parse(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
     let a = &mut cfg.animations;
@@ -87,7 +81,7 @@ fn prop_str<'a>(node: &'a KdlNode, name: &str) -> Option<&'a str> {
 /// `spring damping-ratio=.. stiffness=.. epsilon=..` or
 /// `ease duration-ms=.. curve=".."` - properties, not arguments
 fn motion(node: &KdlNode, cx: &mut Cx) -> Option<Motion> {
-    match node.name().value() {
+    let r = match node.name().value() {
         "spring" => {
             let (Some(d), Some(s), Some(e)) = (
                 prop_f64(node, "damping-ratio"),
@@ -97,46 +91,24 @@ fn motion(node: &KdlNode, cx: &mut Cx) -> Option<Motion> {
                 cx.at(node, "spring needs damping-ratio= stiffness= epsilon=");
                 return None;
             };
-            let d = match f64_in(d, "damping-ratio", 0.1, 10.0) {
-                Ok(v) => v,
-                Err(e) => return err(cx, node, e),
-            };
-            let s = match f64_in(s, "stiffness", 1.0, 100_000.0) {
-                Ok(v) => v,
-                Err(e) => return err(cx, node, e),
-            };
-            let e = match f64_in(e, "epsilon", 0.00001, 0.1) {
-                Ok(v) => v,
-                Err(e) => return err(cx, node, e),
-            };
-            Some(Motion::Spring { damping: d, stiffness: s, epsilon: e })
+            spring_params(d, s, e)
         }
         "ease" => {
             let Some(ms) = prop_f64(node, "duration-ms") else {
                 cx.at(node, "ease needs duration-ms=");
                 return None;
             };
-            let ms = match int_in(ms as i64, "duration-ms", 0, 10_000) {
-                Ok(v) => v as u32,
-                Err(e) => return err(cx, node, e),
-            };
-            let curve = match prop_str(node, "curve") {
-                None => CurveRef::Cubic,
-                Some("linear") => CurveRef::Linear,
-                Some("ease-out-quad") => CurveRef::Quad,
-                Some("ease-out-cubic") => CurveRef::Cubic,
-                Some("ease-out-expo") => CurveRef::Expo,
-                Some(name) => CurveRef::Named(name.to_string()),
-            };
-            Some(Motion::Ease { ms, curve })
+            ease_params(ms as i64, prop_str(node, "curve"))
         }
         _ => unreachable!(),
+    };
+    match r {
+        Ok(m) => Some(m),
+        Err(e) => {
+            cx.leaf(node, e);
+            None
+        }
     }
-}
-
-fn err(cx: &mut Cx, node: &KdlNode, e: String) -> Option<Motion> {
-    cx.leaf(node, e);
-    None
 }
 
 /// `curve "name" x1 y1 x2 y2` - a named cubic bezier
@@ -207,37 +179,13 @@ fn style(node: &KdlNode, cx: &mut Cx, family: Family) -> Option<Style> {
         .iter()
         .find(|e| e.name().is_none())
         .and_then(|e| e.value().as_string())?;
-    let perc = || -> f64 {
-        prop_f64(node, "perc")
-            .map(|p| (p / 100.0).clamp(0.0, 1.0))
-            .unwrap_or(0.8)
-    };
-    let dir = match prop_str(node, "dir") {
-        None => None,
-        Some("top") => Some(Dir::Up),
-        Some("bottom") => Some(Dir::Down),
-        Some("left") => Some(Dir::Left),
-        Some("right") => Some(Dir::Right),
-        Some(other) => {
-            cx.at(node, &format!("dir \"{other}\" is top, bottom, left or right"));
-            return None;
+    match style_from(family, name, prop_f64(node, "perc"), prop_str(node, "dir")) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            cx.leaf(node, e);
+            None
         }
-    };
-    let s = match (family, name) {
-        (Family::Win, "popin") => Style::Popin { perc: perc() },
-        (Family::Win, "fade") => Style::Fade,
-        (Family::Win, "slide") => Style::Slide { dir },
-        (Family::Ws, "slide") => Style::Slide { dir: None },
-        (Family::Ws, "slidevert") => Style::SlideVert,
-        (Family::Ws, "fade") => Style::Fade,
-        (Family::Ws, "slidefade") => Style::SlideFade { perc: perc() },
-        (Family::Ws, "slidefadevert") => Style::SlideFadeVert { perc: perc() },
-        _ => {
-            cx.at(node, &format!("style \"{name}\" does not fit this animation"));
-            return None;
-        }
-    };
-    Some(s)
+    }
 }
 
 #[cfg(test)]

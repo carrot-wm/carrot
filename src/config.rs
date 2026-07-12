@@ -388,6 +388,64 @@ impl AnimsCfg {
     }
 }
 
+/// which styles an animation kind accepts
+#[derive(Copy, Clone, PartialEq)]
+pub(crate) enum StyleFamily {
+    Win,        // popin, fade, slide
+    Ws,         // slide, slidevert, fade, slidefade, slidefadevert
+    MotionOnly, // no style at all
+}
+
+pub(crate) fn spring_params(d: f64, s: f64, e: f64) -> Result<Motion, String> {
+    Ok(Motion::Spring {
+        damping: f64_in(d, "damping-ratio", 0.1, 10.0)?,
+        stiffness: f64_in(s, "stiffness", 1.0, 100_000.0)?,
+        epsilon: f64_in(e, "epsilon", 0.00001, 0.1)?,
+    })
+}
+
+pub(crate) fn ease_params(ms: i64, curve: Option<&str>) -> Result<Motion, String> {
+    let ms = int_in(ms, "duration-ms", 0, 10_000)? as u32;
+    let curve = match curve {
+        None => CurveRef::Cubic,
+        Some("linear") => CurveRef::Linear,
+        Some("ease-out-quad") => CurveRef::Quad,
+        Some("ease-out-cubic") => CurveRef::Cubic,
+        Some("ease-out-expo") => CurveRef::Expo,
+        Some(name) => CurveRef::Named(name.to_string()),
+    };
+    Ok(Motion::Ease { ms, curve })
+}
+
+/// perc arrives as written (0..100); dir as the config word
+pub(crate) fn style_from(
+    family: StyleFamily,
+    name: &str,
+    perc: Option<f64>,
+    dir: Option<&str>,
+) -> Result<Style, String> {
+    let perc = perc.map(|p| (p / 100.0).clamp(0.0, 1.0)).unwrap_or(0.8);
+    let dir = match dir {
+        None => None,
+        Some("top") => Some(Dir::Up),
+        Some("bottom") => Some(Dir::Down),
+        Some("left") => Some(Dir::Left),
+        Some("right") => Some(Dir::Right),
+        Some(other) => return Err(format!("dir \"{other}\" is top, bottom, left or right")),
+    };
+    match (family, name) {
+        (StyleFamily::Win, "popin") => Ok(Style::Popin { perc }),
+        (StyleFamily::Win, "fade") => Ok(Style::Fade),
+        (StyleFamily::Win, "slide") => Ok(Style::Slide { dir }),
+        (StyleFamily::Ws, "slide") => Ok(Style::Slide { dir: None }),
+        (StyleFamily::Ws, "slidevert") => Ok(Style::SlideVert),
+        (StyleFamily::Ws, "fade") => Ok(Style::Fade),
+        (StyleFamily::Ws, "slidefade") => Ok(Style::SlideFade { perc }),
+        (StyleFamily::Ws, "slidefadevert") => Ok(Style::SlideFadeVert { perc }),
+        _ => Err(format!("style \"{name}\" does not fit this animation")),
+    }
+}
+
 /// motion + clock -> a running Anim
 pub fn build_anim(
     clock: &crate::anim::AnimClock,

@@ -14,8 +14,8 @@
 // }
 
 use super::{
-    Action, Bind, Config, DeviceRule, Dir, LayerRule, LayoutMode, ModKey, OutputCfg,
-    PointerClassCfg, RemapProfile, RuleMatch, SpawnCfg, Vrr, WindowRule,
+    Action, Bind, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule, LayoutMode, ModKey,
+    Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch, SpawnCfg, Vrr, WindowRule,
 };
 use piccolo::{Closure, Executor, Lua, Table, Value};
 
@@ -156,6 +156,7 @@ fn build(root: Table) -> Result<Config, Vec<String>> {
             continue;
         };
         let r = match key.as_str() {
+            "animations" => animations(&v, &mut cfg),
             "input" => input(&v, &mut cfg),
             "outputs" => outputs(&v, &mut cfg),
             "layout" => layout(&v, &mut cfg),
@@ -375,6 +376,159 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                 return Err(format!("{key}: not implemented yet"));
             }
             other => return Err(format!("unknown layout key `{other}`")),
+        }
+    }
+    Ok(())
+}
+
+fn animations(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    let a = &mut cfg.animations;
+    for (k, v) in table(v, "animations")?.iter() {
+        let key = vstr(&k).ok_or("animations keys must be strings")?;
+        match key.as_str() {
+            "off" => a.off = need_bool(&v, &key)?,
+            "slowdown" => {
+                a.slowdown = super::f64_in(need_num(&v, &key)?, "slowdown", 0.1, 10.0)?;
+            }
+            "curves" => {
+                for (name, v) in named_entries(&v, "curves")? {
+                    let pts = indexed_entries(&v, &name)?;
+                    let nums: Vec<f64> =
+                        pts.iter().filter_map(|p| vnum(p)).collect();
+                    let [x1, y1, x2, y2] = nums.as_slice() else {
+                        return Err(format!("curve `{name}` wants {{x1, y1, x2, y2}}"));
+                    };
+                    if a.curves.iter().any(|(n, _)| *n == name) {
+                        return Err(format!("duplicate curve `{name}`"));
+                    }
+                    a.curves
+                        .push((name, crate::anim::CubicBezier::new(*x1, *y1, *x2, *y2)));
+                }
+            }
+            "spring" => a.default_motion = lua_spring(&v)?,
+            "ease" => a.default_motion = lua_ease(&v)?,
+            "window_open" => anim_kind(&v, &key, super::StyleFamily::Win, &mut a.window_open)?,
+            "window_close" => anim_kind(&v, &key, super::StyleFamily::Win, &mut a.window_close)?,
+            "window_move" => {
+                anim_kind(&v, &key, super::StyleFamily::MotionOnly, &mut a.window_move)?;
+            }
+            "window_resize" => {
+                anim_kind(&v, &key, super::StyleFamily::MotionOnly, &mut a.window_resize)?;
+            }
+            "workspace_switch" => {
+                anim_kind(&v, &key, super::StyleFamily::Ws, &mut a.workspace_switch)?;
+            }
+            "view_movement" => {
+                anim_kind(&v, &key, super::StyleFamily::MotionOnly, &mut a.view_movement)?;
+            }
+            "layer_open" => anim_kind(&v, &key, super::StyleFamily::Win, &mut a.layer_open)?,
+            "layer_close" => anim_kind(&v, &key, super::StyleFamily::Win, &mut a.layer_close)?,
+            "border_color" => {
+                anim_kind(&v, &key, super::StyleFamily::MotionOnly, &mut a.border_color)?;
+            }
+            other => return Err(format!("unknown animations key `{other}`")),
+        }
+    }
+    // named curves must exist by the end of the section
+    let known: Vec<&String> = a.curves.iter().map(|(n, _)| n).collect();
+    let mut motions: Vec<&Option<Motion>> = vec![];
+    for kc in [
+        &a.window_open,
+        &a.window_close,
+        &a.window_move,
+        &a.window_resize,
+        &a.workspace_switch,
+        &a.view_movement,
+        &a.layer_open,
+        &a.layer_close,
+        &a.border_color,
+    ] {
+        motions.push(&kc.motion);
+    }
+    let default_slot = Some(a.default_motion.clone());
+    for m in motions.into_iter().chain([&default_slot]) {
+        if let Some(Motion::Ease { curve: CurveRef::Named(n), .. }) = m {
+            if !known.contains(&n) {
+                return Err(format!("unknown curve `{n}`"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lua_spring(v: &Value) -> Result<Motion, String> {
+    let (mut d, mut s, mut e) = (None, None, None);
+    for (k, v) in table(v, "spring")?.iter() {
+        let key = vstr(&k).ok_or("spring keys must be strings")?;
+        match key.as_str() {
+            "damping_ratio" => d = Some(need_num(&v, &key)?),
+            "stiffness" => s = Some(need_num(&v, &key)?),
+            "epsilon" => e = Some(need_num(&v, &key)?),
+            other => return Err(format!("unknown spring key `{other}`")),
+        }
+    }
+    let (Some(d), Some(s), Some(e)) = (d, s, e) else {
+        return Err("spring needs damping_ratio, stiffness, epsilon".to_string());
+    };
+    super::spring_params(d, s, e)
+}
+
+fn lua_ease(v: &Value) -> Result<Motion, String> {
+    let (mut ms, mut curve) = (None, None);
+    for (k, v) in table(v, "ease")?.iter() {
+        let key = vstr(&k).ok_or("ease keys must be strings")?;
+        match key.as_str() {
+            "duration_ms" => ms = Some(need_int(&v, &key)?),
+            "curve" => curve = Some(need_str(&v, &key)?),
+            other => return Err(format!("unknown ease key `{other}`")),
+        }
+    }
+    let Some(ms) = ms else {
+        return Err("ease needs duration_ms".to_string());
+    };
+    super::ease_params(ms, curve.as_deref())
+}
+
+/// { off = bool, spring = {..} | ease = {..}, style = { "name", perc = n, dir = ".." } }
+fn anim_kind(
+    v: &Value,
+    what: &str,
+    family: super::StyleFamily,
+    out: &mut KindCfg,
+) -> Result<(), String> {
+    let mut has_motion = false;
+    for (k, v) in table(v, what)?.iter() {
+        let key = vstr(&k).ok_or_else(|| format!("{what} keys must be strings"))?;
+        match key.as_str() {
+            "off" => out.off = need_bool(&v, &key)?,
+            "spring" | "ease" => {
+                if has_motion {
+                    return Err("spring and ease are mutually exclusive".to_string());
+                }
+                out.motion = Some(if key == "spring" { lua_spring(&v)? } else { lua_ease(&v)? });
+                has_motion = true;
+            }
+            "style" => {
+                if family == super::StyleFamily::MotionOnly {
+                    return Err(format!("{what} takes no style"));
+                }
+                let t = table(&v, "style")?;
+                let name = t
+                    .iter()
+                    .find_map(|(k, v)| if vint(&k) == Some(1) { vstr(&v) } else { None })
+                    .ok_or("style wants { \"name\", ... }")?;
+                let mut perc = None;
+                let mut dir = None;
+                for (k, v) in t.iter() {
+                    match vstr(&k).as_deref() {
+                        Some("perc") => perc = Some(need_num(&v, "perc")?),
+                        Some("dir") => dir = Some(need_str(&v, "dir")?),
+                        _ => {}
+                    }
+                }
+                out.style = super::style_from(family, &name, perc, dir.as_deref())?;
+            }
+            other => return Err(format!("unknown animation key `{other}`")),
         }
     }
     Ok(())
@@ -767,6 +921,14 @@ mod tests {
                 gaps-out 8
                 border { width 2; active-color "#89b4fa"; inactive-color "#585b70" }
             }
+            animations {
+                slowdown 2.0
+                curve "shoot" 0.05 0.9 0.1 1.05
+                spring damping-ratio=1.0 stiffness=600 epsilon=0.001
+                window-open { ease duration-ms=200 curve="shoot"; style "slide" dir="top" }
+                workspace-switch { style "slidefadevert" perc=30 }
+                window-move { off }
+            }
             output "DP-3" { mode "2560x1440@480"; variable-refresh-rate }
             screencast { picker "fuzzel-pick" }
             binds {
@@ -798,6 +960,17 @@ mod tests {
                     gaps_in = 4,
                     gaps_out = 8,
                     border = { width = 2, active_color = "#89b4fa", inactive_color = "#585b70" },
+                },
+                animations = {
+                    slowdown = 2.0,
+                    curves = { shoot = { 0.05, 0.9, 0.1, 1.05 } },
+                    spring = { damping_ratio = 1.0, stiffness = 600, epsilon = 0.001 },
+                    window_open = {
+                        ease = { duration_ms = 200, curve = "shoot" },
+                        style = { "slide", dir = "top" },
+                    },
+                    workspace_switch = { style = { "slidefadevert", perc = 30 } },
+                    window_move = { off = true },
                 },
                 outputs = { ["DP-3"] = { mode = "2560x1440@480", vrr = "always" } },
                 screencast = { picker = "fuzzel-pick" },

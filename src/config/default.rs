@@ -63,6 +63,21 @@ cursor {
     // software
 }
 
+// per-kind motion is a spring or an ease; unset kinds inherit the
+// section's default spring. styles: windows/layers take popin, fade,
+// slide; workspace-switch takes slide, slidevert, fade, slidefade,
+// slidefadevert
+animations {
+    // off
+    slowdown 1.0
+    // curve "overshot" 0.05 0.9 0.1 1.05
+    spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+    window-open { ease duration-ms=150 curve="ease-out-expo"; style "popin" perc=80 }
+    window-close { ease duration-ms=150 curve="ease-out-quad"; style "popin" perc=80 }
+    workspace-switch { spring damping-ratio=1.0 stiffness=1000 epsilon=0.0001; style "slide" }
+    border-color { ease duration-ms=200 curve="ease-out-quad" }
+}
+
 // prefer-no-csd
 
 // spawn-at-startup "quickshell"
