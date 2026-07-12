@@ -51,3 +51,10 @@
 - Screen Sleep & Wake on Input (DPMS)
 - Game Input (Relative Pointer & Constraints)
 - App Launcher & Widget Keyboard Support
+- Lock Screen (ext-session-lock)
+- PipeWire Screencast Portal
+- Pure Rust PipeWire Client
+- Window, Workspace & Output Casting
+- Hidden Workspace Casting
+- Screenshare Restore Tokens
+- Shell Agnostic Share Picker
