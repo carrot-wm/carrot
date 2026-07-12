@@ -5,6 +5,7 @@
 
 pub mod dwindle;
 pub mod float;
+pub mod scrolling;
 pub mod workspace;
 
 use crate::config::Dir;
