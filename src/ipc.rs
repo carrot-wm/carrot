@@ -305,6 +305,7 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
         eprintln!("carrot: config: {k}: needs restart");
     }
     let sw = cfg.cursor.software;
+    state.anim_clock.set_global(cfg.animations.off, cfg.animations.slowdown);
     *state.config.borrow_mut() = Rc::new(cfg);
     if let Some(seat) = state.seat.borrow().clone() {
         seat.apply_input_config(state);

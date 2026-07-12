@@ -73,6 +73,9 @@ pub struct State {
     /// the render device + (fourcc, modifier) set the dmabuf global speaks
     /// for; filled when the display comes up
     pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
+    /// frozen at each output's predicted present; all sampling agrees on
+    /// when the frame will glass
+    pub anim_clock: crate::anim::AnimClock,
     serial: NumCell<u64>,
     /// identity for cache keys: wire ids get reused, uids never do
     obj_uid: NumCell<u64>,
@@ -118,6 +121,7 @@ impl State {
             retired: RefCell::new(Vec::new()),
             frames_in_flight: std::cell::Cell::new(0),
             dmabuf_info: RefCell::new(None),
+            anim_clock: crate::anim::AnimClock::new(),
             serial: NumCell::new(0),
             obj_uid: NumCell::new(0),
         })

@@ -257,6 +257,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             *state.last_config_event.borrow_mut() = Some(ev.to_string());
         }
     }
+    {
+        let a = &state.config.borrow().animations;
+        state.anim_clock.set_global(a.off, a.slowdown);
+    }
     for sp in state.config.borrow().spawns.clone().iter() {
         ipc::run_spawn(&state, sp);
     }

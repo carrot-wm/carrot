@@ -346,6 +346,9 @@ pub struct Output {
     /// software-cursor texture; rebuilt when the image generation moves
     cursor_tex: RefCell<Option<Texture>>,
     cursor_gen: Cell<u64>,
+    /// a live animation was sampled during this output's compose; the
+    /// present loop stays dirty until one compose sees none
+    pub anim_pending: Cell<bool>,
 }
 
 impl Output {
@@ -1465,6 +1468,7 @@ fn init_output(
         vrr_warned: Cell::new(false),
         cursor_tex: RefCell::new(None),
         cursor_gen: Cell::new(0),
+        anim_pending: Cell::new(false),
     })
 }
 
@@ -1502,6 +1506,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             }
         }
         dirty |= out.damage.take();
+        dirty |= out.anim_pending.get();
         // render only when dirty AND the pipe is free
         if !dirty || out.conn.flip_pending.get() || out.paused.get() {
             continue;
@@ -1794,6 +1799,27 @@ fn compose_ops(
     cursor: CapCursor,
     ws_override: Option<usize>,
 ) -> Vec<RenderOp> {
+    // animations sample the moment this frame will glass, not "now"
+    let (sec, usec) = out.conn.flip_time.get();
+    let period_ns = out
+        .conn
+        .pipe
+        .borrow()
+        .as_ref()
+        .map(|p| {
+            let m = &p.mode;
+            m.htotal as u64 * m.vtotal as u64 * 1_000_000_000 / (m.clock.max(1) as u64 * 1000)
+        })
+        .unwrap_or(0);
+    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+    let target = if flip_ns == 0 || period_ns == 0 || out.conn.vrr_want.get() {
+        crate::util::Time::now().nsec()
+    } else {
+        flip_ns + period_ns
+    };
+    state.anim_clock.freeze(target);
+    out.anim_pending.set(false);
+
     let mut ops = Vec::new();
     let mut live: Vec<(ClientId, u64)> = Vec::new();
     // a locked session shows nothing but the lock surface; an output
