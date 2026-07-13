@@ -201,6 +201,22 @@ impl Default for ShadowCfg {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct BlurCfg {
+    pub passes: i32,
+    /// tap offset in half-pixels; bigger = blurrier per pass
+    pub size: f64,
+    pub noise: f64,
+    pub contrast: f64,
+    pub brightness: f64,
+}
+
+impl Default for BlurCfg {
+    fn default() -> BlurCfg {
+        BlurCfg { passes: 3, size: 8.0, noise: 0.02, contrast: 1.0, brightness: 1.0 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct DecoCfg {
     /// corner radius px; 0 = square
     pub rounding: i32,
@@ -209,11 +225,18 @@ pub struct DecoCfg {
     pub rounding_power: f64,
     pub dim_inactive: f64,
     pub shadow: Option<ShadowCfg>,
+    pub blur: Option<BlurCfg>,
 }
 
 impl Default for DecoCfg {
     fn default() -> DecoCfg {
-        DecoCfg { rounding: 0, rounding_power: 2.0, dim_inactive: 0.0, shadow: None }
+        DecoCfg {
+            rounding: 0,
+            rounding_power: 2.0,
+            dim_inactive: 0.0,
+            shadow: None,
+            blur: None,
+        }
     }
 }
 
@@ -321,11 +344,13 @@ pub struct WindowRule {
     pub rounding: Option<i32>,
     pub shadow: Option<bool>,
     pub dim: Option<bool>,
+    pub blur: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct LayerRule {
     pub matches: Vec<String>,
+    pub blur: bool,
 }
 
 // -- animations: per-kind spring/ease motion plus visual styles --
@@ -935,6 +960,7 @@ pub struct RuleFx {
     pub rounding: Option<i32>,
     pub shadow: Option<bool>,
     pub dim: Option<bool>,
+    pub blur: Option<bool>,
 }
 
 fn matcher_hits(
@@ -1005,6 +1031,9 @@ pub fn rule_effects(
         }
         if let Some(v) = r.dim {
             fx.dim = Some(v);
+        }
+        if let Some(v) = r.blur {
+            fx.blur = Some(v);
         }
     }
     fx

@@ -31,6 +31,8 @@ use rspirv::spirv::{
 #[repr(u32)]
 enum GLOp {
     FAbs = 4,
+    Fract = 10,
+    Sin = 13,
     Pow = 26,
     FMax = 40,
     FClamp = 43,
@@ -826,6 +828,190 @@ fn build_xfade() -> Vec<u32> {
     b.module().assemble()
 }
 
+
+// the kawase pair share one skeleton: fullscreen quad, corner uv, one
+// sampler, push = vec2 dst_pos @0, vec2 dst_size @8, vec2 halfpixel @16,
+// float extra_a @24, float extra_b @28 (down: contrast/brightness,
+// up: noise/unused). taps differ per direction.
+fn build_blur(down: bool) -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    let set = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let c = common(&mut b);
+
+    let pc_struct = b.type_struct(vec![c.vec2, c.vec2, c.vec2, c.f32t, c.f32t]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    for (i, off) in [0u32, 8, 16, 24, 28].iter().enumerate() {
+        b.member_decorate(
+            pc_struct,
+            i as u32,
+            Decoration::Offset,
+            vec![Operand::LiteralBit32(*off)],
+        );
+    }
+    let ptr_pc = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let pc_var = b.variable(ptr_pc, None, StorageClass::PushConstant, None);
+    let ptr_pc_f32 = b.type_pointer(None, StorageClass::PushConstant, c.f32t);
+    let c_i32_3 = b.constant_bit32(c.i32t, 3);
+    let c_i32_4 = b.constant_bit32(c.i32t, 4);
+
+    let image = b.type_image(c.f32t, Dim::Dim2D, 0, 0, 0, 1, ImageFormat::Unknown, None);
+    let sampled = b.type_sampled_image(image);
+    let ptr_uc = b.type_pointer(None, StorageClass::UniformConstant, sampled);
+    let tex = b.variable(ptr_uc, None, StorageClass::UniformConstant, None);
+    b.decorate(tex, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(tex, Decoration::Binding, vec![Operand::LiteralBit32(0)]);
+
+    let vidx = b.variable(c.ptr_in_i32, None, StorageClass::Input, None);
+    b.decorate(vidx, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
+    let gl_pos = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(gl_pos, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::Position)]);
+    let ptr_out_vec2 = b.type_pointer(None, StorageClass::Output, c.vec2);
+    let uv_out = b.variable(ptr_out_vec2, None, StorageClass::Output, None);
+    b.decorate(uv_out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let ptr_in_vec2 = b.type_pointer(None, StorageClass::Input, c.vec2);
+    let uv_in = b.variable(ptr_in_vec2, None, StorageClass::Input, None);
+    b.decorate(uv_in, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let out_color = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(out_color, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+
+    // vs: quad + corner uv
+    let vs = b
+        .begin_function(c.void, None, FunctionControl::NONE, c.fn_void)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let idx = b.load(c.i32t, None, vidx, None, vec![]).unwrap();
+    let x_i = b.bitwise_and(c.i32t, None, idx, c.c_i32_1).unwrap();
+    let y_i = b.shift_right_arithmetic(c.i32t, None, idx, c.c_i32_1).unwrap();
+    let x = b.convert_s_to_f(c.f32t, None, x_i).unwrap();
+    let y = b.convert_s_to_f(c.f32t, None, y_i).unwrap();
+    let corner = b.composite_construct(c.vec2, None, vec![x, y]).unwrap();
+    let pos_ptr = b
+        .access_chain(c.ptr_pc_vec2, None, pc_var, vec![c.c_i32_0])
+        .unwrap();
+    let pos = b.load(c.vec2, None, pos_ptr, None, vec![]).unwrap();
+    let size_ptr = b
+        .access_chain(c.ptr_pc_vec2, None, pc_var, vec![c.c_i32_1])
+        .unwrap();
+    let size = b.load(c.vec2, None, size_ptr, None, vec![]).unwrap();
+    let scaled = b.f_mul(c.vec2, None, corner, size).unwrap();
+    let ndc = b.f_add(c.vec2, None, pos, scaled).unwrap();
+    store_position(&mut b, &c, gl_pos, ndc);
+    b.store(uv_out, corner, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    // fs
+    let fs = b
+        .begin_function(c.void, None, FunctionControl::NONE, c.fn_void)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let si = b.load(sampled, None, tex, None, vec![]).unwrap();
+    let uv = b.load(c.vec2, None, uv_in, None, vec![]).unwrap();
+    let hp_ptr = b
+        .access_chain(c.ptr_pc_vec2, None, pc_var, vec![c.c_i32_2])
+        .unwrap();
+    let hp = b.load(c.vec2, None, hp_ptr, None, vec![]).unwrap();
+    let ea_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![c_i32_3]).unwrap();
+    let extra_a = b.load(c.f32t, None, ea_ptr, None, vec![]).unwrap();
+    let eb_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![c_i32_4]).unwrap();
+    let extra_b = b.load(c.f32t, None, eb_ptr, None, vec![]).unwrap();
+
+    let hpx = b.composite_extract(c.f32t, None, hp, vec![0]).unwrap();
+    let hpy = b.composite_extract(c.f32t, None, hp, vec![1]).unwrap();
+    let nhpx = b.f_negate(c.f32t, None, hpx).unwrap();
+    let nhpy = b.f_negate(c.f32t, None, hpy).unwrap();
+    let mut sample_at = |b: &mut Builder, dx: Word, dy: Word| -> Word {
+        let off = b.composite_construct(c.vec2, None, vec![dx, dy]).unwrap();
+        let p = b.f_add(c.vec2, None, uv, off).unwrap();
+        b.image_sample_implicit_lod(c.vec4, None, si, p, None, vec![])
+            .unwrap()
+    };
+
+    let acc;
+    if down {
+        // 4x center + the four diagonals, /8
+        let center = {
+            let s0 = b
+                .image_sample_implicit_lod(c.vec4, None, si, uv, None, vec![])
+                .unwrap();
+            let four = b.constant_bit32(c.f32t, 4.0f32.to_bits());
+            b.vector_times_scalar(c.vec4, None, s0, four).unwrap()
+        };
+        let d1 = sample_at(&mut b, hpx, hpy);
+        let d2 = sample_at(&mut b, nhpx, nhpy);
+        let d3 = sample_at(&mut b, hpx, nhpy);
+        let d4 = sample_at(&mut b, nhpx, hpy);
+        let mut sum = b.f_add(c.vec4, None, center, d1).unwrap();
+        sum = b.f_add(c.vec4, None, sum, d2).unwrap();
+        sum = b.f_add(c.vec4, None, sum, d3).unwrap();
+        sum = b.f_add(c.vec4, None, sum, d4).unwrap();
+        let inv8 = b.constant_bit32(c.f32t, 0.125f32.to_bits());
+        let avg = b.vector_times_scalar(c.vec4, None, sum, inv8).unwrap();
+        // extra_a = contrast about mid, extra_b = brightness multiply
+        let half4 = {
+            let h = b.constant_bit32(c.f32t, 0.5f32.to_bits());
+            b.composite_construct(c.vec4, None, vec![h, h, h, h]).unwrap()
+        };
+        let centered = b.f_sub(c.vec4, None, avg, half4).unwrap();
+        let con = b.vector_times_scalar(c.vec4, None, centered, extra_a).unwrap();
+        let back = b.f_add(c.vec4, None, con, half4).unwrap();
+        acc = b.vector_times_scalar(c.vec4, None, back, extra_b).unwrap();
+    } else {
+        // eight taps, doubled diagonals, /12
+        let two = b.constant_bit32(c.f32t, 2.0f32.to_bits());
+        let hpx2 = b.f_mul(c.f32t, None, hpx, two).unwrap();
+        let hpy2 = b.f_mul(c.f32t, None, hpy, two).unwrap();
+        let nhpx2 = b.f_negate(c.f32t, None, hpx2).unwrap();
+        let nhpy2 = b.f_negate(c.f32t, None, hpy2).unwrap();
+        let u1 = sample_at(&mut b, nhpx2, c.c_f32_0);
+        let u2 = sample_at(&mut b, nhpx, hpy);
+        let u3 = sample_at(&mut b, c.c_f32_0, hpy2);
+        let u4 = sample_at(&mut b, hpx, hpy);
+        let u5 = sample_at(&mut b, hpx2, c.c_f32_0);
+        let u6 = sample_at(&mut b, hpx, nhpy);
+        let u7 = sample_at(&mut b, c.c_f32_0, nhpy2);
+        let u8 = sample_at(&mut b, nhpx, nhpy);
+        let d2x = b.f_add(c.vec4, None, u2, u4).unwrap();
+        let d2y = b.f_add(c.vec4, None, u6, u8).unwrap();
+        let diag = b.f_add(c.vec4, None, d2x, d2y).unwrap();
+        let diag2 = b.vector_times_scalar(c.vec4, None, diag, two).unwrap();
+        let ax = b.f_add(c.vec4, None, u1, u3).unwrap();
+        let ay = b.f_add(c.vec4, None, u5, u7).unwrap();
+        let axes = b.f_add(c.vec4, None, ax, ay).unwrap();
+        let sum = b.f_add(c.vec4, None, diag2, axes).unwrap();
+        let inv12 = b.constant_bit32(c.f32t, (1.0f32 / 12.0).to_bits());
+        let avg = b.vector_times_scalar(c.vec4, None, sum, inv12).unwrap();
+        // extra_a = noise strength: cheap hash off the uv
+        let k1 = b.constant_bit32(c.f32t, 12.9898f32.to_bits());
+        let k2 = b.constant_bit32(c.f32t, 78.233f32.to_bits());
+        let kv = b.composite_construct(c.vec2, None, vec![k1, k2]).unwrap();
+        let dt = b.dot(c.f32t, None, uv, kv).unwrap();
+        let sn = glsl(&mut b, set, c.f32t, GLOp::Sin, &[dt]);
+        let k3 = b.constant_bit32(c.f32t, 43758.5453f32.to_bits());
+        let big = b.f_mul(c.f32t, None, sn, k3).unwrap();
+        let fr = glsl(&mut b, set, c.f32t, GLOp::Fract, &[big]);
+        let half = b.constant_bit32(c.f32t, 0.5f32.to_bits());
+        let signed = b.f_sub(c.f32t, None, fr, half).unwrap();
+        let n = b.f_mul(c.f32t, None, signed, extra_a).unwrap();
+        let n4 = b.composite_construct(c.vec4, None, vec![n, n, n, c.c_f32_0]).unwrap();
+        let noised = b.f_add(c.vec4, None, avg, n4).unwrap();
+        let _ = extra_b;
+        acc = noised;
+    }
+    b.store(out_color, acc, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    b.entry_point(ExecutionModel::Vertex, vs, "vs_main", vec![vidx, gl_pos, uv_out]);
+    b.entry_point(ExecutionModel::Fragment, fs, "fs_main", vec![uv_in, out_color]);
+    b.execution_mode(fs, ExecutionMode::OriginUpperLeft, vec![]);
+
+    b.module().assemble()
+}
+
 fn emit_const(out: &mut String, name: &str, words: &[u32]) {
     writeln!(out, "pub const {name}: &[u32] = &[").unwrap();
     for chunk in words.chunks(8) {
@@ -845,6 +1031,8 @@ fn main() {
     let border = build_border();
     let shadow = build_shadow();
     let xfade = build_xfade();
+    let blur_down = build_blur(true);
+    let blur_up = build_blur(false);
 
     let own_src = std::fs::read_to_string(tool_dir.join("src/main.rs")).unwrap();
     let gen_hash = hex(&Sha256::digest(own_src.as_bytes()));
@@ -862,6 +1050,8 @@ fn main() {
     emit_const(&mut out, "BORDER", &border);
     emit_const(&mut out, "SHADOW", &shadow);
     emit_const(&mut out, "XFADE", &xfade);
+    emit_const(&mut out, "BLUR_DOWN", &blur_down);
+    emit_const(&mut out, "BLUR_UP", &blur_up);
 
     writeln!(
         out,
@@ -877,6 +1067,8 @@ mod tests {{
     const BORDER_HASH: &str = "{border_hash}";
     const SHADOW_HASH: &str = "{shadow_hash}";
     const XFADE_HASH: &str = "{xfade_hash}";
+    const BLUR_DOWN_HASH: &str = "{blur_down_hash}";
+    const BLUR_UP_HASH: &str = "{blur_up_hash}";
     const REGEN: &str =
         "shaders out of date - rerun: cargo run --manifest-path tools/gen-shaders/Cargo.toml";
 
@@ -902,6 +1094,8 @@ mod tests {{
         assert_eq!(BORDER_HASH, words_hash(super::BORDER), "{{REGEN}}");
         assert_eq!(SHADOW_HASH, words_hash(super::SHADOW), "{{REGEN}}");
         assert_eq!(XFADE_HASH, words_hash(super::XFADE), "{{REGEN}}");
+        assert_eq!(BLUR_DOWN_HASH, words_hash(super::BLUR_DOWN), "{{REGEN}}");
+        assert_eq!(BLUR_UP_HASH, words_hash(super::BLUR_UP), "{{REGEN}}");
     }}
 
     #[test]
@@ -912,6 +1106,8 @@ mod tests {{
         assert_eq!(super::BORDER[0], 0x0723_0203);
         assert_eq!(super::SHADOW[0], 0x0723_0203);
         assert_eq!(super::XFADE[0], 0x0723_0203);
+        assert_eq!(super::BLUR_DOWN[0], 0x0723_0203);
+        assert_eq!(super::BLUR_UP[0], 0x0723_0203);
     }}
 }}"#,
         gen_hash = gen_hash,
@@ -921,12 +1117,14 @@ mod tests {{
         border_hash = words_hash(&border),
         shadow_hash = words_hash(&shadow),
         xfade_hash = words_hash(&xfade),
+        blur_down_hash = words_hash(&blur_down),
+        blur_up_hash = words_hash(&blur_up),
     )
     .unwrap();
 
     std::fs::write(render_dir.join("shaders.rs"), out).unwrap();
     println!(
         "wrote shaders.rs ({} modules)",
-        6
+        8
     );
 }

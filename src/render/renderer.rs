@@ -66,6 +66,15 @@ struct XfadePush {
 }
 
 #[repr(C)]
+struct BlurPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    halfpixel: [f32; 2],
+    extra_a: f32,
+    extra_b: f32,
+}
+
+#[repr(C)]
 struct TexRPush {
     pos: [f32; 2],
     size: [f32; 2],
@@ -122,6 +131,15 @@ pub enum RenderOp {
         power: f32,
         color: [f32; 4],
     },
+    /// one kawase step over the whole target; down: a=contrast b=brightness,
+    /// up: a=noise
+    Blur {
+        view: vk::ImageView,
+        halfpixel: [f32; 2],
+        extra_a: f32,
+        extra_b: f32,
+        up: bool,
+    },
     /// two textures stretched to the quad, mixed by progress, clipped to
     /// the rounded geometry; the resize crossfade
     Xfade {
@@ -155,6 +173,7 @@ impl RenderOp {
             RenderOp::Border { .. } => true,
             RenderOp::Shadow { .. } => true,
             RenderOp::Xfade { .. } => true,
+            RenderOp::Blur { .. } => false,
         }
     }
 }
@@ -216,6 +235,8 @@ struct Pipelines {
     border_blend: vk::Pipeline,
     shadow_blend: vk::Pipeline,
     xfade_blend: vk::Pipeline,
+    blur_down: vk::Pipeline,
+    blur_up: vk::Pipeline,
 }
 
 pub struct Renderer {
@@ -227,6 +248,7 @@ pub struct Renderer {
     texr_layout: vk::PipelineLayout,
     xfade_set_layout: vk::DescriptorSetLayout,
     xfade_layout: vk::PipelineLayout,
+    blur_layout: vk::PipelineLayout,
     border_layout: vk::PipelineLayout,
     shadow_layout: vk::PipelineLayout,
     fill_layout: vk::PipelineLayout,
@@ -313,6 +335,14 @@ impl Renderer {
             .push_constant_ranges(&xfade_range);
         let xfade_layout = unsafe { dev.create_pipeline_layout(&xfade_layout_info, None) }?;
 
+        let blur_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<BlurPush>() as u32)];
+        let blur_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&blur_range);
+        let blur_layout = unsafe { dev.create_pipeline_layout(&blur_layout_info, None) }?;
+
         let border_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .size(size_of::<BorderPush>() as u32)];
@@ -333,6 +363,8 @@ impl Renderer {
         let border_module = create_module(dev, shaders::BORDER)?;
         let shadow_module = create_module(dev, shaders::SHADOW)?;
         let xfade_module = create_module(dev, shaders::XFADE)?;
+        let blur_down_module = create_module(dev, shaders::BLUR_DOWN)?;
+        let blur_up_module = create_module(dev, shaders::BLUR_UP)?;
         let pipes = Pipelines {
             fill_opaque: create_pipeline(dev, format, fill_module, fill_layout, false)?,
             fill_blend: create_pipeline(dev, format, fill_module, fill_layout, true)?,
@@ -342,6 +374,8 @@ impl Renderer {
             border_blend: create_pipeline(dev, format, border_module, border_layout, true)?,
             shadow_blend: create_pipeline(dev, format, shadow_module, shadow_layout, true)?,
             xfade_blend: create_pipeline(dev, format, xfade_module, xfade_layout, true)?,
+            blur_down: create_pipeline(dev, format, blur_down_module, blur_layout, false)?,
+            blur_up: create_pipeline(dev, format, blur_up_module, blur_layout, false)?,
         };
         unsafe {
             dev.destroy_shader_module(fill_module, None);
@@ -350,6 +384,8 @@ impl Renderer {
             dev.destroy_shader_module(border_module, None);
             dev.destroy_shader_module(shadow_module, None);
             dev.destroy_shader_module(xfade_module, None);
+            dev.destroy_shader_module(blur_down_module, None);
+            dev.destroy_shader_module(blur_up_module, None);
         }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -369,6 +405,7 @@ impl Renderer {
             texr_layout,
             xfade_set_layout,
             xfade_layout,
+            blur_layout,
             border_layout,
             shadow_layout,
             fill_layout,
@@ -504,6 +541,10 @@ impl Renderer {
                 (RenderOp::Border { .. }, _) => (self.pipes.border_blend, self.border_layout),
                 (RenderOp::Shadow { .. }, _) => (self.pipes.shadow_blend, self.shadow_layout),
                 (RenderOp::Xfade { .. }, _) => (self.pipes.xfade_blend, self.xfade_layout),
+                (RenderOp::Blur { up, .. }, _) => (
+                    if *up { self.pipes.blur_up } else { self.pipes.blur_down },
+                    self.blur_layout,
+                ),
             };
             unsafe {
                 if pipe != bound {
@@ -556,6 +597,38 @@ impl Renderer {
                             uv_pos: *uv_pos,
                             uv_size: *uv_size,
                             mul: *mul,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::Blur { view, halfpixel, extra_a, extra_b, .. } => {
+                        let image_info = vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                        let infos = [image_info];
+                        let write = vk::WriteDescriptorSet::default()
+                            .dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&infos);
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &[write],
+                        );
+                        let pc = BlurPush {
+                            pos: [-1.0, -1.0],
+                            size: [2.0, 2.0],
+                            halfpixel: *halfpixel,
+                            extra_a: *extra_a,
+                            extra_b: *extra_b,
                         };
                         dev.cmd_push_constants(
                             cb,

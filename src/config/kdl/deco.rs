@@ -37,8 +37,12 @@ pub(super) fn parse(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     d.shadow = Some(s);
                 }
             }
-            // parses when the blur pass exists
-            "blur" => cx.at(c, "blur: not implemented yet"),
+            "blur" => {
+                let mut b = BlurCfg::default();
+                if blur(c, &mut b, cx) {
+                    d.blur = Some(b);
+                }
+            }
             other => cx.at(c, &format!("unknown decoration key \"{other}\"")),
         }
     }
@@ -102,6 +106,83 @@ fn shadow(node: &KdlNode, out: &mut ShadowCfg, cx: &mut Cx) -> bool {
     ok
 }
 
+fn blur(node: &KdlNode, out: &mut BlurCfg, cx: &mut Cx) -> bool {
+    let mut ok = true;
+    for c in children(node) {
+        match c.name().value() {
+            "passes" => {
+                if let Some(v) = cx.int(c) {
+                    match int_in(v, "passes", 1, 4) {
+                        Ok(v) => out.passes = v as i32,
+                        Err(e) => {
+                            cx.leaf(c, e);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            "size" => {
+                if let Some(v) = cx.float(c) {
+                    match f64_in(v, "size", 0.5, 40.0) {
+                        Ok(v) => out.size = v,
+                        Err(e) => {
+                            cx.leaf(c, e);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            "noise" => {
+                if let Some(v) = cx.float(c) {
+                    match f64_in(v, "noise", 0.0, 1.0) {
+                        Ok(v) => out.noise = v,
+                        Err(e) => {
+                            cx.leaf(c, e);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            "contrast" => {
+                if let Some(v) = cx.float(c) {
+                    match f64_in(v, "contrast", 0.0, 2.0) {
+                        Ok(v) => out.contrast = v,
+                        Err(e) => {
+                            cx.leaf(c, e);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            "brightness" => {
+                if let Some(v) = cx.float(c) {
+                    match f64_in(v, "brightness", 0.0, 2.0) {
+                        Ok(v) => out.brightness = v,
+                        Err(e) => {
+                            cx.leaf(c, e);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            // the cache samples the backdrop; true stacking is future work
+            "xray" => {
+                if let Some(b) = cx.flag(c) {
+                    if !b {
+                        cx.at(c, "xray #false: not implemented yet");
+                        ok = false;
+                    }
+                }
+            }
+            other => {
+                cx.at(c, &format!("unknown blur key \"{other}\""));
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::*;
@@ -138,12 +219,29 @@ mod tests {
             ("decoration { rounding 999 }", "rounding"),
             ("decoration { dim-inactive 2 }", "dim-inactive"),
             ("decoration { shadow { offset 0 } }", "offset"),
-            ("decoration { blur { passes 3 } }", "blur"),
+            ("decoration { blur { passes 9 } }", "passes"),
+            ("decoration { blur { xray #false } }", "xray"),
             ("decoration { bogus 1 }", "unknown"),
         ] {
             let errs = parse_errs(src);
             assert!(errs.iter().any(|e| e.contains(needle)), "{src}: {errs:?}");
         }
+    }
+
+    #[test]
+    fn blur_block_parses() {
+        let c = parse_ok(
+            "decoration { blur { passes 2; size 6.0; noise 0.05; contrast 1.1; brightness 0.9; xray } }",
+        );
+        let b = c.decoration.blur.as_ref().unwrap();
+        assert_eq!(b.passes, 2);
+        assert_eq!(b.size, 6.0);
+        assert!((b.noise - 0.05).abs() < 1e-9);
+        let c = parse_ok(
+            "window-rule { match app-id=\"term\"\n blur }\nlayer-rule { match namespace=\"^bar$\"\n blur }",
+        );
+        assert_eq!(c.rules[0].blur, Some(true));
+        assert!(c.layer_rules[0].blur);
     }
 
     #[test]

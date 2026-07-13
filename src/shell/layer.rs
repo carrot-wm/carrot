@@ -127,6 +127,7 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             version: self.version,
             me: me.clone(),
             surface: surface.clone(),
+            namespace: req.namespace.clone(),
             pending: Cell::new(LayerState::new(req.layer)),
             current: Cell::new(LayerState::new(req.layer)),
             created_layer: req.layer,
@@ -255,6 +256,8 @@ pub struct LayerSurface {
     pub version: u32,
     me: Weak<LayerSurface>,
     pub surface: Rc<WlSurface>,
+    /// the get_layer_surface namespace; rules match against it
+    pub namespace: String,
     pending: Cell<LayerState>,
     pub current: Cell<LayerState>,
     /// the get_layer_surface layer argument; unmap resets back to it
@@ -608,6 +611,14 @@ impl SurfaceExt for LayerExt {
         let state = ls.client.state.clone();
         if ls.closed.get() {
             return;
+        }
+        // backdrop content feeds the blur cache; its commits invalidate it
+        if ls.current.get().layer <= BOTTOM {
+            if let Some(d) = state.display.borrow().as_ref() {
+                if let Some(out) = d.outputs.borrow().get(ls.output.get()) {
+                    out.blur_dirty.set(true);
+                }
+            }
         }
         if !ls.configured.get() {
             // the initial commit is answered with a configure and maps

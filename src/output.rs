@@ -353,6 +353,15 @@ pub struct Output {
     pub ws_switch: RefCell<Option<WsSwitch>>,
     /// unmapped layer surfaces still animating out
     pub closing_layers: RefCell<Vec<ClosingWindow>>,
+    /// blurred-backdrop cache; levels[0] doubles as the finished result
+    pub blur: RefCell<Option<BlurCache>>,
+    /// the backdrop changed since the cache was built
+    pub blur_dirty: Cell<bool>,
+}
+
+pub struct BlurCache {
+    /// full res first, then each kawase level at half the previous
+    levels: Vec<Texture>,
 }
 
 #[derive(Clone)]
@@ -1488,6 +1497,8 @@ fn init_output(
         anim_pending: Cell::new(false),
         ws_switch: RefCell::new(None),
         closing_layers: RefCell::new(Vec::new()),
+        blur: RefCell::new(None),
+        blur_dirty: Cell::new(true),
     })
 }
 
@@ -1923,6 +1934,7 @@ fn compose_ops(
     let fs = ws.fullscreen.borrow().clone();
     let screen = out.rect();
     let cfg = state.config.borrow().clone();
+    ensure_blur_cache(state, out, screen, &cfg);
 
     // paint order: background, bottom, tiled, fullscreen, floats, top,
     // overlay, layer popups; fullscreen hides everything below itself
@@ -2102,6 +2114,11 @@ fn draw_layer(
         let r = ls.rect.get();
         let mark = ops.len();
         let lmark = live.len();
+        if layer > crate::shell::layer::BOTTOM
+            && layer_blur_on(&state.config.borrow().clone(), &ls.namespace)
+        {
+            push_blur_backdrop(out, r, 0.0, ops);
+        }
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, 0.0, ops, live);
         let anim = ls.anim.borrow().clone();
         if let Some((a, style)) = anim {
@@ -2345,6 +2362,173 @@ fn draw_buffer(
     }
 }
 
+/// a layer surface whose namespace hits a blur rule samples the cache
+fn layer_blur_on(cfg: &crate::config::Config, ns: &str) -> bool {
+    cfg.decoration.blur.is_some()
+        && cfg.layer_rules.iter().any(|r| {
+            r.blur
+                && r.matches
+                    .iter()
+                    .any(|m| regex_lite::Regex::new(m).is_ok_and(|re| re.is_match(ns)))
+        })
+}
+
+fn blur_consumers_visible(state: &Rc<State>, out: &Rc<Output>, cfg: &crate::config::Config) -> bool {
+    if cfg.decoration.blur.is_none() {
+        return false;
+    }
+    for ls in state.layers.borrow().iter() {
+        if ls.output.get() == out.index.get() && ls.mapped() && layer_blur_on(cfg, &ls.namespace) {
+            return true;
+        }
+    }
+    let mut hit = false;
+    if let Some(ws) = state.workspaces.borrow().get(out.ws.get()) {
+        ws.for_each(|w| hit |= w.rule_blur.get());
+    }
+    hit
+}
+
+/// rebuild the blurred backdrop when needed; any failure leaves the cache
+/// empty and the consumers draw without it
+fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &crate::config::Config) {
+    let Some(bc) = &cfg.decoration.blur else {
+        if let Some(old) = out.blur.borrow_mut().take() {
+            state.retire_tex.borrow_mut().extend(old.levels);
+        }
+        return;
+    };
+    if !blur_consumers_visible(state, out, cfg) {
+        return;
+    }
+    if !out.blur_dirty.replace(false) && out.blur.borrow().is_some() {
+        return;
+    }
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
+    draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
+    let passes = bc.passes.clamp(1, 4) as u32;
+    let need: Vec<(u32, u32)> = (0..=passes)
+        .map(|i| ((out.width >> i).max(1), (out.height >> i).max(1)))
+        .collect();
+    {
+        let mut slot = out.blur.borrow_mut();
+        let fits = slot.as_ref().is_some_and(|c| {
+            c.levels.len() == need.len()
+                && c.levels.iter().zip(&need).all(|(t, n)| (t.width, t.height) == *n)
+        });
+        if !fits {
+            if let Some(old) = slot.take() {
+                state.retire_tex.borrow_mut().extend(old.levels);
+            }
+            let mut levels = Vec::new();
+            for (w, h) in &need {
+                match out.renderer.create_render_texture(*w, *h) {
+                    Ok(t) => levels.push(t),
+                    Err(e) => {
+                        eprintln!("carrot: blur cache alloc failed: {e}");
+                        state.retire_tex.borrow_mut().extend(levels);
+                        return;
+                    }
+                }
+            }
+            *slot = Some(BlurCache { levels });
+        }
+    }
+    let slot = out.blur.borrow();
+    let cache = slot.as_ref().unwrap();
+    let run = |tex: &Texture, pass_ops: &[RenderOp]| -> bool {
+        out.renderer
+            .render_into(tex, Some([0.0, 0.0, 0.0, 1.0]), pass_ops, Vec::new())
+            .and_then(|f| f.wait(&out.renderer))
+            .is_ok()
+    };
+    if !run(&cache.levels[0], &ops) {
+        return;
+    }
+    let sz = bc.size as f32;
+    for i in 0..passes as usize {
+        let (src, dst) = (&cache.levels[i], &cache.levels[i + 1]);
+        let hp = [0.5 / dst.width as f32 * sz, 0.5 / dst.height as f32 * sz];
+        let first = i == 0;
+        let op = RenderOp::Blur {
+            view: src.view,
+            halfpixel: hp,
+            extra_a: if first { bc.contrast as f32 } else { 1.0 },
+            extra_b: if first { bc.brightness as f32 } else { 1.0 },
+            up: false,
+        };
+        if !run(dst, &[op]) {
+            return;
+        }
+    }
+    for i in (0..passes as usize).rev() {
+        let (src, dst) = (&cache.levels[i + 1], &cache.levels[i]);
+        let hp = [0.5 / src.width as f32 * sz, 0.5 / src.height as f32 * sz];
+        let last = i == 0;
+        let op = RenderOp::Blur {
+            view: src.view,
+            halfpixel: hp,
+            extra_a: if last { bc.noise as f32 } else { 0.0 },
+            extra_b: 0.0,
+            up: true,
+        };
+        if !run(dst, &[op]) {
+            return;
+        }
+    }
+}
+
+/// the blurred backdrop under a rect, rounded to taste
+fn push_blur_backdrop(out: &Rc<Output>, r: Rect, round: f32, ops: &mut Vec<RenderOp>) {
+    let slot = out.blur.borrow();
+    let Some(cache) = slot.as_ref() else { return };
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    let pos = [fxp(r.x1), fyp(r.y1)];
+    let size = [
+        r.width() as f32 / out.width as f32 * 2.0,
+        r.height() as f32 / out.height as f32 * 2.0,
+    ];
+    let uv_pos = [
+        (r.x1 - gx) as f32 / out.width as f32,
+        (r.y1 - gy) as f32 / out.height as f32,
+    ];
+    let uv_size = [
+        r.width() as f32 / out.width as f32,
+        r.height() as f32 / out.height as f32,
+    ];
+    if round >= 0.5 {
+        ops.push(RenderOp::TexR {
+            view: cache.levels[0].view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: 1.0,
+            geo_px: [
+                (r.x1 - gx) as f32,
+                (r.y1 - gy) as f32,
+                r.width() as f32,
+                r.height() as f32,
+            ],
+            radius: round,
+        });
+    } else {
+        ops.push(RenderOp::Tex {
+            view: cache.levels[0].view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: 1.0,
+            opaque: true,
+        });
+    }
+}
+
 /// one workspace's content: tiled, closings, fullscreen, floats
 fn ws_scene(
     state: &Rc<State>,
@@ -2422,6 +2606,7 @@ fn remap_local(ops: &mut [RenderOp], out: &Output, r: Rect) {
                 geo_px[0] -= px;
                 geo_px[1] -= py;
             }
+            RenderOp::Blur { .. } => {}
         }
     }
 }
@@ -2632,6 +2817,9 @@ fn draw_window(
     }
     let geo = win.geometry();
     let alpha = win.rule_opacity.get().unwrap_or(1.0);
+    if win.rule_blur.get() && !win.fullscreen.get() {
+        push_blur_backdrop(out, rect, round, ops);
+    }
     let mut xfaded = false;
     if let Some((p, _)) = rz_progress {
         xfaded = draw_resize_xfade(state, out, win, rect, round, p, ops, live);
@@ -2897,6 +3085,8 @@ fn apply_batch(
                 }
                 *radius *= scale;
             }
+            // pre-pass only; never inside a window batch
+            RenderOp::Blur { .. } => {}
         }
     }
 }

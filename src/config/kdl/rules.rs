@@ -123,6 +123,11 @@ pub(super) fn window_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     rule.dim = Some(b);
                 }
             }
+            "blur" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.blur = Some(b);
+                }
+            }
             "animation" => {
                 if let Some(s) = cx.str_(c) {
                     match style_from(
@@ -155,6 +160,11 @@ pub(super) fn layer_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                 Some(Err(err)) => cx.leaf(c, err),
                 None => cx.at(c, "match wants namespace=, a regex string"),
             },
+            "blur" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.blur = b;
+                }
+            }
             other => cx.at(c, &format!("unknown layer-rule key \"{other}\"")),
         }
     }

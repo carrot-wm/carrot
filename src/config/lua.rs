@@ -14,7 +14,7 @@
 // }
 
 use super::{
-    Action, Bind, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
+    Action, Bind, BlurCfg, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
     LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch,
     SetLayoutArg, ShadowCfg, SpawnCfg, Vrr, WindowRule,
 };
@@ -553,7 +553,34 @@ fn decoration(v: &Value, cfg: &mut Config) -> Result<(), String> {
                 }
                 d.shadow = Some(s);
             }
-            "blur" => return Err("blur: not implemented yet".to_string()),
+            "blur" => {
+                let mut b = BlurCfg::default();
+                for (k, v) in table(&v, "blur")?.iter() {
+                    let key = vstr(&k).ok_or("blur keys must be strings")?;
+                    match key.as_str() {
+                        "passes" => {
+                            b.passes =
+                                super::int_in(need_int(&v, &key)?, "passes", 1, 4)? as i32;
+                        }
+                        "size" => b.size = super::f64_in(need_num(&v, &key)?, "size", 0.5, 40.0)?,
+                        "noise" => b.noise = super::f64_in(need_num(&v, &key)?, "noise", 0.0, 1.0)?,
+                        "contrast" => {
+                            b.contrast = super::f64_in(need_num(&v, &key)?, "contrast", 0.0, 2.0)?;
+                        }
+                        "brightness" => {
+                            b.brightness =
+                                super::f64_in(need_num(&v, &key)?, "brightness", 0.0, 2.0)?;
+                        }
+                        "xray" => {
+                            if !need_bool(&v, &key)? {
+                                return Err("xray false: not implemented yet".to_string());
+                            }
+                        }
+                        other => return Err(format!("unknown blur key `{other}`")),
+                    }
+                }
+                d.blur = Some(b);
+            }
             other => return Err(format!("unknown decoration key `{other}`")),
         }
     }
@@ -939,6 +966,7 @@ fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                 }
                 "shadow" => rule.shadow = Some(need_bool(&v, &key).map_err(whine)?),
                 "dim" => rule.dim = Some(need_bool(&v, &key).map_err(whine)?),
+                "blur" => rule.blur = Some(need_bool(&v, &key).map_err(whine)?),
                 "animation" => {
                     rule.animation =
                         Some(lua_style(&v, super::StyleFamily::Win).map_err(whine)?);
@@ -966,6 +994,7 @@ fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                         rule.matches.push(super::regex(&m).map_err(whine)?);
                     }
                 }
+                "blur" => rule.blur = need_bool(&v, &key).map_err(whine)?,
                 other => return Err(whine(format!("unknown key `{other}`"))),
             }
         }

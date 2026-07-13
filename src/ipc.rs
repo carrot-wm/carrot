@@ -412,6 +412,11 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
     if let Some(d) = state.display.borrow().as_ref() {
         d.set_software_cursor(state, sw);
     }
+    if let Some(d) = state.display.borrow().as_ref() {
+        for out in d.outputs.borrow().iter() {
+            out.blur_dirty.set(true);
+        }
+    }
     let ws = crate::tree::active(state);
     crate::tree::relayout(state, &ws);
     crate::shell::layer::arrange(state);
