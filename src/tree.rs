@@ -1229,8 +1229,10 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
             let old_view = ws.tiling.strip.view_px();
             let rects = ws.tiling.strip.layout(area, &cfg.layout.scrolling);
             // the scroll itself draws as one strip translate; feeding it
-            // into per-window move anims would animate the delta twice
-            let view_dx = old_view - ws.tiling.strip.view_px();
+            // into per-window move anims would animate the delta twice.
+            // a view step of +V moves targets by -V, so the scroll share
+            // inside (old.x1 - new.x1) is +V = new_view - old_view
+            let view_dx = ws.tiling.strip.view_px() - old_view;
             for (win, raw) in rects {
                 win.set_rect_animated_bias(state, apply_gaps(raw, area, &cfg), view_dx);
                 if !win.fullscreen.get() {

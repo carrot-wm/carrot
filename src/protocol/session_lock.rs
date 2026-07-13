@@ -128,7 +128,7 @@ impl ext_session_lock_manager_v1::Handler for SessionLockManager {
         }
         crate::tree::focus_window(state, None);
         if let Some(seat) = state.seat.borrow().clone() {
-            seat.prepare_for_lock();
+            seat.prepare_for_lock(state);
             seat.repick(state);
         }
         state.damage.trigger();

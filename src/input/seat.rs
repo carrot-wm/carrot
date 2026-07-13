@@ -144,8 +144,9 @@ impl SeatGlobal {
 
     /// a session lock takes the seat: grabs and armed binds must not
     /// survive into the locked state
-    pub fn prepare_for_lock(&self) {
+    pub fn prepare_for_lock(&self, state: &State) {
         *self.grab.borrow_mut() = None;
+        state.grab_active.set(false);
         *self.armed_release.borrow_mut() = None;
         self.cancel_repeat();
     }
