@@ -2460,6 +2460,42 @@ fn draw_window(
     if let Some(tl) = win.xdg_opt() {
         draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
     }
+    let is_focused = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, &surface));
+    let dim_want = if is_focused || win.fullscreen.get() || !win.rule_dim.get().unwrap_or(true) {
+        0.0
+    } else {
+        cfg.decoration.dim_inactive
+    };
+    let dim = win.dim_now(state, dim_want);
+    if dim > 0.004 {
+        let (gx, gy) = out.pos.get();
+        let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+        let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+        let pos = [fxp(rect.x1), fyp(rect.y1)];
+        let size = [
+            rect.width() as f32 / out.width as f32 * 2.0,
+            rect.height() as f32 / out.height as f32 * 2.0,
+        ];
+        let shade = [0.0, 0.0, 0.0, dim as f32];
+        if round >= 0.5 {
+            // a ring wider than the box is a rounded fill
+            ops.push(RenderOp::Border {
+                pos,
+                size,
+                rect_px: [
+                    (rect.x1 - gx) as f32,
+                    (rect.y1 - gy) as f32,
+                    rect.width() as f32,
+                    rect.height() as f32,
+                ],
+                radius: round,
+                width: rect.width().max(rect.height()) as f32,
+                color: shade,
+            });
+        } else {
+            ops.push(RenderOp::Fill { pos, size, color: shade });
+        }
+    }
     let open = win.anims.borrow().open.clone();
     if let Some((a, style)) = open {
         if !win.fullscreen.get() {

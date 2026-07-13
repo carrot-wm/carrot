@@ -174,6 +174,8 @@ pub struct WinAnims {
     pub move_: Option<MoveAnim>,
     pub open: Option<(crate::anim::Anim, crate::config::Style)>,
     pub border: Option<BorderAnim>,
+    /// settled dim rides here too; never pruned
+    pub dim: Option<crate::anim::Anim>,
 }
 
 /// draw offset = (dx, dy) * anim.value(); the anim runs 1 -> 0
@@ -336,7 +338,10 @@ impl Window {
         if m.border.as_ref().is_some_and(|b| b.anim.is_done(now)) {
             m.border = None;
         }
-        m.move_.is_some() || m.open.is_some() || m.border.is_some()
+        m.move_.is_some()
+            || m.open.is_some()
+            || m.border.is_some()
+            || m.dim.as_ref().is_some_and(|a| !a.is_done(now))
     }
 
     /// drop every animation; grabs and no-anim paths stay 1:1
@@ -347,6 +352,49 @@ impl Window {
     /// drop only the move animation; a grab must not chase its own pointer
     pub fn move_snap(&self) {
         self.anims.borrow_mut().move_ = None;
+    }
+
+    /// this frame's dim strength, easing toward `want` on focus flips
+    pub fn dim_now(&self, state: &State, want: f64) -> f64 {
+        let now = state.anim_clock.now();
+        let cfg = state.config.borrow().clone();
+        let mut m = self.anims.borrow_mut();
+        let Some(a) = &mut m.dim else {
+            m.dim = Some(crate::anim::Anim::ease(
+                &state.anim_clock,
+                want,
+                want,
+                0,
+                crate::anim::Curve::Linear,
+            ));
+            return want;
+        };
+        if (a.to() - want).abs() > 1e-3 {
+            match cfg.animations.motion(crate::config::AnimKind::BorderColor) {
+                Some(motion) => {
+                    let cur = a.clamped_value(now);
+                    state.anim_clock.touch();
+                    *a = crate::config::build_anim(
+                        &state.anim_clock,
+                        motion,
+                        &cfg.animations,
+                        cur,
+                        want,
+                        0.0,
+                    );
+                }
+                None => {
+                    *a = crate::anim::Anim::ease(
+                        &state.anim_clock,
+                        want,
+                        want,
+                        0,
+                        crate::anim::Curve::Linear,
+                    );
+                }
+            }
+        }
+        a.clamped_value(now).clamp(0.0, 1.0)
     }
 
     /// the border color this frame, easing in oklab toward `want`
@@ -1327,6 +1375,24 @@ mod tests {
         ws.tiling.for_each(|_| n += 1);
         assert_eq!(n, 3);
         assert!(!ws_axis_vertical(&state));
+    }
+
+    #[test]
+    fn dim_eases_between_targets() {
+        let (state, client) = crate::client::test_utils::test_client();
+        let base = crate::shell::xdg::tests::mk_base(&client, 70);
+        let (_s, _xdg, tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 71, 72, 73);
+        let win = Rc::new(Window::new(&state, WindowKind::Xdg(tl)));
+        // first paint settles instantly
+        assert_eq!(win.dim_now(&state, 0.0), 0.0);
+        // focus loss eases toward the configured strength
+        win.dim_now(&state, 0.2);
+        let t0 = state.anim_clock.now();
+        state.anim_clock.freeze(t0 + 50_000_000);
+        let mid = win.dim_now(&state, 0.2);
+        assert!(mid > 0.0 && mid < 0.2, "got {mid}");
+        state.anim_clock.freeze(t0 + 10_000_000_000);
+        assert!((win.dim_now(&state, 0.2) - 0.2).abs() < 1e-9);
     }
 
     #[test]
