@@ -28,7 +28,7 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 - **Special workspaces** (named scratchpads) with toggle-and-launch behavior
 
 ### Eye Candy
-- Multi-pass **Kawase blur** with per-window and per-layer control *(planned)*
+- Multi-pass **Kawase blur** with per-window and per-layer control (cached blurred backdrop; noise, contrast, brightness)
 - **Drop shadows** with configurable size, color, offset and falloff power
 - **Rounded corners** with matching ring borders, per-window opacity, active/inactive borders
 - **Dim-inactive** with animated focus transitions; rounding/shadow/dim all overridable per window rule

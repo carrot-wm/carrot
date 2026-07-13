@@ -70,4 +70,4 @@
 - Resize Crossfade (Old and New Content Mix Across the Animated Geometry)
 - Offscreen Sampled Render Targets
 - Pointer Move/Resize Actions (Key or Mouse-Chord Grabs)
-- check-config Verb
+- Kawase Blur (Backdrop Cache, Per-Window and Per-Layer Rules)
