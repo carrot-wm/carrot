@@ -135,6 +135,15 @@ impl RenderOp {
     }
 }
 
+/// who consumes the target after the pass
+#[derive(Copy, Clone, PartialEq)]
+pub enum TargetRelease {
+    /// scanout: foreign-queue handoff, GENERAL
+    Scanout,
+    /// our own sampler: stays on the graphics queue, SHADER_READ_ONLY
+    Sampled,
+}
+
 pub struct FrameTarget {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -338,20 +347,44 @@ impl Renderer {
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
+        self.render_release(target, clear, ops, waits, TargetRelease::Scanout)
+    }
+
+    pub fn render_release(
+        &self,
+        target: &FrameTarget,
+        clear: Option<[f32; 4]>,
+        ops: &[RenderOp],
+        waits: Vec<vk::Semaphore>,
+        release_mode: TargetRelease,
+    ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
         let cb = self.take_cb()?;
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { dev.begin_command_buffer(cb, &begin) }?;
 
-        // take the target from the display side
+        // take the target from the display side; sampled targets are ours
+        // already and come back from their last SHADER_READ_ONLY use
+        let (src_qf, dst_qf, old_owned) = match release_mode {
+            TargetRelease::Scanout => (
+                vk::QUEUE_FAMILY_FOREIGN_EXT,
+                self.core.queue_family,
+                vk::ImageLayout::GENERAL,
+            ),
+            TargetRelease::Sampled => (
+                vk::QUEUE_FAMILY_IGNORED,
+                vk::QUEUE_FAMILY_IGNORED,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ),
+        };
         let acquire = image_barrier(target.image)
-            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .dst_queue_family_index(self.core.queue_family)
+            .src_queue_family_index(src_qf)
+            .dst_queue_family_index(dst_qf)
             .old_layout(if target.undefined {
                 vk::ImageLayout::UNDEFINED
             } else {
-                vk::ImageLayout::GENERAL
+                old_owned
             })
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -563,16 +596,26 @@ impl Renderer {
 
         unsafe { dev.cmd_end_rendering(cb) };
 
-        // hand it back for scanout
-        let release = image_barrier(target.image)
-            .src_queue_family_index(self.core.queue_family)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
-            );
+        // hand it back: to the display side, or to our own samplers
+        let release = match release_mode {
+            TargetRelease::Scanout => image_barrier(target.image)
+                .src_queue_family_index(self.core.queue_family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(
+                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+                ),
+            TargetRelease::Sampled => image_barrier(target.image)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ),
+        };
         barrier2(dev, cb, &[release]);
         unsafe { dev.end_command_buffer(cb) }?;
 
@@ -801,6 +844,75 @@ impl Renderer {
             height: h,
             undefined: std::cell::Cell::new(true),
         })
+    }
+
+    /// a texture the renderer can draw into and later sample
+    pub fn create_render_texture(&self, w: u32, h: u32) -> Result<Texture, RenderError> {
+        let dev = &self.core.device;
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(self.format)
+            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { dev.create_image(&info, None) }?;
+        let image_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image(image, None) });
+        let reqs = unsafe { dev.get_image_memory_requirements(image) };
+        let mem_type = self
+            .core
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe { dev.allocate_memory(&alloc, None) }?;
+        let mem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(memory, None) });
+        unsafe { dev.bind_image_memory(image, memory, 0) }?;
+        // attachment views take no swizzle; identity serves sampling too
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(self.format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let view = unsafe { dev.create_image_view(&view_info, None) }?;
+        std::mem::forget(mem_guard);
+        std::mem::forget(image_guard);
+        Ok(Texture {
+            image,
+            memory,
+            view,
+            width: w,
+            height: h,
+            undefined: std::cell::Cell::new(true),
+        })
+    }
+
+    /// draw an op list into a render texture; it comes out sampleable
+    pub fn render_into(
+        &self,
+        tex: &Texture,
+        clear: Option<[f32; 4]>,
+        ops: &[RenderOp],
+        waits: Vec<vk::Semaphore>,
+    ) -> Result<Frame, RenderError> {
+        let target = FrameTarget {
+            image: tex.image,
+            view: tex.view,
+            width: tex.width,
+            height: tex.height,
+            undefined: tex.undefined.get(),
+        };
+        let frame = self.render_release(&target, clear, ops, waits, TargetRelease::Sampled)?;
+        tex.undefined.set(false);
+        Ok(frame)
     }
 
     pub fn destroy_texture(&self, tex: &Texture) {
