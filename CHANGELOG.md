@@ -59,9 +59,15 @@
 - Screenshare Restore Tokens
 - Shell Agnostic Share Picker
 - Presentation Time (wp_presentation)
-- Config Overhaul (New Schema, Embedded Default, Multi Error Reporting)
 - Animations (Window Open/Close/Move, Workspace Switch, Layer Surfaces, Border Color)
 - Per-Kind Animation Config (Springs, Easings, Custom Bezier Curves, Styles)
 - Animation Clock Locked to Predicted Presentation Time
 - Scrolling Layout (Per-Workspace Columns, Animated View, Width Presets)
 - Runtime Layout Switching (set-layout, Vertical Workspace Axis Rule)
+- Rounded Corners (SDF-Clipped Sampling, Ring Borders)
+- Drop Shadows (Distance Falloff, Body Cutout)
+- Dim Inactive Windows (Animated)
+- Resize Crossfade (Old and New Content Mix Across the Animated Geometry)
+- Offscreen Sampled Render Targets
+- Pointer Move/Resize Actions (Key or Mouse-Chord Grabs)
+- check-config Verb

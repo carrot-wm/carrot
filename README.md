@@ -28,9 +28,11 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 - **Special workspaces** (named scratchpads) with toggle-and-launch behavior
 
 ### Eye Candy
-- Multi-pass **Kawase blur** with per-window and per-layer control
-- **Drop shadows** with configurable falloff
-- **Rounded corners**, per-window opacity, active/inactive borders
+- Multi-pass **Kawase blur** with per-window and per-layer control *(planned)*
+- **Drop shadows** with configurable size, color, offset and falloff power
+- **Rounded corners** with matching ring borders, per-window opacity, active/inactive borders
+- **Dim-inactive** with animated focus transitions; rounding/shadow/dim all overridable per window rule
+- **Resize crossfade** - old and new content mix while the geometry animates
 - **Animations** - spring physics or easing per animation kind, named custom bezier curves, hot-reloadable
   - Animated: window open/close/move, workspace switch, layer surfaces, border color (blended in OkLab)
   - Window styles: popin, fade, slide; workspace styles: slide, slidevert, fade, slidefade, slidefadevert
