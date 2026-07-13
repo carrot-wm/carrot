@@ -143,7 +143,7 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             closed: Cell::new(false),
             popups: RefCell::new(Vec::new()),
             anim: RefCell::new(None),
-            last_batch: RefCell::new((Vec::new(), Vec::new())),
+            last_batch: RefCell::new((Vec::new(), Vec::new(), 0..0)),
         });
         c.add_client_obj(ls.clone())?;
         *surface.ext.borrow_mut() = Rc::new(LayerExt { ls });
@@ -281,6 +281,7 @@ pub struct LayerSurface {
     pub last_batch: RefCell<(
         Vec<crate::render::renderer::RenderOp>,
         Vec<(crate::client::ClientId, u64)>,
+        std::ops::Range<usize>,
     )>,
 }
 

@@ -2119,6 +2119,7 @@ fn draw_layer(
         {
             push_blur_backdrop(out, r, 0.0, ops);
         }
+        let cmark = ops.len();
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, 0.0, ops, live);
         let anim = ls.anim.borrow().clone();
         if let Some((a, style)) = anim {
@@ -2143,7 +2144,11 @@ fn draw_layer(
                 out.anim_pending.set(true);
             }
         }
-        *ls.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
+        *ls.last_batch.borrow_mut() = (
+            ops[cmark..].to_vec(),
+            live[lmark..].to_vec(),
+            0..(ops.len() - cmark),
+        );
     }
 }
 
@@ -2647,12 +2652,21 @@ fn draw_resize_xfade(
     remap_local(&mut tmp, out, target);
     let mut m = win.anims.borrow_mut();
     let Some(rz) = m.resize.as_mut() else { return false };
-    // the old content bakes exactly once, from the last composed batch
+    // the old content bakes exactly once, from the last composed batch:
+    // surface ops only (decorations draw live), and never from views whose
+    // textures the stale sweep already destroyed
     if rz.snapshot.is_none() {
-        let (mut old_ops, _) = win.last_batch.borrow().clone();
-        if old_ops.is_empty() {
+        let (all_ops, keys, srange) = win.last_batch.borrow().clone();
+        if all_ops.is_empty() || srange.is_empty() {
             return false;
         }
+        {
+            let t = out.textures.borrow();
+            if keys.iter().any(|k| !t.contains_key(k)) {
+                return false;
+            }
+        }
+        let mut old_ops = all_ops[srange].to_vec();
         remap_local(&mut old_ops, out, rz.from_rect);
         let (fw, fh) = (rz.from_rect.width().max(1), rz.from_rect.height().max(1));
         let tex = match out.renderer.create_render_texture(fw as u32, fh as u32) {
@@ -2770,6 +2784,10 @@ fn draw_window(
             .unwrap_or(cfg.decoration.rounding)
             .max(0) as f32
     };
+    if win.rule_blur.get() && !win.fullscreen.get() {
+        push_blur_backdrop(out, rect, round, ops);
+    }
+    let cmark = ops.len();
     if !win.fullscreen.get() && win.rule_shadow.get().unwrap_or(true) {
         if let Some(sc) = &cfg.decoration.shadow {
             let (gx, gy) = out.pos.get();
@@ -2817,9 +2835,7 @@ fn draw_window(
     }
     let geo = win.geometry();
     let alpha = win.rule_opacity.get().unwrap_or(1.0);
-    if win.rule_blur.get() && !win.fullscreen.get() {
-        push_blur_backdrop(out, rect, round, ops);
-    }
+    let smark = ops.len();
     let mut xfaded = false;
     if let Some((p, _)) = rz_progress {
         xfaded = draw_resize_xfade(state, out, win, rect, round, p, ops, live);
@@ -2837,8 +2853,18 @@ fn draw_window(
     if !xfaded {
         draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, round, ops, live);
     }
+    let send = ops.len();
     if let Some(tl) = win.xdg_opt() {
         draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
+    }
+    // captured before dim and the open transform, minus the blur backdrop:
+    // close anims and resize snapshots replay clean, untransformed content
+    if !xfaded {
+        *win.last_batch.borrow_mut() = (
+            ops[cmark..].to_vec(),
+            live[lmark..].to_vec(),
+            (smark - cmark)..(send - cmark),
+        );
     }
     let is_focused = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, &surface));
     let dim_want = if is_focused || win.fullscreen.get() || !win.rule_dim.get().unwrap_or(true) {
@@ -2890,9 +2916,6 @@ fn draw_window(
             apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d, out_dims(out));
         }
     }
-    if !xfaded {
-        *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
-    }
 }
 
 // -- closing windows: the final batch outlives the surface --
@@ -2906,24 +2929,41 @@ pub struct ClosingWindow {
     pub style: crate::config::Style,
 }
 
-/// wrap a cached final batch, taking ownership of its textures
+/// wrap a cached final batch, taking ownership of its textures. a batch
+/// whose textures were already evicted references destroyed views - those
+/// must never reach the gpu, so the capture is refused instead
 pub fn seize_batch(
     out: &Rc<Output>,
-    batch: (Vec<RenderOp>, Vec<(ClientId, u64)>),
+    batch: (Vec<RenderOp>, Vec<(ClientId, u64)>, std::ops::Range<usize>),
     rect: Rect,
     anim: crate::anim::Anim,
     style: crate::config::Style,
 ) -> Option<ClosingWindow> {
-    let (ops, keys) = batch;
+    let (ops, keys, _) = batch;
     if ops.is_empty() {
         return None;
     }
     let mut keep = Vec::new();
-    let mut textures = out.textures.borrow_mut();
-    for k in &keys {
-        if let Some((t, _)) = textures.remove(k) {
-            keep.push(t);
+    let mut taken: Vec<(ClientId, u64)> = Vec::new();
+    let mut missing = false;
+    {
+        let mut textures = out.textures.borrow_mut();
+        for k in &keys {
+            if taken.contains(k) {
+                continue;
+            }
+            match textures.remove(k) {
+                Some((t, _)) => {
+                    keep.push(t);
+                    taken.push(*k);
+                }
+                None => missing = true,
+            }
         }
+    }
+    if missing {
+        out.retired_tex.borrow_mut().extend(keep);
+        return None;
     }
     Some(ClosingWindow { ops, keep, rect, anim, style })
 }
