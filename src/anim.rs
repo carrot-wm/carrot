@@ -106,8 +106,11 @@ pub(crate) fn spring_pos(k: &SpringK, x0: f64, v0: f64, t: f64) -> f64 {
         let w1 = (k.omega0 * k.omega0 - k.beta * k.beta).sqrt();
         env * (x0 * (w1 * t).cos() + ((k.beta * x0 + v0) / w1) * (w1 * t).sin())
     } else {
+        // cosh/sinh folded into the envelope: both exponents stay negative
+        // (w2 < beta), so large t can't reach exp-underflow * cosh-overflow
         let w2 = (k.beta * k.beta - k.omega0 * k.omega0).sqrt();
-        env * (x0 * (w2 * t).cosh() + ((k.beta * x0 + v0) / w2) * (w2 * t).sinh())
+        let c = (k.beta * x0 + v0) / w2;
+        0.5 * ((x0 + c) * ((w2 - k.beta) * t).exp() + (x0 - c) * (-(w2 + k.beta) * t).exp())
     }
 }
 
@@ -163,8 +166,11 @@ impl AnimClock {
             slowdown: Cell::new(1.0),
         }
     }
+    /// forward-only, like touch(): a predicted present derived from a
+    /// stale flip (idle wake, missed deadline) must not rewind time behind
+    /// anim starts already stamped at event time
     pub fn freeze(&self, ns: u64) {
-        self.now_ns.set(ns);
+        self.now_ns.set(self.now_ns.get().max(ns));
     }
     /// forward-only bump to real monotonic time; anim starts happen in
     /// event context where the compose-frozen stamp can be seconds stale
@@ -213,11 +219,15 @@ impl Anim {
     }
 
     pub fn spring(clock: &AnimClock, from: f64, to: f64, v0: f64, k: SpringK) -> Anim {
+        // a poisoned handoff velocity must not poison the whole spring
+        let v0 = if v0.is_finite() { v0 } else { 0.0 };
         let x0 = from - to;
         let (dur, clamped) = if clock.off.get() || x0 == 0.0 {
             (0.0, 0.0)
         } else {
-            (spring_duration(&k, x0, v0), spring_clamped(&k, x0, v0))
+            // 3s ceiling matches the clamped scan: the render loop must go
+            // quiescent even for pathologically soft parameters
+            (spring_duration(&k, x0, v0).min(3.0), spring_clamped(&k, x0, v0))
         };
         Anim {
             from,
@@ -240,6 +250,12 @@ impl Anim {
 
     pub fn is_done(&self, now: u64) -> bool {
         self.elapsed_ns(now) >= self.dur_ns
+    }
+
+    /// quiescence for clamped_value consumers: they pin at the target from
+    /// clamped_ns on, so the scene is static while the envelope tail runs
+    pub fn settled(&self, now: u64) -> bool {
+        self.elapsed_ns(now) >= self.clamped_ns
     }
 
     pub fn value(&self, now: u64) -> f64 {
@@ -505,6 +521,64 @@ mod tests {
         }
         let mid = lerp_oklab(red, blue, 0.5);
         assert!((mid[3] - 0.75).abs() < 1e-6, "alpha lerps linearly");
+    }
+
+    #[test]
+    fn spring_overdamped_extremes_stay_finite() {
+        // damping 10 once hit exp-underflow * cosh-overflow = NaN, which
+        // saturated dur_ns to u64::MAX and pinned the render loop
+        let k = SpringK::new(10.0, 800.0, 0.0001);
+        for i in 0..=1000 {
+            let x = spring_pos(&k, 1.0, 0.0, i as f64 * 0.01);
+            assert!(x.is_finite(), "t={}", i as f64 * 0.01);
+        }
+        let d = spring_duration(&k, 1.0, 0.0);
+        assert!(d.is_finite());
+        assert!(spring_pos(&k, 1.0, 0.0, d).abs() <= 0.0001 * 1.001);
+    }
+
+    #[test]
+    fn anim_spring_duration_capped_at_3s() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        // softest legal spring: the envelope alone runs past 9s
+        let a = Anim::spring(&clock, 0.0, 100.0, 0.0, SpringK::new(1.0, 1.0, 0.0001));
+        assert!(!a.is_done(2_900_000_000));
+        assert!(a.is_done(3_000_000_000));
+    }
+
+    #[test]
+    fn anim_spring_swallows_poisoned_velocity() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        let a = Anim::spring(&clock, 0.0, 1.0, f64::NAN, SpringK::new(1.0, 800.0, 0.0001));
+        assert!(a.value(100_000_000).is_finite());
+        assert!(a.is_done(3_000_000_001));
+    }
+
+    #[test]
+    fn settled_at_first_touch_done_at_rest() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        let k = SpringK::new(0.5, 800.0, 0.0001);
+        let a = Anim::spring(&clock, 0.0, 1.0, 0.0, k);
+        let ns = (spring_clamped(&k, -1.0, 0.0) * 1e9) as u64 + 1_000_000;
+        // underdamped touches the target long before the envelope rests:
+        // clamped consumers are static there, raw values still oscillate
+        assert!(a.settled(ns));
+        assert!(!a.is_done(ns));
+        assert_eq!(a.clamped_value(ns), 1.0);
+    }
+
+    #[test]
+    fn clock_freeze_never_rewinds() {
+        let clock = AnimClock::new();
+        clock.freeze(5_000_000_000);
+        // a stale predicted present must not undercut event-time starts
+        clock.freeze(1_000_000_000);
+        assert_eq!(clock.now(), 5_000_000_000);
+        clock.freeze(6_000_000_000);
+        assert_eq!(clock.now(), 6_000_000_000);
     }
 
     #[test]

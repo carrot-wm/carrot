@@ -407,24 +407,26 @@ impl Window {
         }
     }
 
-    /// prune finished animations, report whether any remain
+    /// prune finished animations, report whether any remain. move draws
+    /// the raw overshooting value, so it lives until the envelope rests;
+    /// everything else draws clamped and is static once settled
     pub fn anims_live(&self, now: u64) -> bool {
         let mut m = self.anims.borrow_mut();
         if m.move_.as_ref().is_some_and(|mv| mv.anim.is_done(now)) {
             m.move_ = None;
         }
         // resize is pruned by the draw path, which can retire its textures
-        if m.open.as_ref().is_some_and(|(a, _)| a.is_done(now)) {
+        if m.open.as_ref().is_some_and(|(a, _)| a.settled(now)) {
             m.open = None;
         }
-        if m.border.as_ref().is_some_and(|b| b.anim.is_done(now)) {
+        if m.border.as_ref().is_some_and(|b| b.anim.settled(now)) {
             m.border = None;
         }
         m.move_.is_some()
             || m.open.is_some()
             || m.border.is_some()
-            || m.dim.as_ref().is_some_and(|a| !a.is_done(now))
-            || m.resize.as_ref().is_some_and(|r| !r.anim.is_done(now))
+            || m.dim.as_ref().is_some_and(|a| !a.settled(now))
+            || m.resize.as_ref().is_some_and(|r| !r.anim.settled(now))
     }
 
     /// drop every animation; grabs and no-anim paths stay 1:1

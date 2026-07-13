@@ -1528,7 +1528,7 @@ pub fn start_ws_switch(state: &Rc<State>, out: &Rc<Output>, from: usize, to: usi
     let mut sw = out.ws_switch.borrow_mut();
     let anim = match &*sw {
         // a switch mid-slide restarts from the current progress
-        Some(cur) if !cur.anim.is_done(now) => crate::config::build_anim(
+        Some(cur) if !cur.anim.settled(now) => crate::config::build_anim(
             &state.anim_clock,
             motion,
             &cfg.animations,
@@ -1656,8 +1656,11 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                     .append(&mut out.present_fbs.borrow_mut());
             }
             Ok(FlipResult::NotPresented) => {
-                // retry next wakeup with a fresh frame
+                // the pipe was momentarily busy (a cursor commit can hold
+                // it between vblanks) and no event follows: self-wake, or
+                // the retry waits on unrelated damage
                 dirty = true;
+                out.damage.trigger();
             }
             Err(crate::drm::device::DrmError::LostMaster) => {
                 // vt left between the pause signal and our commit; resume
@@ -1868,30 +1871,48 @@ fn compose_ops(
     cursor: CapCursor,
     ws_override: Option<usize>,
 ) -> Vec<RenderOp> {
-    // animations sample the moment this frame will glass, not "now"
-    let (sec, usec) = out.conn.flip_time.get();
-    let period_ns = out
-        .conn
-        .pipe
-        .borrow()
-        .as_ref()
-        .map(|p| {
-            let m = &p.mode;
-            m.htotal as u64 * m.vtotal as u64 * 1_000_000_000 / (m.clock.max(1) as u64 * 1000)
-        })
-        .unwrap_or(0);
-    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
-    let target = if flip_ns == 0 || period_ns == 0 || out.conn.vrr_want.get() {
-        crate::util::Time::now().nsec()
-    } else {
-        flip_ns + period_ns
-    };
-    state.anim_clock.freeze(target);
-    out.anim_pending.set(false);
-    out.retired_tex
-        .borrow_mut()
-        .extend(state.retire_tex.borrow_mut().drain(..));
+    let present = cursor == CapCursor::Present;
+    if present {
+        // animations sample the moment this frame will glass, not "now"
+        let (sec, usec) = out.conn.flip_time.get();
+        let period_ns = out
+            .conn
+            .pipe
+            .borrow()
+            .as_ref()
+            .map(|p| {
+                let m = &p.mode;
+                m.htotal as u64 * m.vtotal as u64 * 1_000_000_000 / (m.clock.max(1) as u64 * 1000)
+            })
+            .unwrap_or(0);
+        let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+        let target = if flip_ns == 0 || period_ns == 0 || out.conn.vrr_want.get() {
+            crate::util::Time::now().nsec()
+        } else {
+            flip_ns + period_ns
+        };
+        state.anim_clock.freeze(target);
+        out.anim_pending.set(false);
+        out.retired_tex
+            .borrow_mut()
+            .extend(state.retire_tex.borrow_mut().drain(..));
+    }
+    // captures sample at the already-frozen clock and must not disturb
+    // the present's redraw latch: their scene isn't the one on glass
+    let latch = out.anim_pending.get();
+    let ops = compose_scene(state, out, cursor, ws_override);
+    if !present {
+        out.anim_pending.set(latch);
+    }
+    ops
+}
 
+fn compose_scene(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    cursor: CapCursor,
+    ws_override: Option<usize>,
+) -> Vec<RenderOp> {
     let mut ops = Vec::new();
     let mut live: Vec<(ClientId, u64)> = Vec::new();
     // a locked session shows nothing but the lock surface; an output
@@ -1946,7 +1967,7 @@ fn compose_ops(
     let sw = out.ws_switch.borrow().clone();
     let now = state.anim_clock.now();
     match &sw {
-        Some(s) if !s.anim.is_done(now) => {
+        Some(s) if !s.anim.settled(now) => {
             let p = s.anim.clamped_value(now);
             // full ndc span plus a tenth of it as the gap between scenes
             let step = 2.2 * s.dist;
@@ -2125,7 +2146,7 @@ fn draw_layer(
         if let Some((a, style)) = anim {
             use crate::config::Style;
             let now = state.anim_clock.now();
-            if a.is_done(now) {
+            if a.settled(now) {
                 *ls.anim.borrow_mut() = None;
             } else {
                 let p = a.clamped_value(now);
@@ -2743,20 +2764,19 @@ fn draw_window(
     let mark = ops.len();
     let lmark = live.len();
     let rect = win.visual_rect(state);
-    if win.anims_live(state.anim_clock.now()) {
-        out.anim_pending.set(true);
-    }
-    // a finished crossfade retires its textures; a live one shrinks the
+    // a settled crossfade retires its textures; a live one shrinks the
     // drawn rect to the animated size
     let rz_progress = {
         let now = state.anim_clock.now();
         let mut m = win.anims.borrow_mut();
         match &mut m.resize {
-            Some(rz) if rz.anim.is_done(now) => {
+            Some(rz) if rz.anim.settled(now) => {
                 let mut q = state.retire_tex.borrow_mut();
                 q.extend(rz.snapshot.take());
                 q.extend(rz.live.take());
                 m.resize = None;
+                // one more compose drains the retire queue it just fed
+                out.anim_pending.set(true);
                 None
             }
             Some(rz) => Some((rz.anim.clamped_value(now), rz.from)),
@@ -2848,6 +2868,7 @@ fn draw_window(
                 q.extend(rz.live.take());
             }
             m.resize = None;
+            out.anim_pending.set(true);
         }
     }
     if !xfaded {
@@ -2915,6 +2936,11 @@ fn draw_window(
             };
             apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d, out_dims(out));
         }
+    }
+    // gated last: the dim/border retargets above start their fades inside
+    // this draw, and their first frame must arm the redraw latch too
+    if win.anims_live(state.anim_clock.now()) {
+        out.anim_pending.set(true);
     }
 }
 
@@ -3024,7 +3050,7 @@ fn draw_closing_list(
     let mut list = list.borrow_mut();
     let mut i = 0;
     while i < list.len() {
-        if list[i].anim.is_done(now) {
+        if list[i].anim.settled(now) {
             let cw = list.remove(i);
             out.retired_tex.borrow_mut().extend(cw.keep);
             continue;
