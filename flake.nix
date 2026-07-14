@@ -142,7 +142,7 @@
                             type = types.nullOr types.str;
                             default = null;
                           };
-                          actions = mkOption {
+                          action = mkOption {
                             type = types.nullOr (types.enum actions);
                             default = null;
                           };
@@ -451,7 +451,7 @@
                             type = types.nullOr (types.enum [ "scrolling" "dwindle" ]);
                             default = null;
                           };
-                          workspace-axis = mkOption {
+                          workspace_axis = mkOption {
                             type = types.nullOr (types.enum [ "vertical" "horizontal" ]);
                             default = null;
                           };
@@ -600,7 +600,7 @@
                             type = types.nullOr types.str;
                             default = null;
                           };
-                          ignore_drm_device = mkOption {
+                          ignore_drm_devices = mkOption {
                             type = types.nullOr types.str;
                             default = null;
                           };
