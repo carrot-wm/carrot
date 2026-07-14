@@ -1,8 +1,9 @@
-// renderer core. a frame: acquire target from the display side, one
-// dynamic-rendering pass of quads, release it, one queue_submit2. blending
-// only where alpha exists.
+// renderer core. a frame: staging copies, then offscreen pre-passes, then
+// the target pass - one cb, one queue_submit2, the pass releases ordering
+// every later consumer. blending only where alpha exists.
 //
-// INVARIANT: views handed to Tex ops must already be SHADER_READ_ONLY_OPTIMAL.
+// INVARIANT: views handed to Tex ops must already be SHADER_READ_ONLY_OPTIMAL
+// (or become so by an earlier upload/pre-pass in the same frame).
 
 use crate::render::shaders;
 use crate::render::vulkan::{RenderError, VkCore};
@@ -178,15 +179,6 @@ impl RenderOp {
     }
 }
 
-/// who consumes the target after the pass
-#[derive(Copy, Clone, PartialEq)]
-pub enum TargetRelease {
-    /// scanout: foreign-queue handoff, GENERAL
-    Scanout,
-    /// our own sampler: stays on the graphics queue, SHADER_READ_ONLY
-    Sampled,
-}
-
 pub struct FrameTarget {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -196,12 +188,53 @@ pub struct FrameTarget {
     pub undefined: bool,
 }
 
-/// a submitted frame. wait() is for bring-up; the present loop exports the
-/// fence instead and never blocks.
+/// an offscreen color pass recorded ahead of the main pass; the target
+/// comes out sampleable for everything later in the same submit. the
+/// texture must outlive the frame (retire queues, never direct destroys)
+pub struct PrePass {
+    image: vk::Image,
+    view: vk::ImageView,
+    width: u32,
+    height: u32,
+    undefined: bool,
+    clear: Option<[f32; 4]>,
+    ops: Vec<RenderOp>,
+}
+
+impl PrePass {
+    pub fn new(tex: &Texture, clear: Option<[f32; 4]>, ops: Vec<RenderOp>) -> PrePass {
+        let p = PrePass {
+            image: tex.image,
+            view: tex.view,
+            width: tex.width,
+            height: tex.height,
+            undefined: tex.undefined.get(),
+            clear,
+            ops,
+        };
+        tex.undefined.set(false);
+        p
+    }
+}
+
+/// a filled staging buffer waiting for its copy; recorded before every
+/// draw pass of the frame, freed when the frame's fence signals
+pub struct PreUpload {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    undefined: bool,
+}
+
+/// a submitted frame. wait() is for bring-up and captures; the present
+/// loop exports the fence instead and never blocks.
 pub struct Frame {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     waits: Vec<vk::Semaphore>,
+    staging: Vec<PreUpload>,
 }
 
 impl Frame {
@@ -453,16 +486,22 @@ impl Renderer {
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
-        self.render_release(target, clear, ops, waits, TargetRelease::Scanout)
+        self.render_frame(Vec::new(), Vec::new(), target, clear, ops, waits)
     }
 
-    pub fn render_release(
+    /// the whole frame in one submit: staging copies, offscreen pre-passes
+    /// in list order, then the scanout pass. each pre-pass release is the
+    /// ordering barrier for whoever samples it later in the cb - nothing
+    /// here ever blocks the cpu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame(
         &self,
+        uploads: Vec<PreUpload>,
+        passes: Vec<PrePass>,
         target: &FrameTarget,
         clear: Option<[f32; 4]>,
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
-        release_mode: TargetRelease,
     ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
         let cb = self.take_cb()?;
@@ -470,37 +509,165 @@ impl Renderer {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { dev.begin_command_buffer(cb, &begin) }?;
 
-        // take the target from the display side; sampled targets are ours
-        // already and come back from their last SHADER_READ_ONLY use
-        let (src_qf, dst_qf, old_owned) = match release_mode {
-            TargetRelease::Scanout => (
-                vk::QUEUE_FAMILY_FOREIGN_EXT,
-                self.core.queue_family,
-                vk::ImageLayout::GENERAL,
-            ),
-            TargetRelease::Sampled => (
-                vk::QUEUE_FAMILY_IGNORED,
-                vk::QUEUE_FAMILY_IGNORED,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            ),
-        };
+        if !uploads.is_empty() {
+            let to_dst: Vec<_> = uploads
+                .iter()
+                .map(|u| {
+                    image_barrier(u.image)
+                        .old_layout(if u.undefined {
+                            vk::ImageLayout::UNDEFINED
+                        } else {
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        })
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                })
+                .collect();
+            barrier2(dev, cb, &to_dst);
+            for u in &uploads {
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: u.width,
+                        height: u.height,
+                        depth: 1,
+                    });
+                unsafe {
+                    dev.cmd_copy_buffer_to_image(
+                        cb,
+                        u.buffer,
+                        u.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                }
+            }
+            let to_sample: Vec<_> = uploads
+                .iter()
+                .map(|u| {
+                    image_barrier(u.image)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                })
+                .collect();
+            barrier2(dev, cb, &to_sample);
+        }
+
+        for p in &passes {
+            // src fragment stage: the previous frame (or an earlier pass)
+            // may still be sampling this target when the writes start
+            let acquire = image_barrier(p.image)
+                .old_layout(if p.undefined {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                })
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(
+                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+                );
+            let release = image_barrier(p.image)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
+            self.record_pass(cb, p.view, p.width, p.height, p.clear, &p.ops, acquire, release);
+        }
+
+        // take the target from the display side, hand it back after
         let acquire = image_barrier(target.image)
-            .src_queue_family_index(src_qf)
-            .dst_queue_family_index(dst_qf)
+            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .dst_queue_family_index(self.core.queue_family)
             .old_layout(if target.undefined {
                 vk::ImageLayout::UNDEFINED
             } else {
-                old_owned
+                vk::ImageLayout::GENERAL
             })
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
             );
-        barrier2(dev, cb, &[acquire]);
+        let release = image_barrier(target.image)
+            .src_queue_family_index(self.core.queue_family)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+            );
+        self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
+        unsafe { dev.end_command_buffer(cb) }?;
 
+        // exportable fence so the commit path can take a sync_file
+        let mut export = vk::ExportFenceCreateInfo::default()
+            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+        let fence_info = vk::FenceCreateInfo::default().push_next(&mut export);
+        let fence = unsafe { dev.create_fence(&fence_info, None) }?;
+
+        let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let wait_infos: Vec<_> = waits
+            .iter()
+            .map(|&s| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(s)
+                    .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            })
+            .collect();
+        let submit = vk::SubmitInfo2::default()
+            .command_buffer_infos(&cbs)
+            .wait_semaphore_infos(&wait_infos);
+        let res = unsafe { dev.queue_submit2(self.core.queue, &[submit], fence) };
+        if let Err(e) = res {
+            unsafe {
+                dev.destroy_fence(fence, None);
+                for s in &waits {
+                    dev.destroy_semaphore(*s, None);
+                }
+                for u in &uploads {
+                    dev.destroy_buffer(u.buffer, None);
+                    dev.free_memory(u.memory, None);
+                }
+            }
+            self.free_cbs.borrow_mut().push(cb);
+            return Err(e.into());
+        }
+        Ok(Frame { cb, fence, waits, staging: uploads })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_pass(
+        &self,
+        cb: vk::CommandBuffer,
+        view: vk::ImageView,
+        width: u32,
+        height: u32,
+        clear: Option<[f32; 4]>,
+        ops: &[RenderOp],
+        acquire: vk::ImageMemoryBarrier2,
+        release: vk::ImageMemoryBarrier2,
+    ) {
+        let dev = &self.core.device;
+        barrier2(dev, cb, &[acquire]);
         let mut attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(target.view)
+            .image_view(view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::LOAD)
             .store_op(vk::AttachmentStoreOp::STORE);
@@ -514,10 +681,7 @@ impl Renderer {
         let attachments = [attachment];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D {
-                width: target.width,
-                height: target.height,
-            },
+            extent: vk::Extent2D { width, height },
         };
         let rendering = vk::RenderingInfo::default()
             .render_area(area)
@@ -531,15 +695,21 @@ impl Renderer {
                 &[vk::Viewport {
                     x: 0.0,
                     y: 0.0,
-                    width: target.width as f32,
-                    height: target.height as f32,
+                    width: width as f32,
+                    height: height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
             );
             dev.cmd_set_scissor(cb, 0, &[area]);
         }
+        self.record_ops(cb, ops);
+        unsafe { dev.cmd_end_rendering(cb) };
+        barrier2(dev, cb, &[release]);
+    }
 
+    fn record_ops(&self, cb: vk::CommandBuffer, ops: &[RenderOp]) {
+        let dev = &self.core.device;
         let mut bound = vk::Pipeline::null();
         for op in ops {
             let (pipe, layout) = match (op, op.blends()) {
@@ -786,62 +956,6 @@ impl Renderer {
                 dev.cmd_draw(cb, 4, 1, 0, 0);
             }
         }
-
-        unsafe { dev.cmd_end_rendering(cb) };
-
-        // hand it back: to the display side, or to our own samplers
-        let release = match release_mode {
-            TargetRelease::Scanout => image_barrier(target.image)
-                .src_queue_family_index(self.core.queue_family)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(
-                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                        | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
-                ),
-            TargetRelease::Sampled => image_barrier(target.image)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ),
-        };
-        barrier2(dev, cb, &[release]);
-        unsafe { dev.end_command_buffer(cb) }?;
-
-        // exportable fence so the commit path can take a sync_file
-        let mut export = vk::ExportFenceCreateInfo::default()
-            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-        let fence_info = vk::FenceCreateInfo::default().push_next(&mut export);
-        let fence = unsafe { dev.create_fence(&fence_info, None) }?;
-
-        let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let wait_infos: Vec<_> = waits
-            .iter()
-            .map(|&s| {
-                vk::SemaphoreSubmitInfo::default()
-                    .semaphore(s)
-                    .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            })
-            .collect();
-        let submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(&cbs)
-            .wait_semaphore_infos(&wait_infos);
-        let res = unsafe { dev.queue_submit2(self.core.queue, &[submit], fence) };
-        if let Err(e) = res {
-            unsafe {
-                dev.destroy_fence(fence, None);
-                for s in &waits {
-                    dev.destroy_semaphore(*s, None);
-                }
-            }
-            self.free_cbs.borrow_mut().push(cb);
-            return Err(e.into());
-        }
-        Ok(Frame { cb, fence, waits })
     }
 
     /// diagnostic: pull the target's pixels to the cpu. blocking, allocates
@@ -969,6 +1083,10 @@ impl Renderer {
             for s in &frame.waits {
                 self.core.device.destroy_semaphore(*s, None);
             }
+            for u in &frame.staging {
+                self.core.device.destroy_buffer(u.buffer, None);
+                self.core.device.free_memory(u.memory, None);
+            }
         }
         self.free_cbs.borrow_mut().push(frame.cb);
     }
@@ -1088,26 +1206,6 @@ impl Renderer {
             undefined: std::cell::Cell::new(true),
             uid: self.next_tex_uid(),
         })
-    }
-
-    /// draw an op list into a render texture; it comes out sampleable
-    pub fn render_into(
-        &self,
-        tex: &Texture,
-        clear: Option<[f32; 4]>,
-        ops: &[RenderOp],
-        waits: Vec<vk::Semaphore>,
-    ) -> Result<Frame, RenderError> {
-        let target = FrameTarget {
-            image: tex.image,
-            view: tex.view,
-            width: tex.width,
-            height: tex.height,
-            undefined: tex.undefined.get(),
-        };
-        let frame = self.render_release(&target, clear, ops, waits, TargetRelease::Sampled)?;
-        tex.undefined.set(false);
-        Ok(frame)
     }
 
     pub fn destroy_texture(&self, tex: &Texture) {
@@ -1247,12 +1345,16 @@ impl Renderer {
         })
     }
 
-    /// render ops into an offscreen image and read the pixels back as
-    /// tightly packed rows. screenshot-grade: fully synchronous.
+    /// render pending uploads/pre-passes + ops into an offscreen image and
+    /// read the pixels back as tightly packed rows. screenshot-grade: fully
+    /// synchronous.
+    #[allow(clippy::too_many_arguments)]
     pub fn read_frame(
         &self,
         w: u32,
         h: u32,
+        uploads: Vec<PreUpload>,
+        passes: Vec<PrePass>,
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
     ) -> Result<Vec<u8>, RenderError> {
@@ -1289,7 +1391,14 @@ impl Renderer {
             height: h,
             undefined: true,
         };
-        let frame = self.render(&target, Some([0.0, 0.0, 0.0, 1.0]), ops, waits)?;
+        let frame = self.render_frame(
+            uploads,
+            passes,
+            &target,
+            Some([0.0, 0.0, 0.0, 1.0]),
+            ops,
+            waits,
+        )?;
         frame.wait(self)?;
 
         // staging buffer, host visible
@@ -1392,13 +1501,14 @@ impl Renderer {
         Ok(())
     }
 
-    /// blocking staging upload; `fill` writes tightly packed rows into the
-    /// staging slice. bring-up grade.
-    pub fn upload_texture(
+    /// fill a staging buffer for the next submit; `fill` writes tightly
+    /// packed rows. the copy itself records with the frame - nothing here
+    /// touches the queue
+    pub fn stage_upload(
         &self,
         tex: &Texture,
         fill: impl FnOnce(&mut [u8]),
-    ) -> Result<(), RenderError> {
+    ) -> Result<PreUpload, RenderError> {
         let dev = &self.core.device;
         let size = (tex.width * tex.height * 4) as u64;
         let buf_info = vk::BufferCreateInfo::default()
@@ -1422,67 +1532,18 @@ impl Renderer {
             fill(std::slice::from_raw_parts_mut(ptr, size as usize));
             dev.unmap_memory(mem);
         }
-
-        let cb = self.take_cb()?;
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { dev.begin_command_buffer(cb, &begin) }?;
-        let to_dst = image_barrier(tex.image)
-            .old_layout(if tex.undefined.get() {
-                vk::ImageLayout::UNDEFINED
-            } else {
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-            })
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
-        barrier2(dev, cb, &[to_dst]);
-        let region = vk::BufferImageCopy::default()
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .image_extent(vk::Extent3D {
-                width: tex.width,
-                height: tex.height,
-                depth: 1,
-            });
-        unsafe {
-            dev.cmd_copy_buffer_to_image(
-                cb,
-                buf,
-                tex.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-        }
-        let to_sample = image_barrier(tex.image)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
-        barrier2(dev, cb, &[to_sample]);
-        unsafe { dev.end_command_buffer(cb) }?;
-
-        let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
-        let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let submit = vk::SubmitInfo2::default().command_buffer_infos(&cbs);
-        let res = unsafe {
-            dev.queue_submit2(self.core.queue, &[submit], fence)
-                .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX))
+        std::mem::forget(mem_guard);
+        std::mem::forget(buf_guard);
+        let up = PreUpload {
+            buffer: buf,
+            memory: mem,
+            image: tex.image,
+            width: tex.width,
+            height: tex.height,
+            undefined: tex.undefined.get(),
         };
-        unsafe { dev.destroy_fence(fence, None) };
-        self.free_cbs.borrow_mut().push(cb);
-        drop(buf_guard);
-        drop(mem_guard);
-        res?;
         tex.undefined.set(false);
-        Ok(())
+        Ok(up)
     }
 }
 

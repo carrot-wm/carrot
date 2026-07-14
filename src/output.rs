@@ -13,7 +13,7 @@ use crate::drm::sys;
 use crate::engine::SpawnedFuture;
 use crate::format::XRGB8888;
 use crate::rect::Rect;
-use crate::render::renderer::{FrameTarget, RenderOp, Renderer, Texture};
+use crate::render::renderer::{FrameTarget, PrePass, PreUpload, RenderOp, Renderer, Texture};
 use crate::render::vulkan::VkCore;
 use crate::state::State;
 use crate::surface::WlSurface;
@@ -319,6 +319,10 @@ pub struct Output {
     /// textures pulled from the cache this frame; destroyed only after
     /// the frame fence proves the last sampler is done
     retired_tex: RefCell<Vec<Texture>>,
+    /// offscreen work deferred by compose; the next submit (present or
+    /// capture) drains both into its command buffer
+    prepasses: RefCell<Vec<PrePass>>,
+    preuploads: RefCell<Vec<PreUpload>>,
     /// card's dev_t, matches logind pause/resume signals
     devnum: u64,
     /// vt elsewhere; render but never commit until resume
@@ -719,7 +723,9 @@ pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: boo
             waits.push(sem);
         }
     }
-    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+    let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+    let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+    let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
         Ok(px) => px,
         Err(e) => {
             eprintln!("carrot: screencopy render failed: {e}");
@@ -766,7 +772,9 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
             waits.push(sem);
         }
     }
-    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+    let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+    let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+    let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
         Ok(px) => px,
         Err(e) => {
             eprintln!("carrot: window capture render failed: {e}");
@@ -805,7 +813,9 @@ pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
             waits.push(sem);
         }
     }
-    match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+    let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+    let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+    match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
         Ok(px) => Some(px),
         Err(e) => {
             eprintln!("carrot: workspace copy render failed: {e}");
@@ -858,12 +868,15 @@ fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>, 
             }
         };
         let row = (w * 4) as usize;
-        let res = out.renderer.upload_texture(&tex, |dst| {
+        let res = out.renderer.stage_upload(&tex, |dst| {
             dst[..row * h as usize].copy_from_slice(&pixels[..row * h as usize]);
         });
-        if let Err(e) = res {
-            eprintln!("carrot: cursor upload failed: {e}");
-            return;
+        match res {
+            Ok(up) => out.preuploads.borrow_mut().push(up),
+            Err(e) => {
+                eprintln!("carrot: cursor upload failed: {e}");
+                return;
+            }
         }
         if let Some(old) = out.cursor_tex.borrow_mut().replace(tex) {
             out.renderer.destroy_texture(&old);
@@ -1480,6 +1493,8 @@ fn init_output(
         usable: Cell::new(Rect::default()),
         textures: RefCell::new(HashMap::new()),
         retired_tex: RefCell::new(Vec::new()),
+        prepasses: RefCell::new(Vec::new()),
+        preuploads: RefCell::new(Vec::new()),
         devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
@@ -1610,10 +1625,17 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             height: out.height,
             undefined: buf.undefined.get(),
         };
-        let frame = match out
-            .renderer
-            .render(&target, Some([0.1, 0.1, 0.1, 1.0]), &ops, waits)
-        {
+        // one submit: staged uploads, deferred offscreen passes, the scene
+        let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+        let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+        let frame = match out.renderer.render_frame(
+            uploads,
+            passes,
+            &target,
+            Some([0.1, 0.1, 0.1, 1.0]),
+            &ops,
+            waits,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("carrot: render failed: {e}");
@@ -2299,7 +2321,7 @@ fn draw_buffer(
             let res = if let Some(px) = shadow.as_ref().filter(|p| p.len() >= need) {
                 // the commit-time shadow is the source of truth
                 out.renderer
-                    .upload_texture(&entry.0, |dst| dst[..need].copy_from_slice(&px[..need]))
+                    .stage_upload(&entry.0, |dst| dst[..need].copy_from_slice(&px[..need]))
             } else {
                 // no shadow (capture failed): read the client buffer,
                 // zero-filling any short row instead of leaking staging
@@ -2308,7 +2330,7 @@ fn draw_buffer(
                     Some(a) => a,
                     None => return,
                 };
-                out.renderer.upload_texture(&entry.0, |dst| match access {
+                out.renderer.stage_upload(&entry.0, |dst| match access {
                     ShmAccess::Ptr(p) => {
                         for yy in 0..bh as usize {
                             unsafe {
@@ -2341,9 +2363,12 @@ fn draw_buffer(
                     }
                 })
             };
-            if let Err(e) = res {
-                eprintln!("carrot: upload failed: {e}");
-                return;
+            match res {
+                Ok(up) => out.preuploads.borrow_mut().push(up),
+                Err(e) => {
+                    eprintln!("carrot: upload failed: {e}");
+                    return;
+                }
             }
             entry.1 = cur;
         }
@@ -2495,17 +2520,13 @@ fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &cr
             *slot = Some(BlurCache { levels });
         }
     }
+    // the whole chain defers into the next submit; each pass samples the
+    // previous one through its release barrier, never a cpu wait
     let slot = out.blur.borrow();
     let cache = slot.as_ref().unwrap();
-    let run = |tex: &Texture, pass_ops: &[RenderOp]| -> bool {
-        out.renderer
-            .render_into(tex, Some([0.0, 0.0, 0.0, 1.0]), pass_ops, Vec::new())
-            .and_then(|f| f.wait(&out.renderer))
-            .is_ok()
-    };
-    if !run(&cache.levels[0], &ops) {
-        return;
-    }
+    let mut pp = out.prepasses.borrow_mut();
+    let black = Some([0.0, 0.0, 0.0, 1.0]);
+    pp.push(PrePass::new(&cache.levels[0], black, ops));
     let sz = bc.size as f32;
     for i in 0..passes as usize {
         let (src, dst) = (&cache.levels[i], &cache.levels[i + 1]);
@@ -2518,9 +2539,7 @@ fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &cr
             extra_b: if first { bc.brightness as f32 } else { 1.0 },
             up: false,
         };
-        if !run(dst, &[op]) {
-            return;
-        }
+        pp.push(PrePass::new(dst, black, vec![op]));
     }
     for i in (0..passes as usize).rev() {
         let (src, dst) = (&cache.levels[i + 1], &cache.levels[i]);
@@ -2535,9 +2554,7 @@ fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &cr
             extra_b: 0.0,
             up: true,
         };
-        if !run(dst, &[op]) {
-            return;
-        }
+        pp.push(PrePass::new(dst, black, vec![op]));
     }
 }
 
@@ -2676,7 +2693,6 @@ fn remap_local(ops: &mut [RenderOp], out: &Output, r: Rect) {
 /// means degrade to a plain draw (the caller snaps the anim)
 #[allow(clippy::too_many_arguments)]
 fn draw_resize_xfade(
-    state: &Rc<State>,
     out: &Rc<Output>,
     win: &Rc<crate::tree::Window>,
     arect: Rect,
@@ -2733,35 +2749,25 @@ fn draw_resize_xfade(
             Ok(t) => t,
             Err(_) => return false,
         };
-        let ok = out
-            .renderer
-            .render_into(&tex, Some([0.0; 4]), &old_ops, Vec::new())
-            .and_then(|f| f.wait(&out.renderer));
-        if ok.is_err() {
-            state.retire_tex.borrow_mut().push(tex);
-            return false;
-        }
+        out.prepasses
+            .borrow_mut()
+            .push(PrePass::new(&tex, Some([0.0; 4]), old_ops));
         rz.snapshot = Some(tex);
     }
-    // the live side re-renders every frame at the target dims
-    let (tw, th) = (target.width().max(1) as u32, target.height().max(1) as u32);
-    if rz.live.as_ref().is_none_or(|t| t.width != tw || t.height != th) {
-        if let Some(old) = rz.live.take() {
-            state.retire_tex.borrow_mut().push(old);
-        }
+    // the live side re-renders every frame. the texture is allocated once
+    // per fade - the mixing quad stretches 0..1 either way, so a retarget
+    // just changes the render's resolution, never the allocation
+    if rz.live.is_none() {
+        let (tw, th) = (target.width().max(1) as u32, target.height().max(1) as u32);
         match out.renderer.create_render_texture(tw, th) {
             Ok(t) => rz.live = Some(t),
             Err(_) => return false,
         }
     }
     let live_tex = rz.live.as_ref().unwrap();
-    let ok = out
-        .renderer
-        .render_into(live_tex, Some([0.0; 4]), &tmp, Vec::new())
-        .and_then(|f| f.wait(&out.renderer));
-    if ok.is_err() {
-        return false;
-    }
+    out.prepasses
+        .borrow_mut()
+        .push(PrePass::new(live_tex, Some([0.0; 4]), tmp));
     live.extend(tl);
     let (gx, gy) = out.pos.get();
     let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
@@ -2897,7 +2903,7 @@ fn draw_window(
     let smark = ops.len();
     let mut xfaded = false;
     if let Some((p, _)) = rz_progress {
-        xfaded = draw_resize_xfade(state, out, win, rect, round, p, ops, live);
+        xfaded = draw_resize_xfade(out, win, rect, round, p, ops, live);
         if !xfaded {
             // degrade: snap the crossfade, draw plainly
             let mut m = win.anims.borrow_mut();
