@@ -34,6 +34,485 @@
         "aarch64-linux"
       ];
 
+      flake = {
+        homeModule = 
+          { config, lib, pkgs, ... }:
+          let
+            inherit (lib)
+              mkIf
+              mkOption
+              types
+              ;
+              cfg = config.carrot;
+              actions = [];
+              cfg_spring = lib.types.submodule {
+                  options = {
+                    damping_ratio = lib.mkOption {
+                      type = lib.types.number;
+                    };
+                    stiffness = lib.mkOption {
+                      type = lib.types.number;
+                    };
+                    epsilon = lib.mkOption {
+                      type = lib.types.number;
+                    };
+                  };
+                };
+                cfg_ease = lib.types.submodule {
+                    options = {
+                      duration_ms = lib.mkOption {
+                        type = lib.types.int;
+                      };
+                      curve = lib.mkOption {
+                        type = lib.types.str;
+                      };
+                    };
+                  };
+
+              cfg_anim_kind = lib.types.submodule {
+                options = {
+                  off = lib.mkOption {
+                    type = lib.types.bool;
+                  };
+                  spring = lib.mkOption {
+                    type = cfg_spring;
+                  };
+                  ease = lib.mkOption {
+                    type = cfg_ease;
+                  };
+                  style = lib.mkOption {
+                    type = lib.types.submodule {
+                      options = {
+                        name = lib.mkOption {
+                          type = lib.types.str;
+                        };
+                        perc = lib.mkOption {
+                          type = lib.types.int;
+                        };
+                        dir = lib.mkOption {
+                          type = lib.types.str;
+                        };
+                      };
+                    };
+                  };
+                };
+              };
+          in
+          {
+            options.carrot = {
+              enable = lib.mkEnableOption "Carrot, a pure Rust wayland compositor";
+              settings = mkOption {
+                type = types.suboption {
+                  options = {
+                    binds = mkOption {
+                      type = types.listOf (types.suboption {
+                        options = {
+                          chord = mkOption {
+                            type = types.str;
+                          };
+                          actions = mkOption {
+                            type = types.enum actions;
+                          };
+                          args = mkOption {
+                            type = types.listOf types.str;
+                            default = {};
+                          };
+                          on = mkOption {
+                            type = types.enum [ "press" "release" ];
+                            default = "press";
+                          };
+                          repeat = mkOption {
+                            type = types.bool;
+                            default = false;
+                          };
+                          allow_when_locked = mkOption {
+                            type = types.bool;
+                            default = false;
+                          };
+                          cooldown_ms = mkOption {
+                            type = types.numbers.between 1 60000;
+                            default = null;
+                          };
+                        };
+                      });
+                    };
+                    input = mkOption {
+                      type = types.submodule {
+                        options = {
+                          keyboard = mkOption {
+                            type = types.submodule {
+                              options = {
+                                xkb = mkOption {
+                                  type = types.submodule {
+                                    options = {
+                                      layout = mkOption {
+                                        type = types.str;
+                                      };
+                                      variant = mkOption {
+                                        type = types.str;
+                                      };
+                                      options = mkOption {
+                                        type = types.str;
+                                      };
+                                    };
+                                  };
+                                };
+                                repeat_rate = mkOption {
+                                  type = types.ints.between 1 200;
+                                };
+                                repeat_delay = mkOption {
+                                  type = types.ints.between 1 60000;
+                                };
+                                numlock = mkOption {
+                                  type = types.bool;
+                                };
+                              };
+                            };
+                          };  
+                          touchpad = mkOption {
+                            type = types.submodule {
+                              options = {
+                                accel_profile = mkOption {
+                                  type = types.string;
+                                };
+                                accel_speed = mkOption {
+                                  type = types.numbers.between -1.0 1.0;
+                                };
+                                natural_scroll = mkOption {
+                                  type = types.bool;
+                                };
+                              };
+                            };
+                          };
+                          mouse = mkOption {
+                            type = types.submodule {
+                              options = {
+                                accel_profile = mkOption {
+                                  type = types.string;
+                                };
+                                accel_speed = mkOption {
+                                  type = types.numbers.between -1.0 1.0;
+                                };
+                                natural_scroll = mkOption {
+                                  type = types.bool;
+                                };
+                              };
+                            };
+                          };
+                          devices = mkOption {
+                            type = types.listOf (types.submodule {
+                              options = {
+                                accel_speed = mkOption {
+                                  type = types.numbers.between -1.0 1.0;
+                                };
+                                accel_profile = mkOption {
+                                  type = types.str;
+                                };
+                                natural_scroll = mkOption {
+                                  type = types.bool;
+                                };
+                                dpi = mkOption {
+                                  type = types.numbers.between 100 40000;
+                                };
+                              };
+                            });
+                          };
+                          mod_key = mkOption {
+                            type = types.str;
+                          };
+                        };
+                      };
+                    };
+                    window_rules = mkOption {
+                      type = types.listOf (types.submodule {
+                        options = {
+                          match = mkOption {
+                            type = types.str;
+                          };
+                          exclude = mkOption {
+                            type = types.str;
+                          };
+                          open_floating = mkOption {
+                            type = types.bool;
+                          };
+                          open_on_workspace = mkOption {
+                            type = types.ints.positive;
+                          };
+                          default_size = mkOption {
+                            type = types.listOf types.int;
+                          };
+                          open_centered = mkOption {
+                            type = types.bool;
+                          };
+                          opacity = mkOption {
+                            type = types.numbers.between 0.0 1.0;
+                          };
+                          allow_tearing = mkOption {
+                            type = types.bool;
+                          };
+                          no_anim = mkOption {
+                            type = types.bool;
+                          };
+                          rounding = mkOption {
+                            type = types.ints.between 0 200;
+                          };
+                          shadow = mkOption {
+                            type = types.bool;
+                          };
+                          dim = mkOption {
+                            type = types.bool;
+                          };
+                        };
+                      });
+                    };
+                    spawn_at_startup = mkOption {
+                      type = types.listOf types.str;
+                    };
+                    animations = mkOption {
+                      type = types.listOf (types.submodule {
+                        options = {
+                          off = mkOption {
+                            type = types.bool;
+                          };
+                          slowdown = mkOption {
+                            type = types.numbers.between 0.1 10.0;
+                          };
+                          curves = mkOption {
+                            type = types.attrsOf (types.listOf types.number);
+                          };
+                          spring = mkOption {
+                            type = cfg_spring;
+                          };
+                          ease = mkOption {
+                            type = cfg_ease;
+                          };
+                          window_open = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          window_close = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          window_move = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          window_resize = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          workspace_switch = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          view_movement = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          layer_open = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          layer_close = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                          border_color = mkOption {
+                            type = cfg_anim_kind;
+                          };
+                        };
+                      });
+                    };
+                    decoration = mkOption {
+                      type = types.submodule {
+                        options = {
+                          rounding = mkOption {
+                            type = types.ints.between 0 200;
+                          };
+                          rounding_power = mkOption {
+                            type = types.numbers.between 1.0 8.0;
+                          };
+                          dim_inactive = mkOption {
+                            type = types.numbers.between 0.0 1.0;
+                          };
+                          shadow = mkOption {
+                            type = types.submodule {
+                              options = {
+                                size = mkOption {
+                                  type = types.ints.between 1 200;
+                                };
+                                color = mkOption {
+                                  type = types.str;
+                                };
+                                offset = mkOption {
+                                  type = types.listOf types.ints.between -500 500;
+                                };
+                                power = mkOption {
+                                  type = types.numbers.between 0.5 8.0;
+                                };
+                              };
+                            };
+                          };
+                        };
+                      };
+                    };
+                    layout = mkOption {
+                      type = types.submodule {
+                        options = {
+                          mode = mkOption {
+                            type = types.enum [ "scrolling" "dwindle" ];
+                          };
+                          scrolling = {
+                            type = types.submodule {
+                              options = {
+                                preset_widths = mkOption {
+                                  type = types.listOf types.numbers.between 0.05 1.0;
+                                };
+                                default_width = mkOption {
+                                  type = types.numbers.between 0.05 1.0;
+                                };
+                                default_width_px = mkOption {
+                                  type = types.numbers.between 50 100000;
+                                };
+                                center_focus = mkOption {
+                                  type = types.enum ["never" "always" "on-overflow"];
+                                };
+                              };
+                            };
+                          };
+                          gaps_in = mkOption {
+                            type = types.ints.between 0 500;
+                          };
+                          gaps_out = mkOption {
+                            type = types.ints.between 0 500;
+                          };
+                          border = mkOption {
+                            type = types.submodule {
+                              options = {
+                                width = mkOption {
+                                  type = types.ints.between 0 100;
+                                };
+                                active_color = mkOption {
+                                  type = types.str;
+                                };
+                                inactive_color = mkOption {
+                                  type = types.str;
+                                };
+                              };
+                            };
+                          };
+                          float_above_fullscreen = mkOption {
+                            type = types.bool;
+                          };
+                        };
+                      };
+                    };
+                    outputs = mkOption {
+                      type = types.attrsOf (types.submodule {
+                        options = {
+                          mode = mkOption {
+                            type = types.str;
+                          };
+                          scale = mkOption {
+                            type = types.numbers.between 0.25 4.0;
+                          };
+                          position = mkOption {
+                            type = types.submodule {
+                              options = {
+                                x = mkOption {
+                                  type = types.int;
+                                };
+                                y = mkOption {
+                                  type = types.int;
+                                };
+                              };
+                            };
+                          };
+                          vrr = mkOption {
+                            type = types.enum ["off" "on-demand" "always"];
+                          };
+                          off = mkOption {
+                            type = types.bool;
+                          };
+                          allow_tearing = mkOption {
+                            type = types.bool;
+                          };
+                        };
+                      });
+                    };
+                    cursor = mkOption {
+                      type = types.submodule {
+                        options = {
+                          xcursor_theme = mkOption {
+                            type = types.str;
+                          };
+                          xcursor_size = mkOption {
+                            type = types.ints.between 1 512;
+                          };
+                          software = mkOption {
+                            type = types.bool;
+                          };
+                        };
+                      };
+                    };
+                    environment = mkOption {
+                      type = types.attrsOf (types.either types.str (types.enum [ false ]));
+                    };
+                    prefer_no_csd = mkOption {
+                      type = types.bool;
+                    };
+                    screencast = mkOption {
+                      type = types.submodule {
+                        options = {
+                          picker = mkOption {
+                            type = types.str;
+                          };
+                        };
+                      };
+                    };
+                    debug = mkOption {
+                      type = types.submodule {
+                        render_drm_device = mkOption {
+                          type = types.str;
+                        };
+                        ignore_drm_device = mkOption {
+                          type = types.str;
+                        };
+                      };
+                    };
+                    remaps = mkOption {
+                      type = types.listOf (types.submodule {
+                        options = {
+                          name = mkOption {
+                            type = types.str;
+                          };
+                          match = mkOption {
+                            type = types.submodule {
+                              options = {
+                                app_id = mkOption {
+                                  type = types.str;
+                                };
+                                title = mkOption {
+                                  type = types.str;
+                                };
+                                is_xwayland = mkOption {
+                                  type = types.bool;
+                                };
+                                pid = mkOption {
+                                  type = types.int;
+                                };
+                                workspace = mkOption {
+                                  type = types.int;
+                                };
+                              };
+                            };
+                          };
+                          maps = mkOption {
+                            type = types.listOf (types.listOf lib.types.str);
+                          };
+                        };
+                      });
+                    };
+                  };
+                };
+              };
+            };
+          };
+      };
+
       perSystem =
         {
           pkgs,
