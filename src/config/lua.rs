@@ -1124,6 +1124,16 @@ fn debug(v: &Value, cfg: &mut Config) -> Result<(), String> {
             "ignore_drm_devices" => {
                 cfg.debug.ignore_drm_devices = str_array(&v, &key)?;
             }
+            "latency_policy" => {
+                cfg.debug.latency_policy = match need_str(&v, &key)?.as_str() {
+                    "late-latch" => crate::config::LatencyPolicy::LateLatch,
+                    "vblank" => crate::config::LatencyPolicy::Vblank,
+                    other => return Err(format!("unknown latency_policy `{other}`")),
+                }
+            }
+            "latch_margin_us" => {
+                cfg.debug.latch_margin_us = Some(need_int(&v, &key)?.max(0) as u32);
+            }
             other => return Err(format!("unknown debug key `{other}`")),
         }
     }

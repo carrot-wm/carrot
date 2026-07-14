@@ -13,7 +13,7 @@ use crate::drm::sys;
 use crate::engine::SpawnedFuture;
 use crate::format::XRGB8888;
 use crate::rect::Rect;
-use crate::render::renderer::{FrameTarget, PrePass, PreUpload, RenderOp, Renderer, Texture};
+use crate::render::renderer::{Frame, FrameTarget, PrePass, PreUpload, RenderOp, Renderer, Texture};
 use crate::render::vulkan::VkCore;
 use crate::state::State;
 use crate::surface::WlSurface;
@@ -364,7 +364,78 @@ pub struct Output {
     pub blur: RefCell<Option<BlurCache>>,
     /// the backdrop changed since the cache was built
     pub blur_dirty: Cell<bool>,
+    /// submitted frames whose gpu work may still be running; a side task
+    /// waits each render fence and retires them off the present loop
+    gpu_done: crate::util::AsyncQueue<CleanupJob>,
+    /// late-latch scheduler state
+    sched: Sched,
 }
+
+/// everything whose lifetime ends at a frame's render fence
+struct CleanupJob {
+    frame: Frame,
+    sync: Option<Rc<std::os::fd::OwnedFd>>,
+    retired: Vec<Texture>,
+    /// when the frame was submitted; the fence-signal instant closes the
+    /// gpu-tail sample for the latch scheduler
+    submit_ns: u64,
+}
+
+/// the timing model behind late latching: how long a frame costs on the
+/// cpu (latch to flip-queued) and on the gpu (submit to fence), plus an
+/// adaptive safety margin. all nanoseconds
+struct Sched {
+    ewma_cpu: Cell<u64>,
+    ewma_gpu: Cell<u64>,
+    /// AIMD: doubles on a missed vblank, decays linearly on a met one,
+    /// never below the configured floor
+    margin: Cell<u64>,
+    misses: Cell<u32>,
+    clean: Cell<u32>,
+    /// enough consecutive misses park the policy on render-at-flip-done
+    /// until the pipe proves stable again
+    fallback: Cell<bool>,
+    /// the glass instant the queued flip aimed for; 0 = nothing aimed
+    target_ns: Cell<u64>,
+    /// last flip-done actually accounted, so each is counted once
+    last_seq: Cell<u64>,
+}
+
+impl Default for Sched {
+    fn default() -> Sched {
+        Sched {
+            // deliberately fat startup estimates; real samples pull them in
+            ewma_cpu: Cell::new(1_000_000),
+            ewma_gpu: Cell::new(2_000_000),
+            margin: Cell::new(0),
+            misses: Cell::new(0),
+            clean: Cell::new(0),
+            fallback: Cell::new(false),
+            target_ns: Cell::new(0),
+            last_seq: Cell::new(0),
+        }
+    }
+}
+
+impl Sched {
+    fn ewma(cell: &Cell<u64>, sample: u64) {
+        let e = cell.get();
+        cell.set(e - e / 8 + sample / 8);
+    }
+
+    fn budget_ns(&self, floor_ns: u64) -> u64 {
+        self.ewma_cpu.get() + self.ewma_gpu.get() + self.margin.get().max(floor_ns)
+    }
+}
+
+/// how many misses in a row park late-latching, and how many met deadlines
+/// afterwards un-park it
+const MISS_PARK: u32 = 4;
+const CLEAN_RESTORE: u32 = 240;
+/// linear decay of the miss margin per met deadline
+const MARGIN_DECAY_NS: u64 = 20_000;
+/// a deadline closer than this isn't worth a timer round-trip
+const MIN_SLACK_NS: u64 = 100_000;
 
 pub struct BlurCache {
     /// full res first, then each kawase level at half the previous
@@ -1539,7 +1610,93 @@ fn init_output(
         closing_layers: RefCell::new(Vec::new()),
         blur: RefCell::new(None),
         blur_dirty: Cell::new(true),
+        gpu_done: crate::util::AsyncQueue::default(),
+        sched: Sched::default(),
     })
+}
+
+/// one refresh period in nanoseconds; 0 when unknown or variable
+fn period_ns(out: &Output) -> u64 {
+    out.conn
+        .pipe
+        .borrow()
+        .as_ref()
+        .map(|p| {
+            let m = &p.mode;
+            m.htotal as u64 * m.vtotal as u64 * 1_000_000_000 / (m.clock.max(1) as u64 * 1000)
+        })
+        .unwrap_or(0)
+}
+
+/// account a completed flip against the deadline it aimed for
+fn sched_note_flip(out: &Rc<Output>) {
+    let seq = out.conn.seq64.get();
+    let sched = &out.sched;
+    if seq == 0 || seq == sched.last_seq.replace(seq) {
+        return;
+    }
+    let target = sched.target_ns.replace(0);
+    if target == 0 {
+        return;
+    }
+    let period = period_ns(out);
+    let (sec, usec) = out.conn.flip_time.get();
+    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+    if period == 0 || flip_ns == 0 {
+        return;
+    }
+    if flip_ns > target + period / 2 {
+        // missed the aimed-for vblank: back off multiplicatively, and
+        // after a burst park the policy entirely
+        let m = sched.margin.get().max(MARGIN_DECAY_NS);
+        sched.margin.set((m * 2).min(period));
+        sched.clean.set(0);
+        let misses = sched.misses.get() + 1;
+        sched.misses.set(misses);
+        if misses >= MISS_PARK && !sched.fallback.replace(true) {
+            crate::trace!("late-latch parked after {} misses", misses);
+        }
+    } else {
+        sched.misses.set(0);
+        sched.margin.set(sched.margin.get().saturating_sub(MARGIN_DECAY_NS));
+        let clean = sched.clean.get() + 1;
+        sched.clean.set(clean);
+        if clean >= CLEAN_RESTORE && sched.fallback.replace(false) {
+            crate::trace!("late-latch restored after {} met deadlines", clean);
+        }
+    }
+}
+
+/// the latest instant a latch can start and still make the next vblank,
+/// and the vblank it would make. None = no meaningful fixed deadline.
+/// a parked policy still aims - met deadlines are what un-park it - but
+/// the caller skips the sleep
+fn latch_deadline(state: &Rc<State>, out: &Rc<Output>) -> Option<(u64, u64)> {
+    if state.config.borrow().debug.latency_policy != crate::config::LatencyPolicy::LateLatch {
+        return None;
+    }
+    if vrr_wanted(state, out) || tearing_wanted(state, out) {
+        return None;
+    }
+    let period = period_ns(out);
+    let (sec, usec) = out.conn.flip_time.get();
+    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+    if period == 0 || flip_ns == 0 {
+        return None;
+    }
+    let floor_ns = state
+        .config
+        .borrow()
+        .debug
+        .latch_margin_us
+        .map(|us| us as u64 * 1000)
+        .unwrap_or(500_000);
+    let budget = out.sched.budget_ns(floor_ns);
+    let now = Time::now().nsec();
+    // the first vblank whose latch instant is still ahead of us
+    let k = (now + budget).saturating_sub(flip_ns).div_ceil(period).max(1);
+    let target = flip_ns + k * period;
+    Some((target - budget, target))
 }
 
 /// both scenes travel one step apart; out exits opposite the in's entry
@@ -1582,10 +1739,18 @@ pub fn start_ws_switch(state: &Rc<State>, out: &Rc<Output>, from: usize, to: usi
 }
 
 async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
+    let _cleanup = {
+        let st = state.clone();
+        let o = out.clone();
+        state
+            .eng
+            .spawn("present cleanup", async move { gpu_cleanup_loop(&st, &o).await })
+    };
     let mut dirty = false;
     loop {
         EitherEvent(&out.damage, &out.conn.vblank).await;
         let _ = out.conn.vblank.take();
+        sched_note_flip(out);
         // the completed flip carries the kernel timestamp its feedbacks
         // have been waiting for
         if !out.conn.flip_pending.get() && !out.inflight_fbs.borrow().is_empty() {
@@ -1594,22 +1759,21 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 // no fixed period exists under variable refresh
                 0
             } else {
-                out.conn
-                    .pipe
-                    .borrow()
-                    .as_ref()
-                    .map(|p| {
-                        let m = &p.mode;
-                        (m.htotal as u64 * m.vtotal as u64 * 1_000_000 / m.clock.max(1) as u64)
-                            as u32
-                    })
-                    .unwrap_or(0)
+                period_ns(out) as u32
             };
             let mut flags = crate::protocol::presentation::FLAG_HW_CLOCK
                 | crate::protocol::presentation::FLAG_HW_COMPLETION;
             if out.inflight_vsync.get() {
                 flags |= crate::protocol::presentation::FLAG_VSYNC;
             }
+            crate::trace!(
+                "fb-present: n={} seq={} flip_t={}.{:06} t={}",
+                out.inflight_fbs.borrow().len(),
+                out.conn.seq64.get(),
+                sec,
+                usec,
+                Time::now().nsec()
+            );
             for fb in out.inflight_fbs.borrow_mut().drain(..) {
                 fb.presented(&out.conn.name, sec, usec * 1000, refresh, out.conn.seq64.get(), flags);
             }
@@ -1620,7 +1784,24 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         if !dirty || out.conn.flip_pending.get() || out.paused.get() {
             continue;
         }
+        // late latch: sleep until just before the last instant that still
+        // makes the coming vblank, so the freshest input and commits glass
+        let mut aim_ns = 0;
+        if let Some((deadline, target)) = latch_deadline(state, out) {
+            aim_ns = target;
+            if !out.sched.fallback.get() && deadline > Time::now().nsec() + MIN_SLACK_NS {
+                let _ = state.ring.timeout(Time::from_nsec(deadline)).await;
+                // whatever arrived with the timer - input completions,
+                // commits - routes before the scene is latched
+                state.eng.yield_now().await;
+                dirty |= out.damage.take();
+                if out.paused.get() {
+                    continue;
+                }
+            }
+        }
         dirty = false;
+        let latch_ns = Time::now().nsec();
 
         let back = 1 - out.front.get();
         let buf = &out.bufs[back];
@@ -1669,6 +1850,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         };
         state.frames_in_flight.set(state.frames_in_flight.get() + 1);
         buf.undefined.set(false);
+        let submit_ns = Time::now().nsec();
 
         // render fence into the commit
         let sync = frame.export_sync_file(&out.renderer).ok().map(Rc::new);
@@ -1698,9 +1880,18 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         match res {
             Ok(FlipResult::Queued) => {
                 out.front.set(back);
+                crate::trace!(
+                    "fb-flip: queued n={} t={}",
+                    out.present_fbs.borrow().len(),
+                    Time::now().nsec()
+                );
                 out.inflight_fbs
                     .borrow_mut()
                     .append(&mut out.present_fbs.borrow_mut());
+                if aim_ns != 0 {
+                    out.sched.target_ns.set(aim_ns);
+                    Sched::ewma(&out.sched.ewma_cpu, submit_ns.saturating_sub(latch_ns));
+                }
             }
             Ok(FlipResult::NotPresented) => {
                 // the pipe was momentarily busy (a cursor commit can hold
@@ -1728,16 +1919,58 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             }
         }
 
-        // fence fd doubles as the completion signal; drives cleanup + callbacks
-        let completed = sync.is_some();
-        if let Some(fd) = sync {
-            let _ = state.ring.readable(&fd).await;
+        // callbacks fire the moment the scene is latched and the flip is
+        // queued - the gpu tail is not the client's wait. a client that
+        // renders now still catches the next latch
+        fire_callback_sweep(state);
+        // everything gated on the render fence retires off-loop
+        let retired = if sync.is_some() {
+            std::mem::take(&mut *out.retired_tex.borrow_mut())
+        } else {
+            // no fence to wait: keep them for the next round, like before
+            Vec::new()
+        };
+        out.gpu_done.push(CleanupJob { frame, sync, retired, submit_ns });
+    }
+}
+
+/// frame callbacks for everything some compose (or scanout) marked shown
+/// since the last sweep; clients nobody can see stop rendering into the void
+fn fire_callback_sweep(state: &Rc<State>) {
+    let ms = (Time::now().nsec() / 1_000_000) as u32;
+    // the cursor surface never rides a scene walk but its client still
+    // paces animated cursors off frame callbacks
+    if let Some(seat) = state.seat.borrow().clone() {
+        if let crate::input::seat::CursorState::Surface(s) = &*seat.cursor.borrow() {
+            s.shown.set(true);
         }
-        // this frame is done sampling: retired textures can go now (kept
-        // for the next round if the fence export failed)
+    }
+    state.clients.for_each(|c| {
+        c.objects.for_each_surface(|s| {
+            if s.mapped.get() && s.shown.replace(false) {
+                s.fire_frame_callbacks(ms);
+            }
+        });
+    });
+}
+
+/// the render-fence side of a frame: texture retirement, dmabuf release
+/// accounting, frame recycling, and capture completion all wait on the gpu
+/// here, off the present loop
+async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
+    loop {
+        let job = out.gpu_done.pop().await;
+        let completed = job.sync.is_some();
+        if let Some(fd) = &job.sync {
+            let _ = state.ring.readable(fd).await;
+            // the gpu-tail sample for the latch scheduler; capped so a
+            // stalled queue can't poison the estimate for seconds
+            let tail = Time::now().nsec().saturating_sub(job.submit_ns);
+            Sched::ewma(&out.sched.ewma_gpu, tail.min(50_000_000));
+        }
         if completed {
-            for t in out.retired_tex.borrow_mut().drain(..) {
-                out.renderer.destroy_texture(&t);
+            for t in &job.retired {
+                out.renderer.destroy_texture(t);
             }
         }
         // frame done: parked dmabuf attachments release once NO output still
@@ -1747,26 +1980,8 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         if inflight == 0 {
             state.retired.borrow_mut().clear();
         }
-        out.renderer.recycle_frame(frame);
-        let ms = (Time::now().nsec() / 1_000_000) as u32;
-        // the cursor surface never rides a scene walk but its client still
-        // paces animated cursors off frame callbacks
-        if let Some(seat) = state.seat.borrow().clone() {
-            if let crate::input::seat::CursorState::Surface(s) = &*seat.cursor.borrow() {
-                s.shown.set(true);
-            }
-        }
-        // throttle to what some compose drew since the last present:
-        // clients nobody can see stop rendering into the void
-        state.clients.for_each(|c| {
-            c.objects.for_each_surface(|s| {
-                if s.mapped.get() && s.shown.replace(false) {
-                    s.fire_frame_callbacks(ms);
-                }
-            });
-        });
-        // this present only ran because content changed: pending output
-        // captures complete against the frame just shown
+        out.renderer.recycle_frame(job.frame);
+        // pending output captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
         crate::protocol::session_lock::output_presented(state, &out.conn.name);
         crate::portal::cast::output_presented(state, &out.conn.name);
@@ -2162,6 +2377,12 @@ fn draw_surface_tree(
     if out.collect_fbs.get() {
         let mut latched = surface.latched_feedbacks.borrow_mut();
         if !latched.is_empty() {
+            crate::trace!(
+                "fb-collect: surface {} n={} t={}",
+                surface.id,
+                latched.len(),
+                Time::now().nsec()
+            );
             out.present_fbs.borrow_mut().append(&mut latched);
         }
     }

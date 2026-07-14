@@ -279,6 +279,19 @@ pub struct DebugCfg {
     pub render_drm_device: Option<String>,
     /// secondary gpus to leave alone entirely
     pub ignore_drm_devices: Vec<String>,
+    pub latency_policy: LatencyPolicy,
+    /// floor under the adaptive latch margin, microseconds
+    pub latch_margin_us: Option<u32>,
+}
+
+/// when the present loop starts rendering a dirty frame
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum LatencyPolicy {
+    /// sleep until just before the deadline, then latch the freshest state
+    #[default]
+    LateLatch,
+    /// render as soon as the pipe frees up (one frame of queue depth)
+    Vblank,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Default)]

@@ -320,6 +320,14 @@ impl WlSurface {
         for fb in self.latched_feedbacks.borrow_mut().drain(..) {
             fb.discarded();
         }
+        if !pending.presentation_feedbacks.is_empty() {
+            crate::trace!(
+                "fb-latch: surface {} n={} t={}",
+                self.id,
+                pending.presentation_feedbacks.len(),
+                crate::util::Time::now().nsec()
+            );
+        }
         self.latched_feedbacks
             .borrow_mut()
             .append(&mut pending.presentation_feedbacks);

@@ -329,6 +329,8 @@ binds {
 // debug {
 //     render-drm-device "/dev/dri/card0"
 //     ignore-drm-device "card1"
+//     latency-policy "late-latch"    // or "vblank": render at flip-done
+//     latch-margin-us 500            // floor under the adaptive margin
 // }
 "##;
 
