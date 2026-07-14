@@ -7,7 +7,7 @@ mod commit;
 mod role;
 mod subsurface;
 
-pub use commit::{PendingState, PendingSub};
+pub use commit::PendingState;
 pub use role::{NoneExt, SurfaceExt, SurfaceRole};
 pub use subsurface::{WlSubcompositorGlobal, WlSubsurface};
 

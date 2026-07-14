@@ -1539,7 +1539,6 @@ impl SeatGlobal {
             state.grab_active.set(false);
             return;
         };
-        let mut animate = false;
         match op {
             Op::SetRect(_, r) => {
                 win.rect.set(r);
@@ -1592,7 +1591,6 @@ impl SeatGlobal {
                 if !Rc::ptr_eq(&ws, &ows) {
                     crate::tree::relayout(state, &ows);
                 }
-                animate = true;
             }
         }
         crate::tree::relayout(state, &ws);

@@ -7,8 +7,6 @@
 
 mod ops;
 
-pub use ops::msg::RecvMsg;
-
 use crate::engine::Engine;
 use crate::util::{IdHashMap, IdHashSet, NumCell, Stack};
 use rustix::io::Errno;

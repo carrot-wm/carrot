@@ -171,7 +171,7 @@ fn entry_for_icd(path: &Path) -> Result<ash::Entry, String> {
         )
     } {
         let mut ver: u32 = 5; // the newest loader<->icd interface we speak
-        unsafe { neg(&mut ver) };
+        let _ = unsafe { neg(&mut ver) };
     }
 
     let gipa = unsafe { lib.get::<IcdGipa>("vk_icdGetInstanceProcAddr") }

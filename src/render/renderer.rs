@@ -1741,10 +1741,6 @@ impl Drop for Renderer {
 /// quads -> readback -> pixel check. proves shaders, blend, barriers and the
 /// tier-2 scanout write path.
 pub fn probe() -> i32 {
-    use crate::drm::sys;
-    use rustix::fs::{Mode, OFlags, open};
-    use std::os::fd::AsFd;
-
     let mut cards: Vec<_> = match std::fs::read_dir("/dev/dri") {
         Ok(rd) => rd
             .filter_map(|e| e.ok())

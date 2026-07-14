@@ -9,10 +9,16 @@ macro_rules! trace {
     };
 }
 
+// the disabled arm still names its args so bindings that only feed a
+// probe don't warn; the dead branch folds away
 #[cfg(not(feature = "trace"))]
 #[macro_export]
 macro_rules! trace {
-    ($($arg:tt)*) => {{}};
+    ($($arg:tt)*) => {{
+        if false {
+            let _ = format_args!($($arg)*);
+        }
+    }};
 }
 
 #[cfg(test)]
