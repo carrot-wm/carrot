@@ -80,3 +80,4 @@
 - Display Manager Sessions on Any Distro (carrot install: Session Entry, Portal Registration, IPC Client)
 - XDG Activation (Link Handoffs Focus the Running App and Follow It to Its Workspace)
 - Multi-File Configs (KDL include Nodes and a Lua include(), Paths Resolve Against the Including File)
+- Workspace Axis Choice (Dwindle Picks Horizontal or Vertical Switching; Scrolling Stays Vertical)

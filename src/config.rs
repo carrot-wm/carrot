@@ -150,6 +150,15 @@ pub enum CenterFocus {
     OnOverflow,
 }
 
+/// which way the workspace stack runs on dwindle; scrolling always
+/// stacks vertically because the strip owns the horizontal axis
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum WsAxis {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScrollCfg {
     pub preset_widths: Vec<f64>,
@@ -181,6 +190,7 @@ pub struct LayoutCfg {
     pub gaps_out: i32,
     pub border: BorderCfg,
     pub float_above_fullscreen: bool,
+    pub ws_axis: WsAxis,
     pub scrolling: ScrollCfg,
 }
 

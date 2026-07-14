@@ -39,6 +39,15 @@ pub(super) fn parse(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     l.float_above_fullscreen = b;
                 }
             }
+            "workspace-axis" => {
+                if let Some(s) = cx.str_(c) {
+                    match s.as_str() {
+                        "horizontal" => l.ws_axis = WsAxis::Horizontal,
+                        "vertical" => l.ws_axis = WsAxis::Vertical,
+                        _ => cx.at(c, "workspace-axis is horizontal or vertical"),
+                    }
+                }
+            }
             // reserved until the renderer draws them
             "focus-ring" | "shadow" | "struts" => {
                 cx.at(c, &format!("{}: not implemented yet", c.name().value()));
@@ -158,6 +167,15 @@ mod tests {
         assert_eq!(c.layout.scrolling.center_focus, CenterFocus::OnOverflow);
         let c = parse_ok("layout { scrolling { default-width-px 600 } }");
         assert_eq!(c.layout.scrolling.default_width, ColWidthCfg::FixedPx(600));
+    }
+
+    #[test]
+    fn workspace_axis_parses() {
+        assert_eq!(parse_ok("layout { }").layout.ws_axis, WsAxis::Horizontal);
+        let c = parse_ok("layout { workspace-axis \"vertical\" }");
+        assert_eq!(c.layout.ws_axis, WsAxis::Vertical);
+        let errs = parse_errs("layout { workspace-axis \"diagonal\" }");
+        assert!(errs.iter().any(|e| e.contains("workspace-axis")), "{errs:?}");
     }
 
     #[test]

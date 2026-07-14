@@ -16,7 +16,7 @@
 use super::{
     Action, Bind, BlurCfg, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
     LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch,
-    SetLayoutArg, ShadowCfg, SpawnCfg, Vrr, WindowRule,
+    SetLayoutArg, ShadowCfg, SpawnCfg, Vrr, WindowRule, WsAxis,
 };
 use piccolo::{Callback, CallbackReturn, Closure, Executor, IntoValue, Lua, Table, Value};
 
@@ -466,6 +466,13 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                 }
             }
             "float_above_fullscreen" => l.float_above_fullscreen = need_bool(&v, &key)?,
+            "workspace_axis" => {
+                l.ws_axis = match need_str(&v, &key)?.as_str() {
+                    "horizontal" => WsAxis::Horizontal,
+                    "vertical" => WsAxis::Vertical,
+                    _ => return Err("workspace_axis is horizontal or vertical".into()),
+                };
+            }
             "focus_ring" | "shadow" | "struts" => {
                 return Err(format!("{key}: not implemented yet"));
             }
@@ -1137,6 +1144,7 @@ mod tests {
             layout {
                 gaps-in 4
                 gaps-out 8
+                workspace-axis "vertical"
                 border { width 2; active-color "#89b4fa"; inactive-color "#585b70" }
             }
             animations {
@@ -1177,6 +1185,7 @@ mod tests {
                 layout = {
                     gaps_in = 4,
                     gaps_out = 8,
+                    workspace_axis = "vertical",
                     border = { width = 2, active_color = "#89b4fa", inactive_color = "#585b70" },
                 },
                 animations = {

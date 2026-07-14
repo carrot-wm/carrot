@@ -617,13 +617,15 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
 }
 
 /// scrolling workspaces own the horizontal axis; any of them forces the
-/// workspace stack vertical. an all-dwindle session slides horizontally
+/// workspace stack vertical. dwindle sessions follow workspace-axis,
+/// horizontal unless the config asks otherwise
 pub fn ws_axis_vertical(state: &Rc<State>) -> bool {
-    state
-        .workspaces
-        .borrow()
-        .iter()
-        .any(|w| w.tiling.mode() == crate::config::LayoutMode::Scrolling)
+    state.config.borrow().layout.ws_axis == crate::config::WsAxis::Vertical
+        || state
+            .workspaces
+            .borrow()
+            .iter()
+            .any(|w| w.tiling.mode() == crate::config::LayoutMode::Scrolling)
 }
 
 /// switch a workspace's tiling mode, re-tiling its windows in order; the
@@ -1551,6 +1553,16 @@ mod tests {
         ws.tiling.for_each(|_| n += 1);
         assert_eq!(n, 3);
         assert!(!ws_axis_vertical(&state));
+    }
+
+    #[test]
+    fn workspace_axis_config_forces_vertical_on_dwindle() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        assert!(!ws_axis_vertical(&state));
+        let mut cfg = (**state.config.borrow()).clone();
+        cfg.layout.ws_axis = crate::config::WsAxis::Vertical;
+        *state.config.borrow_mut() = Rc::new(cfg);
+        assert!(ws_axis_vertical(&state), "dwindle honors the configured axis");
     }
 
     #[test]
