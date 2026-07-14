@@ -47,7 +47,9 @@ overflow-checks = false
 [profile.release]
 panic = "abort"
 
-# eyra's libc routed to taproot - the same libc the dlopened mesa closure gets
+# eyra's libc routed to taproot - the same libc the dlopened mesa closure
+# gets. pinned by rev so every build links the exact libc that was tested;
+# flip these to path = "../taproot/..." while hacking on the fork itself
 [patch.crates-io]
-c-scape = { path = "../taproot/c-scape" }
-c-gull = { path = "../taproot/c-gull" }
+c-scape = { git = "https://github.com/carrot-wm/taproot", rev = "723e387d072a19df11c9d0c58ae26e6b5ebf963c" }
+c-gull = { git = "https://github.com/carrot-wm/taproot", rev = "723e387d072a19df11c9d0c58ae26e6b5ebf963c" }

@@ -79,6 +79,7 @@ dependencies = [
 [[package]]
 name = "c-gull"
 version = "0.22.3"
+source = "git+https://github.com/carrot-wm/taproot?rev=723e387d072a19df11c9d0c58ae26e6b5ebf963c#723e387d072a19df11c9d0c58ae26e6b5ebf963c"
 dependencies = [
  "c-scape",
  "errno",
@@ -90,6 +91,7 @@ dependencies = [
 [[package]]
 name = "c-scape"
 version = "0.22.3"
+source = "git+https://github.com/carrot-wm/taproot?rev=723e387d072a19df11c9d0c58ae26e6b5ebf963c#723e387d072a19df11c9d0c58ae26e6b5ebf963c"
 dependencies = [
  "bitflags 2.13.0",
  "errno",

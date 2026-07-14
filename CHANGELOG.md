@@ -72,3 +72,8 @@
 - Pointer Move/Resize Actions (Key or Mouse-Chord Grabs)
 - Kawase Blur (Backdrop Cache, Per-Window and Per-Layer Rules)
 - Tiled Drag-and-Swap (Pointer Grabs Trade Window Slots, Cross-Output on Dwindle)
+- Alpha-Masked Layer Blur (ignore-alpha Layer Rule, Backdrop Clips to the Surface's Own Coverage)
+- No-Capture Window Rule (Screenshares, Recordings & Screenshots See a Black Stand-In)
+- No-Anim Layer Rule (Shells That Remap Layers Skip Open/Close Styles)
+- Live Rule Reload (Config Edits Land on Running Windows)
+- Single-Submit Frames (Offscreen Work Records as Ordered Pre-Passes, No Blocking GPU Waits)

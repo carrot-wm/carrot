@@ -152,6 +152,23 @@ wayland.windowManager.carrot = {
 
 </details>
 
+## Building
+
+Carrot links no system C - its libc is [taproot](https://github.com/carrot-wm/taproot),
+pulled in as a `[patch.crates-io]` git dependency pinned by revision, so a
+plain clone builds out of the box and links the exact libc revision carrot
+was tested against:
+
+```sh
+git clone https://github.com/flammablebunny/carrot
+cd carrot
+nix develop   # pins the toolchain; or use rustup with the pinned toolchain
+cargo build --release
+```
+
+To hack on the libc itself, clone taproot next to carrot and flip the
+`[patch.crates-io]` entries in `Cargo.toml` to `path = "../taproot/..."`.
+
 ### Screensharing
 
 Carrot serves the ScreenCast portal itself and draws no chooser of its own,
