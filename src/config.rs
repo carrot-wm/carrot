@@ -927,7 +927,9 @@ pub(crate) fn keycode(name: &str) -> Option<u32> {
         "f11" => 87, "f12" => 88,
         "ro" => 89, "katakana" => 90, "hiragana" => 91, "henkan" => 92,
         "katakanahiragana" => 93, "muhenkan" => 94, "kpjpcomma" => 95,
-        "kpenter" => 96, "rightctrl" | "ctrl_r" => 97, "kpslash" => 98, "sysrq" => 99,
+        "kpenter" => 96, "rightctrl" | "ctrl_r" => 97, "kpslash" => 98,
+        // the physical prtsc key reports sysrq, not the ac-print code
+        "sysrq" | "print" => 99,
         "rightalt" | "alt_r" => 100, "linefeed" => 101,
         "home" => 102, "up" => 103, "pageup" => 104, "left" => 105,
         "right" => 106, "end" => 107, "down" => 108, "pagedown" => 109,
@@ -964,7 +966,7 @@ pub(crate) fn keycode(name: &str) -> Option<u32> {
         "playcd" => 200, "pausecd" => 201, "prog3" => 202, "prog4" => 203,
         "all_applications" | "dashboard" => 204, "suspend" => 205,
         "close" => 206, "play" => 207, "fastforward" => 208,
-        "bassboost" => 209, "print" => 210, "hp" => 211, "camera" => 212,
+        "bassboost" => 209, "hp" => 211, "camera" => 212,
         "sound" => 213, "question" => 214, "email" => 215, "chat" => 216,
         "search" => 217, "connect" => 218, "finance" => 219, "sport" => 220,
         "shop" => 221, "alterase" => 222, "cancel" => 223,
@@ -978,7 +980,7 @@ pub(crate) fn keycode(name: &str) -> Option<u32> {
         "video_next" => 241, "video_prev" => 242,
         "brightness_cycle" => 243, "brightness_auto" | "brightness_zero" => 244,
         "display_off" => 245, "wwan" | "wimax" => 246, "rfkill" => 247,
-        "micmute" => 248,
+        "micmute" | "xf86audiomicmute" => 248,
         // mouse buttons share the code space; chords say Mod+MouseLeft
         "btn_left" | "mouse_left" | "mouseleft" => 272,
         "btn_right" | "mouse_right" | "mouseright" => 273,
@@ -1355,6 +1357,8 @@ mod tests {
         assert_eq!(k, 28);
         let (_, k) = chord("Mod+MouseLeft").unwrap();
         assert_eq!(k, 272);
+        let (_, k) = chord("Print").unwrap();
+        assert_eq!(k, 99, "prtsc emits sysrq");
         assert!(chord("Mod+Shift").is_err(), "no key");
         assert!(chord("Q+W").is_err(), "two keys");
     }

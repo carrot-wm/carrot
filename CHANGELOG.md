@@ -82,3 +82,4 @@
 - Multi-File Configs (KDL include Nodes and a Lua include(), Paths Resolve Against the Including File)
 - Workspace Axis Choice (Dwindle Picks Horizontal or Vertical Switching; Scrolling Stays Vertical)
 - Move-Column Verbs (The Whole Column Leapfrogs the Strip; Directional Swap Trades Window Slots Between Columns)
+- Guided Default Config (Per-Section Walkthrough, Decoration & No-CSD On, Screenshot/Media/Brightness Binds, Vim Keys, include Examples)
