@@ -7,7 +7,7 @@
 use crate::render::shaders;
 use crate::render::vulkan::{RenderError, VkCore};
 use ash::vk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::rc::Rc;
 
@@ -255,6 +255,7 @@ pub struct Renderer {
     pipes: Pipelines,
     pool: vk::CommandPool,
     free_cbs: RefCell<Vec<vk::CommandBuffer>>,
+    tex_uid: Cell<u64>,
 }
 
 impl Renderer {
@@ -412,7 +413,16 @@ impl Renderer {
             pipes,
             pool,
             free_cbs: RefCell::new(Vec::new()),
+            tex_uid: Cell::new(0),
         })
+    }
+
+    /// textures are cached under stable keys; the uid tells a replacement
+    /// apart from the texture a stored batch actually sampled
+    fn next_tex_uid(&self) -> u64 {
+        let u = self.tex_uid.get();
+        self.tex_uid.set(u + 1);
+        u
     }
 
     /// sync_file (previous scanout's OUT fence) -> submit wait; temporary
@@ -1026,6 +1036,7 @@ impl Renderer {
             width: w,
             height: h,
             undefined: std::cell::Cell::new(true),
+            uid: self.next_tex_uid(),
         })
     }
 
@@ -1075,6 +1086,7 @@ impl Renderer {
             width: w,
             height: h,
             undefined: std::cell::Cell::new(true),
+            uid: self.next_tex_uid(),
         })
     }
 
@@ -1231,6 +1243,7 @@ impl Renderer {
             width: w,
             height: h,
             undefined: std::cell::Cell::new(false),
+            uid: self.next_tex_uid(),
         })
     }
 
@@ -1480,6 +1493,8 @@ pub struct Texture {
     pub width: u32,
     pub height: u32,
     undefined: std::cell::Cell<bool>,
+    /// never reused; view handles can be, so identity checks go through this
+    pub uid: u64,
 }
 
 impl Drop for Renderer {

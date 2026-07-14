@@ -160,13 +160,13 @@ pub struct Window {
     pub rule_dim: Cell<Option<bool>>,
     pub rule_blur: Cell<bool>,
     pub anims: RefCell<WinAnims>,
-    /// the ops + texture keys this window produced at its last compose,
+    /// the ops + texture keys/uids this window produced at its last compose,
     /// plus the subrange holding only the surface-tree ops; the close
     /// animation seizes the whole batch, the resize snapshot bakes just
     /// the surface slice
     pub last_batch: RefCell<(
         Vec<crate::render::renderer::RenderOp>,
-        Vec<(crate::client::ClientId, u64)>,
+        Vec<((crate::client::ClientId, u64), u64)>,
         std::ops::Range<usize>,
     )>,
 }

@@ -277,10 +277,10 @@ pub struct LayerSurface {
     popups: RefCell<Vec<Rc<super::xdg::XdgPopup>>>,
     /// the open animation; unmap capture reuses the closing-window path
     pub anim: RefCell<Option<(crate::anim::Anim, crate::config::Style)>>,
-    /// ops + texture keys from the last compose, for the close capture
+    /// ops + texture keys/uids from the last compose, for the close capture
     pub last_batch: RefCell<(
         Vec<crate::render::renderer::RenderOp>,
-        Vec<(crate::client::ClientId, u64)>,
+        Vec<((crate::client::ClientId, u64), u64)>,
         std::ops::Range<usize>,
     )>,
 }

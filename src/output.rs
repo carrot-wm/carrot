@@ -1923,7 +1923,7 @@ fn compose_scene(
     ws_override: Option<usize>,
 ) -> Vec<RenderOp> {
     let mut ops = Vec::new();
-    let mut live: Vec<(ClientId, u64)> = Vec::new();
+    let mut live: Vec<((ClientId, u64), u64)> = Vec::new();
     // a locked session shows nothing but the lock surface; an output
     // without one stays a cleared frame
     if crate::protocol::session_lock::locked(state) {
@@ -1938,7 +1938,7 @@ fn compose_scene(
         let mut textures = out.textures.borrow_mut();
         let stale: Vec<_> = textures
             .keys()
-            .filter(|k| !live.contains(k))
+            .filter(|k| !live.iter().any(|(lk, _)| lk == *k))
             .copied()
             .collect();
         for k in stale {
@@ -2032,7 +2032,7 @@ fn compose_scene(
     let mut textures = out.textures.borrow_mut();
     let stale: Vec<_> = textures
         .keys()
-        .filter(|k| !live.contains(k))
+        .filter(|k| !live.iter().any(|(lk, _)| lk == *k))
         .copied()
         .collect();
     for k in stale {
@@ -2054,7 +2054,7 @@ fn draw_surface_tree(
     alpha: f32,
     round: f32,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     if !surface.mapped.get() {
         return;
@@ -2100,7 +2100,7 @@ fn draw_popup(
     oy: i32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     if !p.xdg.surface.mapped.get() {
         return;
@@ -2120,7 +2120,7 @@ fn draw_popups(
     oy: i32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
 }
@@ -2133,7 +2133,7 @@ fn draw_layer(
     layer: u32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
     rest: bool,
 ) {
     let layers = state.layers.borrow().clone();
@@ -2196,7 +2196,7 @@ fn draw_layer_popups(
     fs_active: bool,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     let layers = state.layers.borrow().clone();
     for ls in layers.iter() {
@@ -2222,7 +2222,7 @@ fn draw_buffer(
     alpha: f32,
     round: f32,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     let buffer = s.buffer.borrow();
     let Some(att) = buffer.as_ref() else { return };
@@ -2348,15 +2348,15 @@ fn draw_buffer(
             entry.1 = cur;
         }
     }
-    live.push(key);
+    let textures = out.textures.borrow();
+    let (tex, _) = textures.get(&key).unwrap();
+    live.push((key, tex.uid));
     let (sw, sh) = s.size.get();
     let dst = Rect::new_sized_saturating(x, y, sw, sh);
     let vis = dst.intersect(clip);
     if vis.is_empty() {
         return;
     }
-    let textures = out.textures.borrow();
-    let (tex, _) = textures.get(&key).unwrap();
     let (gx, gy) = out.pos.get();
     let fx = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
     let fy = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
@@ -2599,7 +2599,7 @@ fn ws_scene(
     cfg: &crate::config::Config,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     let fs = ws.fullscreen.borrow().clone();
     if fs.is_none() {
@@ -2683,7 +2683,7 @@ fn draw_resize_xfade(
     round: f32,
     progress: f64,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) -> bool {
     let surface = win.surface();
     let target = win.rect.get();
@@ -2710,7 +2710,8 @@ fn draw_resize_xfade(
     let Some(rz) = m.resize.as_mut() else { return false };
     // the old content bakes exactly once, from the last composed batch:
     // surface ops only (decorations draw live), and never from views whose
-    // textures the stale sweep already destroyed
+    // textures were destroyed or replaced since - a key can outlive its
+    // texture (shm reallocs and re-imports reuse it), so match uids
     if rz.snapshot.is_none() {
         let (all_ops, keys, srange) = win.last_batch.borrow().clone();
         if all_ops.is_empty() || srange.is_empty() {
@@ -2718,7 +2719,10 @@ fn draw_resize_xfade(
         }
         {
             let t = out.textures.borrow();
-            if keys.iter().any(|k| !t.contains_key(k)) {
+            if keys
+                .iter()
+                .any(|(k, uid)| t.get(k).map(|(tex, _)| tex.uid) != Some(*uid))
+            {
                 return false;
             }
         }
@@ -2790,7 +2794,7 @@ fn draw_window(
     screen: Rect,
     win: &Rc<crate::tree::Window>,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     let surface = win.surface();
     if !surface.mapped.get() {
@@ -2991,11 +2995,12 @@ pub struct ClosingWindow {
 }
 
 /// wrap a cached final batch, taking ownership of its textures. a batch
-/// whose textures were already evicted references destroyed views - those
-/// must never reach the gpu, so the capture is refused instead
+/// whose textures were evicted - or replaced under the same key - references
+/// destroyed views; those must never reach the gpu, so the capture is
+/// refused instead (uid mismatch counts as missing)
 pub fn seize_batch(
     out: &Rc<Output>,
-    batch: (Vec<RenderOp>, Vec<(ClientId, u64)>, std::ops::Range<usize>),
+    batch: (Vec<RenderOp>, Vec<((ClientId, u64), u64)>, std::ops::Range<usize>),
     rect: Rect,
     anim: crate::anim::Anim,
     style: crate::config::Style,
@@ -3009,14 +3014,19 @@ pub fn seize_batch(
     let mut missing = false;
     {
         let mut textures = out.textures.borrow_mut();
-        for k in &keys {
+        for (k, uid) in &keys {
             if taken.contains(k) {
                 continue;
             }
             match textures.remove(k) {
-                Some((t, _)) => {
+                Some((t, _)) if t.uid == *uid => {
                     keep.push(t);
                     taken.push(*k);
+                }
+                // a replacement: the window is going away, retire it too
+                Some((t, _)) => {
+                    keep.push(t);
+                    missing = true;
                 }
                 None => missing = true,
             }
