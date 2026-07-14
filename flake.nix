@@ -172,7 +172,7 @@
                             default = null;
                           };
                           args = mkOption {
-                            type = types.nullOr (types.listOf (types.either types.str types.int));
+                            type = types.nullOr (types.listOf (types.either types.str types.number));
                             default = null;
                           };
                           on = mkOption {
@@ -683,7 +683,7 @@
             config = mkIf cfg.enable {
               home.packages = [ cfg.package ];
 
-              xdg.configFile."carrot/carrot.lua" = mkIf (cfg.settings != null) {
+              xdg.configFile."carrot/carrot.lua" = mkIf (cfg.settings != {}) {
                 text = let
                   luaConfig = lib.generators.toLua { } cfg.settings;
                 in
