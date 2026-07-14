@@ -340,6 +340,8 @@ pub struct WindowRule {
     pub opacity: Option<f64>,
     pub allow_tearing: bool,
     pub no_anim: bool,
+    /// captures and casts see a black stand-in instead of the content
+    pub no_capture: bool,
     /// open/close style override, window-style grammar
     pub animation: Option<Style>,
     pub rounding: Option<i32>,
@@ -983,6 +985,7 @@ pub struct RuleFx {
     pub size: Option<(i32, i32)>,
     pub center: bool,
     pub no_anim: bool,
+    pub no_capture: bool,
     pub animation: Option<Style>,
     pub rounding: Option<i32>,
     pub shadow: Option<bool>,
@@ -1047,6 +1050,7 @@ pub fn rule_effects(
         }
         fx.center |= r.open_centered;
         fx.no_anim |= r.no_anim;
+        fx.no_capture |= r.no_capture;
         if let Some(a) = &r.animation {
             fx.animation = Some(a.clone());
         }
@@ -1150,6 +1154,7 @@ mod tests {
                 open-floating #true
                 default-size 800 600
                 open-on-workspace 3
+                no-capture
             }
             "##,
         )
@@ -1160,6 +1165,7 @@ mod tests {
         assert_eq!(fx.floating, Some(true), "second rule stacked");
         assert_eq!(fx.size, Some((800, 600)));
         assert_eq!(fx.workspace, Some(2), "parser stores 0-based");
+        assert!(fx.no_capture, "flag accumulates like the other booleans");
         // non-matching app id gets nothing
         let fx = rule_effects(&cfg, "foot", "shell", false, false);
         assert_eq!(fx, RuleFx::default());

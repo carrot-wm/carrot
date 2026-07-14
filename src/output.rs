@@ -765,6 +765,15 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     if rect.is_empty() {
         return None;
     }
+    // rule-hidden: the stream gets an opaque black frame, never pixels
+    if win.rule_no_capture.get() {
+        let n = rect.width() as usize * rect.height() as usize;
+        let mut px = vec![0u8; n * 4];
+        for p in px.chunks_exact_mut(4) {
+            p[3] = 0xff;
+        }
+        return Some(px);
+    }
     let geo = win.geometry();
     let mut ops = Vec::new();
     let mut live = Vec::new();
@@ -827,6 +836,16 @@ pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+/// a live workspace-switch blends two scenes on glass; casts wait it out
+pub fn switching(state: &Rc<State>, name: &str) -> bool {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return false };
+    let outs = d.outputs.borrow();
+    outs.iter()
+        .find(|o| o.conn.name == name)
+        .is_some_and(|o| o.ws_switch.borrow().is_some())
 }
 
 /// output-local full rect + size lookup for the screencopy protocol
@@ -2072,7 +2091,7 @@ fn compose_scene(
     }
     if fs.is_none() {
         draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live, lrest);
-        draw_closing_list(state, out, &out.closing_layers, &mut ops);
+        draw_closing_list(state, out, &out.closing_layers, &mut ops, mode);
     }
     draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live, lrest);
     draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
@@ -2661,6 +2680,37 @@ fn blur_mask_op(out: &Rc<Output>, s: &Rc<WlSurface>, r: Rect, threshold: f32) ->
     })
 }
 
+/// solid black over the window's box, rounded like the content it hides
+fn push_blackout(out: &Rc<Output>, rect: Rect, round: f32, ops: &mut Vec<RenderOp>) {
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    let pos = [fxp(rect.x1), fyp(rect.y1)];
+    let size = [
+        rect.width() as f32 / out.width as f32 * 2.0,
+        rect.height() as f32 / out.height as f32 * 2.0,
+    ];
+    let black = [0.0, 0.0, 0.0, 1.0];
+    if round >= 0.5 {
+        // a ring wider than the box is a rounded fill
+        ops.push(RenderOp::Border {
+            pos,
+            size,
+            rect_px: [
+                (rect.x1 - gx) as f32,
+                (rect.y1 - gy) as f32,
+                rect.width() as f32,
+                rect.height() as f32,
+            ],
+            radius: round,
+            width: rect.width().max(rect.height()) as f32,
+            color: black,
+        });
+    } else {
+        ops.push(RenderOp::Fill { pos, size, color: black });
+    }
+}
+
 /// the blurred backdrop under a rect, rounded to taste
 fn push_blur_backdrop(out: &Rc<Output>, r: Rect, round: f32, ops: &mut Vec<RenderOp>) {
     let slot = out.blur.borrow();
@@ -2728,7 +2778,7 @@ fn ws_scene(
         let mark = ops.len();
         ws.tiling
             .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live, mode));
-        draw_closings(state, out, ws, ops);
+        draw_closings(state, out, ws, ops, mode);
         if ws.tiling.mode() == crate::config::LayoutMode::Scrolling && mode != DrawMode::Rest {
             let now = state.anim_clock.now();
             let dx = ws.tiling.strip.draw_offset_px(now);
@@ -2979,6 +3029,11 @@ fn draw_window(
             .unwrap_or(cfg.decoration.rounding)
             .max(0) as f32
     };
+    // a rule-hidden window leaves the compositor only as a black stand-in
+    if mode != DrawMode::Present && win.rule_no_capture.get() {
+        push_blackout(out, rect, round, ops);
+        return;
+    }
     if win.rule_blur.get() && !win.fullscreen.get() {
         push_blur_backdrop(out, rect, round, ops);
     }
@@ -3140,6 +3195,8 @@ pub struct ClosingWindow {
     pub rect: Rect,
     pub anim: crate::anim::Anim,
     pub style: crate::config::Style,
+    /// the window's capture rule survives it; captures skip the replay
+    pub no_capture: bool,
 }
 
 /// wrap a cached final batch, taking ownership of its textures. a batch
@@ -3152,6 +3209,7 @@ pub fn seize_batch(
     rect: Rect,
     anim: crate::anim::Anim,
     style: crate::config::Style,
+    no_capture: bool,
 ) -> Option<ClosingWindow> {
     let (ops, keys, _) = batch;
     if ops.is_empty() {
@@ -3184,7 +3242,7 @@ pub fn seize_batch(
         out.retired_tex.borrow_mut().extend(keep);
         return None;
     }
-    Some(ClosingWindow { ops, keep, rect, anim, style })
+    Some(ClosingWindow { ops, keep, rect, anim, style, no_capture })
 }
 
 /// seize the window's cached final batch and its textures
@@ -3196,7 +3254,7 @@ pub fn capture_closing(
     style: crate::config::Style,
 ) -> Option<ClosingWindow> {
     let batch = std::mem::take(&mut *win.last_batch.borrow_mut());
-    seize_batch(out, batch, rect, anim, style)
+    seize_batch(out, batch, rect, anim, style, win.rule_no_capture.get())
 }
 
 fn cap_evict(list: &mut Vec<ClosingWindow>) -> Option<ClosingWindow> {
@@ -3228,8 +3286,9 @@ fn draw_closings(
     out: &Rc<Output>,
     ws: &crate::tree::workspace::Workspace,
     ops: &mut Vec<RenderOp>,
+    mode: DrawMode,
 ) {
-    draw_closing_list(state, out, &ws.closing, ops);
+    draw_closing_list(state, out, &ws.closing, ops, mode);
 }
 
 fn draw_closing_list(
@@ -3237,20 +3296,26 @@ fn draw_closing_list(
     out: &Rc<Output>,
     list: &RefCell<Vec<ClosingWindow>>,
     ops: &mut Vec<RenderOp>,
+    mode: DrawMode,
 ) {
     use crate::config::Style;
     let now = state.anim_clock.now();
     let mut list = list.borrow_mut();
-    let mut i = 0;
-    while i < list.len() {
-        if list[i].anim.settled(now) {
-            let cw = list.remove(i);
-            out.retired_tex.borrow_mut().extend(cw.keep);
-            continue;
+    if mode == DrawMode::Present {
+        let mut i = 0;
+        while i < list.len() {
+            if list[i].anim.settled(now) {
+                let cw = list.remove(i);
+                out.retired_tex.borrow_mut().extend(cw.keep);
+                continue;
+            }
+            i += 1;
         }
-        i += 1;
     }
     for c in list.iter() {
+        if c.no_capture && mode != DrawMode::Present {
+            continue;
+        }
         // presence runs 1 -> 0
         let p = c.anim.clamped_value(now);
         let mark = ops.len();
@@ -3472,6 +3537,7 @@ mod tests {
             rect: Rect { x1: x, y1: 0, x2: x + 10, y2: 10 },
             anim: crate::anim::Anim::ease(&clock, 1.0, 0.0, 150, crate::anim::Curve::Linear),
             style: crate::config::Style::Fade,
+            no_capture: false,
         };
         let mut list: Vec<ClosingWindow> = (0..8).map(mk).collect();
         let evicted = cap_evict(&mut list);

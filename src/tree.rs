@@ -159,6 +159,8 @@ pub struct Window {
     pub rule_shadow: Cell<Option<bool>>,
     pub rule_dim: Cell<Option<bool>>,
     pub rule_blur: Cell<bool>,
+    /// captures and casts get a black stand-in instead of this window
+    pub rule_no_capture: Cell<bool>,
     pub anims: RefCell<WinAnims>,
     /// the ops + texture keys/uids this window produced at its last compose,
     /// plus the subrange holding only the surface-tree ops; the close
@@ -221,6 +223,7 @@ impl Window {
             rule_shadow: Cell::new(None),
             rule_dim: Cell::new(None),
             rule_blur: Cell::new(false),
+            rule_no_capture: Cell::new(false),
             anims: RefCell::new(WinAnims::default()),
             last_batch: RefCell::new((Vec::new(), Vec::new(), 0..0)),
         }
@@ -948,6 +951,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     win.rule_shadow.set(fx.shadow);
     win.rule_dim.set(fx.dim);
     win.rule_blur.set(fx.blur.unwrap_or(false));
+    win.rule_no_capture.set(fx.no_capture);
     // a rule can pin the window to a workspace (already 0-based) without switching to it
     let ws = fx
         .workspace

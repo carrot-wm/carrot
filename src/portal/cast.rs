@@ -471,7 +471,13 @@ impl Cast {
                 let Some((idx, w, h)) = crate::output::output_geometry(state, presented) else {
                     return;
                 };
-                (Cap::Out(idx), w, h)
+                // mid-switch the glass blends two workspaces; stream the
+                // rest compose until the animation settles
+                if crate::output::switching(state, presented) {
+                    (Cap::Ws(*index), w, h)
+                } else {
+                    (Cap::Out(idx), w, h)
+                }
             }
         };
         self.push_frame(state, cap, w, h);

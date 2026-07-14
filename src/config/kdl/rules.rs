@@ -105,6 +105,11 @@ pub(super) fn window_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     rule.no_anim = b;
                 }
             }
+            "no-capture" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.no_capture = b;
+                }
+            }
             "rounding" => {
                 if let Some(v) = cx.int(c) {
                     match int_in(v, "rounding", 0, 200) {

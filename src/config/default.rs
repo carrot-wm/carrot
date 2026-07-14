@@ -106,6 +106,8 @@ animations {
 // window-rule {
 //     match app-id=#"^org\.keepassxc\."#
 //     open-floating #true
+//     // screenshares, recordings and screenshots see a black box instead
+//     no-capture
 // }
 
 // layer-rule {

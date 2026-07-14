@@ -958,6 +958,7 @@ fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                     rule.allow_tearing = need_bool(&v, &key).map_err(whine)?;
                 }
                 "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
+                "no_capture" => rule.no_capture = need_bool(&v, &key).map_err(whine)?,
                 "rounding" => {
                     rule.rounding = Some(
                         super::int_in(need_int(&v, &key).map_err(whine)?, "rounding", 0, 200)
