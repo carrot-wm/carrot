@@ -11,12 +11,8 @@ panic-abort-tests = true
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
     # fully static, but keep PIE: eyra's experimental-relocate self-relocates,
-    # so no PT_INTERP while .dynsym survives for --export-dynamic.
+    # so no PT_INTERP while .dynsym survives for --export-dynamic. the link
+    # args themselves live in build.rs so registry installs get them too;
+    # build.rs refuses to build without this flag.
     "-C", "target-feature=+crt-static",
-    # export c-gull into .dynsym so a dlopened lib's libc resolves against us
-    "-C", "link-arg=-Wl,--export-dynamic",
-    # first definition wins, and rustc orders dependents before dependencies:
-    # c-scape's full getauxval shadows origin's few-types shim, and dlopen-rs's
-    # real dl* shadow c-scape's stubs. adds no C - link behaviour only.
-    "-C", "link-arg=-Wl,--allow-multiple-definition",
 ]
