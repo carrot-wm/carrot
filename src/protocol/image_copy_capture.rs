@@ -390,7 +390,14 @@ pub struct IccSession {
     paint_cursors: bool,
     /// one constraint re-burst per size race, cleared by the next attach
     size_debounce: Cell<bool>,
+    /// last successful delivery; paces continuous captures below the
+    /// present rate
+    served: Cell<u64>,
 }
+
+/// continuous captures complete at most ~60 times a second; a skipped
+/// present leaves the frame pending and the next change completes it
+const SERVE_MIN_NS: u64 = 15_000_000;
 
 fn new_session(
     client: &Rc<Client>,
@@ -412,6 +419,7 @@ fn new_session(
         force: Cell::new(true),
         size_debounce: Cell::new(false),
         paint_cursors,
+        served: Cell::new(0),
     })
 }
 
@@ -565,6 +573,7 @@ fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
     }
     sess.status.set(FrameStatus::Ready);
     sess.force.set(false);
+    sess.served.set(crate::util::Time::now().nsec());
     send_ready(sess, frame.id, bw, bh);
 }
 
@@ -810,9 +819,13 @@ pub fn output_presented(state: &Rc<State>, name: &str) {
     if state.icc_sessions.borrow().is_empty() {
         return;
     }
+    let now = crate::util::Time::now().nsec();
     let sessions = state.icc_sessions.borrow().clone();
     for sess in sessions {
         if sess.status.get() != FrameStatus::Capturing {
+            continue;
+        }
+        if now.saturating_sub(sess.served.get()) < SERVE_MIN_NS {
             continue;
         }
         if matches!(&sess.source, SourceKind::Output(n) if n == name) {
@@ -827,9 +840,13 @@ pub fn content_changed(state: &Rc<State>, s: &WlSurface) {
     if state.icc_sessions.borrow().is_empty() {
         return;
     }
+    let now = crate::util::Time::now().nsec();
     let sessions = state.icc_sessions.borrow().clone();
     for sess in sessions {
         if sess.status.get() != FrameStatus::Capturing {
+            continue;
+        }
+        if now.saturating_sub(sess.served.get()) < SERVE_MIN_NS {
             continue;
         }
         let SourceKind::Toplevel(weak) = &sess.source else {

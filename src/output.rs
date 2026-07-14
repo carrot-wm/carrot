@@ -323,6 +323,9 @@ pub struct Output {
     /// capture) drains both into its command buffer
     prepasses: RefCell<Vec<PrePass>>,
     preuploads: RefCell<Vec<PreUpload>>,
+    /// keys captures sampled recently, with the feed time; the sweep
+    /// spares them so cast ticks stop re-importing every frame
+    cast_keep: RefCell<HashMap<(ClientId, u64), u64>>,
     /// card's dev_t, matches logind pause/resume signals
     devnum: u64,
     /// vt elsewhere; render but never commit until resume
@@ -766,6 +769,8 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     let mut ops = Vec::new();
     let mut live = Vec::new();
     draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, 0.0, &mut ops, &mut live);
+    // hidden-window casts land here; spare their textures from the sweep
+    note_cast_keys(&out, &live);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -1495,6 +1500,7 @@ fn init_output(
         retired_tex: RefCell::new(Vec::new()),
         prepasses: RefCell::new(Vec::new()),
         preuploads: RefCell::new(Vec::new()),
+        cast_keep: RefCell::new(HashMap::new()),
         devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
@@ -1887,6 +1893,32 @@ enum CapCursor {
     Never,
 }
 
+/// a cast source stays cached this long after its last feed
+const CAST_KEEP_NS: u64 = 1_000_000_000;
+
+/// captures mark what they sampled; the present sweep leaves those keys
+/// cached so the next tick reuses them
+fn note_cast_keys(out: &Rc<Output>, live: &[((ClientId, u64), u64)]) {
+    let now = Time::now().nsec();
+    let mut keep = out.cast_keep.borrow_mut();
+    for (k, _) in live {
+        keep.insert(*k, now);
+    }
+}
+
+/// how a composition treats animation state
+#[derive(Clone, Copy, PartialEq)]
+enum DrawMode {
+    /// the frame going to glass: full effects, prunes, bakes
+    Present,
+    /// offscreen copy of the live scene: reuse the presents' animation
+    /// visuals, never bake or prune
+    Capture,
+    /// offscreen copy of a hidden scene, pinned to rest: final rects,
+    /// no transforms
+    Rest,
+}
+
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     // presentation feedbacks are claimed only by display composes, never
     // by captures
@@ -1944,6 +1976,13 @@ fn compose_scene(
     cursor: CapCursor,
     ws_override: Option<usize>,
 ) -> Vec<RenderOp> {
+    let mode = if cursor == CapCursor::Present {
+        DrawMode::Present
+    } else if ws_override.is_some() {
+        DrawMode::Rest
+    } else {
+        DrawMode::Capture
+    };
     let mut ops = Vec::new();
     let mut live: Vec<((ClientId, u64), u64)> = Vec::new();
     // a locked session shows nothing but the lock surface; an output
@@ -1955,6 +1994,9 @@ fn compose_scene(
         }
         if cursor != CapCursor::Never {
             draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
+        }
+        if mode != DrawMode::Present {
+            return ops;
         }
         // normal content must not keep textures alive across the lock
         let mut textures = out.textures.borrow_mut();
@@ -1991,14 +2033,18 @@ fn compose_scene(
     // paint order: background, bottom, tiled, fullscreen, floats, top,
     // overlay, layer popups; fullscreen hides everything below itself
     // except overlay
+    // rest composes pin layers too: no anim transforms, no prunes
+    let lrest = mode == DrawMode::Rest;
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live, false);
-        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live, false);
+        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live, lrest);
+        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live, lrest);
     }
     let sw = out.ws_switch.borrow().clone();
     let now = state.anim_clock.now();
     match &sw {
-        Some(s) if !s.anim.settled(now) => {
+        // a live switch belongs to the glass; rest composes show their
+        // workspace in place
+        Some(s) if mode != DrawMode::Rest && !s.anim.settled(now) => {
             let p = s.anim.clamped_value(now);
             // full ndc span plus a tenth of it as the gap between scenes
             let step = 2.2 * s.dist;
@@ -2007,28 +2053,28 @@ fn compose_scene(
             let from = state.workspaces.borrow().get(s.from_ws).cloned();
             if let Some(from) = from {
                 let mark = ops.len();
-                ws_scene(state, out, &from, &focused, &cfg, screen, &mut ops, &mut live);
+                ws_scene(state, out, &from, &focused, &cfg, screen, &mut ops, &mut live, mode);
                 let d = if s.vert { [0.0, off_out as f32] } else { [off_out as f32, 0.0] };
                 apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_out, d, out_dims(out));
             }
             let mark = ops.len();
-            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live);
+            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live, mode);
             let d = if s.vert { [0.0, off_in as f32] } else { [off_in as f32, 0.0] };
             apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_in, d, out_dims(out));
             out.anim_pending.set(true);
         }
         _ => {
-            if sw.is_some() {
+            if sw.is_some() && mode == DrawMode::Present {
                 *out.ws_switch.borrow_mut() = None;
             }
-            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live);
+            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live, mode);
         }
     }
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live, false);
+        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live, lrest);
         draw_closing_list(state, out, &out.closing_layers, &mut ops);
     }
-    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live, false);
+    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live, lrest);
     draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
     // a drag icon rides the pointer, above everything but the cursor
     if ws_override.is_none() {
@@ -2046,15 +2092,25 @@ fn compose_scene(
         draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
     }
 
-    // an override composes a side scene; only the present retires textures
+    // an override composes a side scene: mark its sources so the present
+    // sweep keeps them cached between ticks instead of evict/import churn
     if ws_override.is_some() {
+        note_cast_keys(out, &live);
         return ops;
     }
-    // textures for gone buffers don't outlive the frame
+    // captures observe; only the present's sweep evicts
+    if mode != DrawMode::Present {
+        return ops;
+    }
+    // textures for gone buffers don't outlive the frame, except cast
+    // sources fed within the last second
+    let now_ns = Time::now().nsec();
+    let mut keep = out.cast_keep.borrow_mut();
+    keep.retain(|_, t| now_ns.saturating_sub(*t) < CAST_KEEP_NS);
     let mut textures = out.textures.borrow_mut();
     let stale: Vec<_> = textures
         .keys()
-        .filter(|k| !live.iter().any(|(lk, _)| lk == *k))
+        .filter(|k| !live.iter().any(|(lk, _)| lk == *k) && !keep.contains_key(*k))
         .copied()
         .collect();
     for k in stale {
@@ -2655,6 +2711,7 @@ fn push_blur_backdrop(out: &Rc<Output>, r: Rect, round: f32, ops: &mut Vec<Rende
 }
 
 /// one workspace's content: tiled, closings, fullscreen, floats
+#[allow(clippy::too_many_arguments)]
 fn ws_scene(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -2664,31 +2721,32 @@ fn ws_scene(
     screen: Rect,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<((ClientId, u64), u64)>,
+    mode: DrawMode,
 ) {
     let fs = ws.fullscreen.borrow().clone();
     if fs.is_none() {
         let mark = ops.len();
         ws.tiling
-            .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live));
+            .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live, mode));
         draw_closings(state, out, ws, ops);
-        if ws.tiling.mode() == crate::config::LayoutMode::Scrolling {
+        if ws.tiling.mode() == crate::config::LayoutMode::Scrolling && mode != DrawMode::Rest {
             let now = state.anim_clock.now();
             let dx = ws.tiling.strip.draw_offset_px(now);
             if dx.abs() >= 0.5 {
                 let d = [(dx / out.width as f64 * 2.0) as f32, 0.0];
                 apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, 1.0, d, out_dims(out));
                 out.anim_pending.set(true);
-            } else {
+            } else if mode == DrawMode::Present {
                 *ws.tiling.strip.view_anim.borrow_mut() = None;
             }
         }
     }
     if let Some(f) = &fs {
-        draw_window(state, out, focused, cfg, screen, f, ops, live);
+        draw_window(state, out, focused, cfg, screen, f, ops, live, mode);
     }
     if fs.is_none() || cfg.layout.float_above_fullscreen {
         for win in ws.floats.borrow().iter() {
-            draw_window(state, out, focused, cfg, screen, win, ops, live);
+            draw_window(state, out, focused, cfg, screen, win, ops, live, mode);
         }
     }
 }
@@ -2817,12 +2875,26 @@ fn draw_resize_xfade(
         .borrow_mut()
         .push(PrePass::new(live_tex, Some([0.0; 4]), tmp));
     live.extend(tl);
+    push_xfade_op(out, arect, round, progress, rz.snapshot.as_ref().unwrap(), live_tex, ops);
+    true
+}
+
+/// the mixing quad between two baked sides of a resize
+fn push_xfade_op(
+    out: &Rc<Output>,
+    arect: Rect,
+    round: f32,
+    progress: f64,
+    from: &Texture,
+    to: &Texture,
+    ops: &mut Vec<RenderOp>,
+) {
     let (gx, gy) = out.pos.get();
     let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
     let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
     ops.push(RenderOp::Xfade {
-        from_view: rz.snapshot.as_ref().unwrap().view,
-        to_view: live_tex.view,
+        from_view: from.view,
+        to_view: to.view,
         pos: [fxp(arect.x1), fyp(arect.y1)],
         size: [
             arect.width() as f32 / out.width as f32 * 2.0,
@@ -2837,9 +2909,9 @@ fn draw_resize_xfade(
         ],
         radius: round,
     });
-    true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_window(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -2849,6 +2921,7 @@ fn draw_window(
     win: &Rc<crate::tree::Window>,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<((ClientId, u64), u64)>,
+    mode: DrawMode,
 ) {
     let surface = win.surface();
     if !surface.mapped.get() {
@@ -2856,20 +2929,29 @@ fn draw_window(
     }
     let mark = ops.len();
     let lmark = live.len();
-    let rect = win.visual_rect(state);
+    let rect = if mode == DrawMode::Rest {
+        win.rect.get()
+    } else {
+        win.visual_rect(state)
+    };
     // a settled crossfade retires its textures; a live one shrinks the
-    // drawn rect to the animated size
-    let rz_progress = {
+    // drawn rect to the animated size. only presents prune - captures
+    // observing a settled anim just draw plainly
+    let rz_progress = if mode == DrawMode::Rest {
+        None
+    } else {
         let now = state.anim_clock.now();
         let mut m = win.anims.borrow_mut();
         match &mut m.resize {
             Some(rz) if rz.anim.settled(now) => {
-                let mut q = state.retire_tex.borrow_mut();
-                q.extend(rz.snapshot.take());
-                q.extend(rz.live.take());
-                m.resize = None;
-                // one more compose drains the retire queue it just fed
-                out.anim_pending.set(true);
+                if mode == DrawMode::Present {
+                    let mut q = state.retire_tex.borrow_mut();
+                    q.extend(rz.snapshot.take());
+                    q.extend(rz.live.take());
+                    m.resize = None;
+                    // one more compose drains the retire queue it just fed
+                    out.anim_pending.set(true);
+                }
                 None
             }
             Some(rz) => Some((rz.anim.clamped_value(now), rz.from)),
@@ -2951,17 +3033,29 @@ fn draw_window(
     let smark = ops.len();
     let mut xfaded = false;
     if let Some((p, _)) = rz_progress {
-        xfaded = draw_resize_xfade(out, win, rect, round, p, ops, live);
-        if !xfaded {
-            // degrade: snap the crossfade, draw plainly
-            let mut m = win.anims.borrow_mut();
-            if let Some(rz) = &mut m.resize {
-                let mut q = state.retire_tex.borrow_mut();
-                q.extend(rz.snapshot.take());
-                q.extend(rz.live.take());
+        if mode == DrawMode::Present {
+            xfaded = draw_resize_xfade(out, win, rect, round, p, ops, live);
+            if !xfaded {
+                // degrade: snap the crossfade, draw plainly
+                let mut m = win.anims.borrow_mut();
+                if let Some(rz) = &mut m.resize {
+                    let mut q = state.retire_tex.borrow_mut();
+                    q.extend(rz.snapshot.take());
+                    q.extend(rz.live.take());
+                }
+                m.resize = None;
+                out.anim_pending.set(true);
             }
-            m.resize = None;
-            out.anim_pending.set(true);
+        } else {
+            // captures reuse whatever the presents already baked; a
+            // missing side draws plain, snapping nothing
+            let m = win.anims.borrow();
+            if let Some(rz) = &m.resize {
+                if let (Some(snap), Some(livet)) = (&rz.snapshot, &rz.live) {
+                    push_xfade_op(out, rect, round, p, snap, livet, ops);
+                    xfaded = true;
+                }
+            }
         }
     }
     if !xfaded {
@@ -3018,7 +3112,7 @@ fn draw_window(
     }
     let open = win.anims.borrow().open.clone();
     if let Some((a, style)) = open {
-        if !win.fullscreen.get() {
+        if !win.fullscreen.get() && mode != DrawMode::Rest {
             use crate::config::Style;
             let p = a.clamped_value(state.anim_clock.now());
             let (scale, alpha, d) = match &style {

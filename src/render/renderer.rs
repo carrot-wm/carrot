@@ -252,6 +252,17 @@ pub struct PreUpload {
     undefined: bool,
 }
 
+/// offscreen target + readback buffer the captures reuse call to call
+struct CaptureTarget {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    buffer: vk::Buffer,
+    bmem: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+}
+
 /// a submitted frame. wait() is for bring-up and captures; the present
 /// loop exports the fence instead and never blocks.
 pub struct Frame {
@@ -315,6 +326,7 @@ pub struct Renderer {
     pool: vk::CommandPool,
     free_cbs: RefCell<Vec<vk::CommandBuffer>>,
     tex_uid: Cell<u64>,
+    capture: RefCell<Option<CaptureTarget>>,
 }
 
 impl Renderer {
@@ -486,6 +498,7 @@ impl Renderer {
             pool,
             free_cbs: RefCell::new(Vec::new()),
             tex_uid: Cell::new(0),
+            capture: RefCell::new(None),
         })
     }
 
@@ -547,7 +560,39 @@ impl Renderer {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        self.record_pre(cb, &uploads, &passes);
 
+        // take the target from the display side, hand it back after
+        let acquire = image_barrier(target.image)
+            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .dst_queue_family_index(self.core.queue_family)
+            .old_layout(if target.undefined {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                vk::ImageLayout::GENERAL
+            })
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+            );
+        let release = image_barrier(target.image)
+            .src_queue_family_index(self.core.queue_family)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+            );
+        self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
+        unsafe { dev.end_command_buffer(cb) }?;
+        self.submit_frame(cb, waits, uploads)
+    }
+
+    /// staging copies, then the offscreen pre-passes in list order
+    fn record_pre(&self, cb: vk::CommandBuffer, uploads: &[PreUpload], passes: &[PrePass]) {
+        let dev = &self.core.device;
         if !uploads.is_empty() {
             let to_dst: Vec<_> = uploads
                 .iter()
@@ -566,7 +611,7 @@ impl Renderer {
                 })
                 .collect();
             barrier2(dev, cb, &to_dst);
-            for u in &uploads {
+            for u in uploads {
                 let region = vk::BufferImageCopy::default()
                     .image_subresource(
                         vk::ImageSubresourceLayers::default()
@@ -603,7 +648,7 @@ impl Renderer {
             barrier2(dev, cb, &to_sample);
         }
 
-        for p in &passes {
+        for p in passes {
             // src fragment stage: the previous frame (or an earlier pass)
             // may still be sampling this target when the writes start
             let acquire = image_barrier(p.image)
@@ -628,34 +673,17 @@ impl Renderer {
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
             self.record_pass(cb, p.view, p.width, p.height, p.clear, &p.ops, acquire, release);
         }
+    }
 
-        // take the target from the display side, hand it back after
-        let acquire = image_barrier(target.image)
-            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .dst_queue_family_index(self.core.queue_family)
-            .old_layout(if target.undefined {
-                vk::ImageLayout::UNDEFINED
-            } else {
-                vk::ImageLayout::GENERAL
-            })
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
-            );
-        let release = image_barrier(target.image)
-            .src_queue_family_index(self.core.queue_family)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
-            );
-        self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
-        unsafe { dev.end_command_buffer(cb) }?;
-
-        // exportable fence so the commit path can take a sync_file
+    /// exportable fence so the commit path can take a sync_file; failure
+    /// releases everything the frame would have owned
+    fn submit_frame(
+        &self,
+        cb: vk::CommandBuffer,
+        waits: Vec<vk::Semaphore>,
+        staging: Vec<PreUpload>,
+    ) -> Result<Frame, RenderError> {
+        let dev = &self.core.device;
         let mut export = vk::ExportFenceCreateInfo::default()
             .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
         let fence_info = vk::FenceCreateInfo::default().push_next(&mut export);
@@ -680,7 +708,7 @@ impl Renderer {
                 for s in &waits {
                     dev.destroy_semaphore(*s, None);
                 }
-                for u in &uploads {
+                for u in &staging {
                     dev.destroy_buffer(u.buffer, None);
                     dev.free_memory(u.memory, None);
                 }
@@ -688,7 +716,7 @@ impl Renderer {
             self.free_cbs.borrow_mut().push(cb);
             return Err(e.into());
         }
-        Ok(Frame { cb, fence, waits, staging: uploads })
+        Ok(Frame { cb, fence, waits, staging })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1438,19 +1466,20 @@ impl Renderer {
         })
     }
 
-    /// render pending uploads/pre-passes + ops into an offscreen image and
-    /// read the pixels back as tightly packed rows. screenshot-grade: fully
-    /// synchronous.
-    #[allow(clippy::too_many_arguments)]
-    pub fn read_frame(
-        &self,
-        w: u32,
-        h: u32,
-        uploads: Vec<PreUpload>,
-        passes: Vec<PrePass>,
-        ops: &[RenderOp],
-        waits: Vec<vk::Semaphore>,
-    ) -> Result<Vec<u8>, RenderError> {
+    /// the persistent capture target + readback buffer; rebuilt on a size
+    /// change, gpu-idle by construction (read_frame waits before returning)
+    fn ensure_capture(&self, w: u32, h: u32) -> Result<(), RenderError> {
+        if self
+            .capture
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.width == w && c.height == h)
+        {
+            return Ok(());
+        }
+        if let Some(old) = self.capture.borrow_mut().take() {
+            self.destroy_capture(&old);
+        }
         let dev = &self.core.device;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1477,24 +1506,6 @@ impl Renderer {
         let view = self.create_target_view(image)?;
         let view_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image_view(view, None) });
 
-        let target = FrameTarget {
-            image,
-            view,
-            width: w,
-            height: h,
-            undefined: true,
-        };
-        let frame = self.render_frame(
-            uploads,
-            passes,
-            &target,
-            Some([0.0, 0.0, 0.0, 1.0]),
-            ops,
-            waits,
-        )?;
-        frame.wait(self)?;
-
-        // staging buffer, host visible
         let size = (w as u64) * (h as u64) * 4;
         let binfo = vk::BufferCreateInfo::default()
             .size(size)
@@ -1511,51 +1522,100 @@ impl Renderer {
             .allocation_size(breqs.size)
             .memory_type_index(btype);
         let bmem = unsafe { dev.allocate_memory(&balloc, None) }?;
-        let bmem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(bmem, None) });
         unsafe { dev.bind_buffer_memory(buffer, bmem, 0) }?;
+        std::mem::forget(buf_guard);
+        std::mem::forget(view_guard);
+        std::mem::forget(mem_guard);
+        std::mem::forget(img_guard);
+        *self.capture.borrow_mut() = Some(CaptureTarget {
+            image,
+            memory,
+            view,
+            buffer,
+            bmem,
+            width: w,
+            height: h,
+        });
+        Ok(())
+    }
 
-        // one-shot copy; render released the target to GENERAL
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(self.core.queue_family);
-        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
-        let pool_guard = crate::util::OnDrop(|| unsafe { dev.destroy_command_pool(pool, None) });
-        let cba = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cb = unsafe { dev.allocate_command_buffers(&cba) }?[0];
+    fn destroy_capture(&self, c: &CaptureTarget) {
+        let dev = &self.core.device;
+        unsafe {
+            dev.destroy_image_view(c.view, None);
+            dev.destroy_image(c.image, None);
+            dev.free_memory(c.memory, None);
+            dev.destroy_buffer(c.buffer, None);
+            dev.free_memory(c.bmem, None);
+        }
+    }
+
+    /// render pending uploads/pre-passes + ops offscreen and read the
+    /// pixels back as tightly packed rows. one submit, one fence wait;
+    /// the target and readback buffer persist across calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_frame(
+        &self,
+        w: u32,
+        h: u32,
+        uploads: Vec<PreUpload>,
+        passes: Vec<PrePass>,
+        ops: &[RenderOp],
+        waits: Vec<vk::Semaphore>,
+    ) -> Result<Vec<u8>, RenderError> {
+        let dev = &self.core.device;
+        self.ensure_capture(w, h)?;
+        let slot = self.capture.borrow();
+        let cap = slot.as_ref().unwrap();
+        let cb = self.take_cb()?;
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        self.record_pre(cb, &uploads, &passes);
+        // every capture clears, so the old contents can be discarded; the
+        // previous read finished before the last call returned
+        let acquire = image_barrier(cap.image)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+            );
+        let release = image_barrier(cap.image)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ);
+        self.record_pass(cb, cap.view, w, h, Some([0.0, 0.0, 0.0, 1.0]), ops, acquire, release);
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
         unsafe {
-            dev.begin_command_buffer(cb, &begin)?;
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
-            dev.cmd_copy_image_to_buffer(cb, image, vk::ImageLayout::GENERAL, buffer, &[region]);
+            dev.cmd_copy_image_to_buffer(
+                cb,
+                cap.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                cap.buffer,
+                &[region],
+            );
             dev.end_command_buffer(cb)?;
-            let cbs = [cb];
-            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-            dev.queue_submit(self.core.queue, &[submit], vk::Fence::null())?;
-            dev.queue_wait_idle(self.core.queue)?;
         }
+        let frame = self.submit_frame(cb, waits, uploads)?;
+        frame.wait(self)?;
 
+        let size = (w as u64) * (h as u64) * 4;
         let mut out = vec![0u8; size as usize];
         unsafe {
-            let ptr = dev.map_memory(bmem, 0, size, vk::MemoryMapFlags::empty())?;
+            let ptr = dev.map_memory(cap.bmem, 0, size, vk::MemoryMapFlags::empty())?;
             std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), size as usize);
-            dev.unmap_memory(bmem);
+            dev.unmap_memory(cap.bmem);
         }
-        drop(pool_guard);
-        drop(bmem_guard);
-        drop(buf_guard);
-        drop(view_guard);
-        drop(mem_guard);
-        drop(img_guard);
         Ok(out)
     }
 
@@ -1654,6 +1714,12 @@ pub struct Texture {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let dev = &self.core.device;
+        if let Some(c) = self.capture.borrow_mut().take() {
+            unsafe {
+                let _ = dev.device_wait_idle();
+            }
+            self.destroy_capture(&c);
+        }
         unsafe {
             let _ = dev.device_wait_idle();
             dev.destroy_pipeline(self.pipes.fill_opaque, None);
