@@ -106,10 +106,10 @@
               enable = lib.mkEnableOption "Carrot, a pure Rust wayland compositor";
               package = lib.mkPackageOption self.packages.${pkgs.system}.carrot { };
               settings = mkOption {
-                type = types.suboption {
+                type = types.submodule {
                   options = {
                     binds = mkOption {
-                      type = types.listOf (types.suboption {
+                      type = types.listOf (types.submodule {
                         options = {
                           chord = mkOption {
                             type = types.str;
