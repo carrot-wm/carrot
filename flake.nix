@@ -196,7 +196,7 @@
                                   type = types.str;
                                 };
                                 accel_speed = mkOption {
-                                  type = types.numbers.between -1.0 1.0;
+                                  type = types.numbers.between (-1.0) 1.0;
                                 };
                                 natural_scroll = mkOption {
                                   type = types.bool;
@@ -211,7 +211,7 @@
                                   type = types.str;
                                 };
                                 accel_speed = mkOption {
-                                  type = types.numbers.between -1.0 1.0;
+                                  type = types.numbers.between (-1.0) 1.0;
                                 };
                                 natural_scroll = mkOption {
                                   type = types.bool;
@@ -223,7 +223,7 @@
                             type = types.listOf (types.submodule {
                               options = {
                                 accel_speed = mkOption {
-                                  type = types.numbers.between -1.0 1.0;
+                                  type = types.numbers.between (-1.0) 1.0;
                                 };
                                 accel_profile = mkOption {
                                   type = types.str;
@@ -358,7 +358,7 @@
                                   type = types.str;
                                 };
                                 offset = mkOption {
-                                  type = types.listOf types.ints.between -500 500;
+                                  type = types.listOf (types.ints.between (-500) 500);
                                 };
                                 power = mkOption {
                                   type = types.numbers.between 0.5 8.0;
@@ -379,7 +379,7 @@
                             type = types.submodule {
                               options = {
                                 preset_widths = mkOption {
-                                  type = types.listOf types.numbers.between 0.05 1.0;
+                                  type = types.listOf (types.numbers.between 0.05 1.0);
                                 };
                                 default_width = mkOption {
                                   type = types.numbers.between 0.05 1.0;
@@ -486,13 +486,11 @@
                     debug = mkOption {
                       type = types.submodule {
                         options = {
-                          type = types.submodule {
-                            render_drm_device = mkOption {
-                              type = types.str;
-                            };
-                            ignore_drm_device = mkOption {
-                              type = types.str;
-                            };
+                          render_drm_device = mkOption {
+                            type = types.str;
+                          };
+                          ignore_drm_device = mkOption {
+                            type = types.str;
                           };
                         };
                       };
