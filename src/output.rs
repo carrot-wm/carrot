@@ -369,6 +369,10 @@ pub struct Output {
     gpu_done: crate::util::AsyncQueue<CleanupJob>,
     /// late-latch scheduler state
     sched: Sched,
+    /// direct-scanout state; the queued flip's zero-copy-ness rides along
+    /// for its presentation feedback
+    scanout: RefCell<ScanoutState>,
+    inflight_zero_copy: Cell<bool>,
 }
 
 /// everything whose lifetime ends at a frame's render fence
@@ -427,6 +431,32 @@ impl Sched {
         self.ewma_cpu.get() + self.ewma_gpu.get() + self.margin.get().max(floor_ns)
     }
 }
+
+/// direct-scanout bookkeeping: the client buffer on the primary plane,
+/// the one the queued flip is replacing, and the fb cache
+#[derive(Default)]
+struct ScanoutState {
+    /// on glass, or queued to be
+    cur: Option<Rc<crate::protocol::shm::WlBuffer>>,
+    /// replaced by the in-flight flip; releases at its flip-done
+    prev: Option<Rc<crate::protocol::shm::WlBuffer>>,
+    /// per-buffer drm framebuffers, keyed by wl_buffer uid
+    fbs: HashMap<u64, ScanoutFb>,
+    /// gem handles are deduplicated by the kernel per drm fd, so two fbs
+    /// over one bo share handles; close only when the last user goes
+    handles: HashMap<u32, u32>,
+    /// monotonically counts scanout flips; ages cache entries
+    tick: u64,
+}
+
+struct ScanoutFb {
+    fb: u32,
+    handles: Vec<u32>,
+    last_used: u64,
+}
+
+/// cache entries idle this many scanout flips get evicted
+const SCANOUT_FB_IDLE: u64 = 600;
 
 /// how many misses in a row park late-latching, and how many met deadlines
 /// afterwards un-park it
@@ -1612,6 +1642,8 @@ fn init_output(
         blur_dirty: Cell::new(true),
         gpu_done: crate::util::AsyncQueue::default(),
         sched: Sched::default(),
+        scanout: RefCell::new(ScanoutState::default()),
+        inflight_zero_copy: Cell::new(false),
     })
 }
 
@@ -1664,6 +1696,235 @@ fn sched_note_flip(out: &Rc<Output>) {
         if clean >= CLEAN_RESTORE && sched.fallback.replace(false) {
             crate::trace!("late-latch restored after {} met deadlines", clean);
         }
+    }
+}
+
+/// a frame that is exactly one client buffer needs no compose at all: the
+/// buffer goes on the primary plane and the gpu stays idle. eligibility
+/// mirrors what a present compose would draw - anything beyond the bare
+/// fullscreen surface falls back to compositing
+fn scanout_candidate(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+) -> Option<(Rc<WlSurface>, Rc<crate::protocol::shm::WlBuffer>)> {
+    if crate::protocol::session_lock::locked(state) || tearing_wanted(state, out) {
+        return None;
+    }
+    if out.anim_pending.get() || out.ws_switch.borrow().is_some() {
+        return None;
+    }
+    // a composited cursor or drag icon needs pixels
+    {
+        let d = state.display.borrow();
+        let d = d.as_ref()?;
+        let plane_less = out.conn.pipe.borrow().as_ref().is_none_or(|p| p.cursor.is_none());
+        if let Some(seat) = state.seat.borrow().clone() {
+            if (d.sw.get() || plane_less)
+                && !d.sw_hidden.get()
+                && !out.cursor_locked.get()
+                && d.sw_image.borrow().is_some()
+                && out.rect().contains(seat.ptr_x.get() as i32, seat.ptr_y.get() as i32)
+            {
+                return None;
+            }
+            if seat.data.drag().is_some_and(|drag| drag.icon.borrow().is_some()) {
+                return None;
+            }
+        }
+    }
+    let ws = state.workspaces.borrow().get(out.ws.get())?.clone();
+    let win = ws.fullscreen.borrow().clone()?;
+    let cfg = state.config.borrow();
+    if cfg.layout.float_above_fullscreen && !ws.floats.borrow().is_empty() {
+        return None;
+    }
+    drop(cfg);
+    // overlay layers draw above fullscreen
+    if state.layers.borrow().iter().any(|ls| {
+        ls.current.get().layer == crate::shell::layer::OVERLAY
+            && ls.mapped()
+            && ls.output.get() == out.index.get()
+    }) {
+        return None;
+    }
+    if win.anims_live(state.anim_clock.now()) || win.rule_opacity.get().unwrap_or(1.0) < 1.0 {
+        return None;
+    }
+    let surface = win.surface();
+    if !surface.mapped.get() {
+        return None;
+    }
+    if surface
+        .children
+        .borrow()
+        .as_ref()
+        .is_some_and(|ch| ch.below.iter().chain(ch.above.iter()).any(|e| !e.pending.get()))
+    {
+        return None;
+    }
+    if let Some(tl) = win.xdg_opt() {
+        let mut popups = false;
+        tl.xdg.for_each_popup(|p| popups |= p.xdg.surface.mapped.get());
+        if popups {
+            return None;
+        }
+    }
+    if surface.transform.get() != crate::surface::Transform::Normal || surface.scale.get() != 1 {
+        return None;
+    }
+    let buf = surface.buffer.borrow().as_ref()?.buf.clone();
+    let img = buf.dmabuf()?;
+    // the buffer must be the whole frame: mode-sized, geometry-aligned,
+    // and with no alpha for the plane to blend
+    if buf.rect.width() != out.width as i32
+        || buf.rect.height() != out.height as i32
+        || buf.format.has_alpha()
+    {
+        return None;
+    }
+    let geo = win.geometry();
+    if geo != Rect::new_sized_saturating(0, 0, buf.rect.width(), buf.rect.height())
+        || win.rect.get() != out.rect()
+    {
+        return None;
+    }
+    // the primary plane has to take this format+modifier as-is
+    {
+        let pipe = out.conn.pipe.borrow();
+        let plane = &pipe.as_ref()?.primary;
+        if !plane.supports(buf.format.drm) {
+            return None;
+        }
+        let mods = plane.modifiers(buf.format.drm);
+        if mods.is_empty() {
+            // no IN_FORMATS: only implicit/linear layouts are expressible
+            if img.modifier != 0 {
+                return None;
+            }
+        } else if !mods.contains(&img.modifier) {
+            return None;
+        }
+    }
+    Some((surface, buf))
+}
+
+/// the drm framebuffer for a client buffer, imported once per wl_buffer
+fn scanout_fb(out: &Rc<Output>, buf: &Rc<crate::protocol::shm::WlBuffer>) -> Option<u32> {
+    use crate::drm::sys;
+    let mut st = out.scanout.borrow_mut();
+    let tick = st.tick + 1;
+    st.tick = tick;
+    if let Some(e) = st.fbs.get_mut(&buf.uid) {
+        e.last_used = tick;
+        return Some(e.fb);
+    }
+    let img = buf.dmabuf()?;
+    let fd = out.dev.fd.as_fd();
+    let mut handles = Vec::new();
+    let mut pitches = Vec::new();
+    let mut offsets = Vec::new();
+    for plane in &img.planes {
+        match sys::prime_fd_to_handle(fd, plane.fd.as_fd()) {
+            Ok(h) => {
+                *st.handles.entry(h).or_insert(0) += 1;
+                handles.push(h);
+                pitches.push(plane.stride);
+                offsets.push(plane.offset);
+            }
+            Err(e) => {
+                crate::trace!("scanout: prime import failed: {e}");
+                scanout_release_handles(&mut st, fd, &handles);
+                return None;
+            }
+        }
+    }
+    // IN_FORMATS present means the kernel takes explicit modifiers
+    let explicit = out
+        .conn
+        .pipe
+        .borrow()
+        .as_ref()
+        .map(|p| !p.primary.modifiers(buf.format.drm).is_empty())
+        .unwrap_or(false);
+    let modifier = explicit.then_some(img.modifier);
+    let fb = match sys::addfb2(
+        fd,
+        buf.rect.width() as u32,
+        buf.rect.height() as u32,
+        buf.format.drm,
+        &handles,
+        &pitches,
+        &offsets,
+        modifier,
+    ) {
+        Ok(fb) => fb,
+        Err(e) => {
+            crate::trace!("scanout: addfb2 failed: {e}");
+            scanout_release_handles(&mut st, fd, &handles);
+            return None;
+        }
+    };
+    st.fbs.insert(buf.uid, ScanoutFb { fb, handles, last_used: tick });
+    // age out fbs of buffers the client stopped rotating through
+    let keep_cur = st.cur.as_ref().map(|b| b.uid);
+    let keep_prev = st.prev.as_ref().map(|b| b.uid);
+    let stale: Vec<u64> = st
+        .fbs
+        .iter()
+        .filter(|(uid, e)| {
+            tick.saturating_sub(e.last_used) > SCANOUT_FB_IDLE
+                && Some(**uid) != keep_cur
+                && Some(**uid) != keep_prev
+        })
+        .map(|(uid, _)| *uid)
+        .collect();
+    for uid in stale {
+        if let Some(e) = st.fbs.remove(&uid) {
+            let _ = sys::rmfb(fd, e.fb);
+            scanout_release_handles(&mut st, fd, &e.handles);
+        }
+    }
+    Some(fb)
+}
+
+fn scanout_release_handles(
+    st: &mut ScanoutState,
+    fd: std::os::fd::BorrowedFd<'_>,
+    handles: &[u32],
+) {
+    for h in handles {
+        if let Some(rc) = st.handles.get_mut(h) {
+            *rc -= 1;
+            if *rc == 0 {
+                st.handles.remove(h);
+                let _ = crate::drm::sys::gem_close(fd, *h);
+            }
+        }
+    }
+}
+
+/// a buffer left the plane: its parked attachment may release now
+fn scanout_retire(state: &Rc<State>, buf: &Rc<crate::protocol::shm::WlBuffer>) {
+    let mut uids = state.scanout_uids.borrow_mut();
+    if let Some(i) = uids.iter().position(|&u| u == buf.uid) {
+        uids.swap_remove(i);
+    }
+    let gone = !uids.contains(&buf.uid);
+    drop(uids);
+    if gone {
+        // dropping the attachment sends the release
+        state.scanout_hold.borrow_mut().retain(|a| a.buf.uid != buf.uid);
+    }
+}
+
+/// drop every plane reference this output holds (vt away, flip errors)
+fn scanout_reset(state: &Rc<State>, out: &Rc<Output>) {
+    let (cur, prev) = {
+        let mut st = out.scanout.borrow_mut();
+        (st.cur.take(), st.prev.take())
+    };
+    for b in [cur, prev].into_iter().flatten() {
+        scanout_retire(state, &b);
     }
 }
 
@@ -1766,6 +2027,9 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             if out.inflight_vsync.get() {
                 flags |= crate::protocol::presentation::FLAG_VSYNC;
             }
+            if out.inflight_zero_copy.get() {
+                flags |= crate::protocol::presentation::FLAG_ZERO_COPY;
+            }
             crate::trace!(
                 "fb-present: n={} seq={} flip_t={}.{:06} t={}",
                 out.inflight_fbs.borrow().len(),
@@ -1776,6 +2040,13 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             );
             for fb in out.inflight_fbs.borrow_mut().drain(..) {
                 fb.presented(&out.conn.name, sec, usec * 1000, refresh, out.conn.seq64.get(), flags);
+            }
+        }
+        // the completed flip replaced whatever was on the plane before it
+        if !out.conn.flip_pending.get() {
+            let prev = out.scanout.borrow_mut().prev.take();
+            if let Some(p) = prev {
+                scanout_retire(state, &p);
             }
         }
         dirty |= out.damage.take();
@@ -1802,6 +2073,60 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         }
         dirty = false;
         let latch_ns = Time::now().nsec();
+
+        // one client buffer as the whole frame: onto the plane, no render
+        if let Some((surface, buf)) = scanout_candidate(state, out) {
+            if let Some(fb) = scanout_fb(out, &buf) {
+                let fence = buf.dmabuf().and_then(|img| img.read_fence());
+                out.conn.vrr_want.set(vrr_wanted(state, out));
+                match out.conn.flip(&out.dev, fb, fence.as_ref().map(|f| f.as_raw_fd())) {
+                    Ok(FlipResult::Queued) => {
+                        out.inflight_vsync.set(true);
+                        out.inflight_zero_copy.set(true);
+                        if aim_ns != 0 {
+                            out.sched.target_ns.set(aim_ns);
+                        }
+                        // no compose collected these; they ride directly
+                        out.inflight_fbs
+                            .borrow_mut()
+                            .append(&mut surface.latched_feedbacks.borrow_mut());
+                        surface.shown.set(true);
+                        {
+                            let mut st = out.scanout.borrow_mut();
+                            if st.cur.as_ref().is_none_or(|c| c.uid != buf.uid) {
+                                state.scanout_uids.borrow_mut().push(buf.uid);
+                                st.prev = st.cur.replace(buf.clone());
+                            }
+                        }
+                        fire_callback_sweep(state);
+                        // captures compose their own copy of the scene; a
+                        // scanout frame still owes them the new-frame kick
+                        crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
+                        crate::protocol::session_lock::output_presented(state, &out.conn.name);
+                        crate::portal::cast::output_presented(state, &out.conn.name);
+                        continue;
+                    }
+                    Ok(FlipResult::NotPresented) => {
+                        dirty = true;
+                        out.damage.trigger();
+                        continue;
+                    }
+                    Err(crate::drm::device::DrmError::LostMaster) => {
+                        for fb in out.inflight_fbs.borrow_mut().drain(..) {
+                            fb.discarded();
+                        }
+                        scanout_reset(state, out);
+                        out.paused.set(true);
+                        dirty = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        // odd rejection: the composite path still owes a frame
+                        crate::trace!("scanout flip failed: {e}");
+                    }
+                }
+            }
+        }
 
         let back = 1 - out.front.get();
         let buf = &out.bufs[back];
@@ -1892,6 +2217,12 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                     out.sched.target_ns.set(aim_ns);
                     Sched::ewma(&out.sched.ewma_cpu, submit_ns.saturating_sub(latch_ns));
                 }
+                // a composited frame replaces any client buffer on the plane
+                out.inflight_zero_copy.set(false);
+                let mut st = out.scanout.borrow_mut();
+                if let Some(c) = st.cur.take() {
+                    st.prev = Some(c);
+                }
             }
             Ok(FlipResult::NotPresented) => {
                 // the pipe was momentarily busy (a cursor commit can hold
@@ -1909,6 +2240,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 for fb in out.inflight_fbs.borrow_mut().drain(..) {
                     fb.discarded();
                 }
+                scanout_reset(state, out);
                 out.paused.set(true);
                 dirty = true;
             }

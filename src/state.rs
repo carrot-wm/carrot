@@ -70,6 +70,11 @@ pub struct State {
     pub dpms_off: std::cell::Cell<bool>,
     /// replaced dmabuf attachments; released after the next present's fence
     pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
+    /// attachments whose buffer sits on a plane (direct scanout); they
+    /// release when the buffer leaves it, not when render frames drain
+    pub scanout_hold: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
+    /// buffer uids currently on (or queued to) a plane, one entry per output
+    pub scanout_uids: RefCell<Vec<u64>>,
     /// frames between render submit and fence; gates the retired drain
     pub frames_in_flight: std::cell::Cell<u32>,
     /// the render device + (fourcc, modifier) set the dmabuf global speaks
@@ -128,6 +133,8 @@ impl State {
             lock: RefCell::new(None),
             dpms_off: std::cell::Cell::new(false),
             retired: RefCell::new(Vec::new()),
+            scanout_hold: RefCell::new(Vec::new()),
+            scanout_uids: RefCell::new(Vec::new()),
             frames_in_flight: std::cell::Cell::new(0),
             dmabuf_info: RefCell::new(None),
             anim_clock: crate::anim::AnimClock::new(),
