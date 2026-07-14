@@ -116,6 +116,8 @@ animations {
 //     // backdrop only where the surface's own alpha reaches the gate;
 //     // argb surfaces only (xrgb reads as fully opaque)
 //     ignore-alpha 0.1
+//     // shells that remap layers on state changes: skip open/close styles
+//     no-anim
 // }
 
 // remap "example-game" {

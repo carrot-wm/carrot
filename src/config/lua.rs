@@ -1002,6 +1002,7 @@ fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                             .map_err(whine)?,
                     )
                 }
+                "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
                 other => return Err(whine(format!("unknown key `{other}`"))),
             }
         }

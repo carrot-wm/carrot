@@ -178,6 +178,11 @@ pub(super) fn layer_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     }
                 }
             }
+            "no-anim" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.no_anim = b;
+                }
+            }
             other => cx.at(c, &format!("unknown layer-rule key \"{other}\"")),
         }
     }

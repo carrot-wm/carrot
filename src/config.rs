@@ -357,6 +357,9 @@ pub struct LayerRule {
     /// backdrop only where surface alpha >= this; unset covers the whole
     /// rect. argb surfaces only - xrgb views pin alpha to one
     pub ignore_alpha: Option<f64>,
+    /// maps and unmaps appear instantly; shells that remap layers on
+    /// state changes opt out of the open/close styles
+    pub no_anim: bool,
 }
 
 // -- animations: per-kind spring/ease motion plus visual styles --

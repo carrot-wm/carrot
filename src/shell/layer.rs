@@ -666,8 +666,19 @@ impl SurfaceExt for LayerExt {
     }
 }
 
+/// a namespace hit on a no-anim layer rule pins maps and unmaps
+fn layer_no_anim(cfg: &crate::config::Config, ns: &str) -> bool {
+    cfg.layer_rules
+        .iter()
+        .any(|r| r.no_anim && r.matches.iter().any(|m| m.matches(ns)))
+}
+
 fn start_layer_open(state: &Rc<State>, ls: &Rc<LayerSurface>) {
     let cfg = state.config.borrow().clone();
+    if layer_no_anim(&cfg, &ls.namespace) {
+        *ls.anim.borrow_mut() = None;
+        return;
+    }
     let Some(motion) = cfg.animations.motion(crate::config::AnimKind::LayerOpen) else {
         *ls.anim.borrow_mut() = None;
         return;
@@ -685,6 +696,9 @@ fn start_layer_open(state: &Rc<State>, ls: &Rc<LayerSurface>) {
 
 fn capture_layer_close(state: &Rc<State>, ls: &Rc<LayerSurface>) {
     let cfg = state.config.borrow().clone();
+    if layer_no_anim(&cfg, &ls.namespace) {
+        return;
+    }
     let Some(motion) = cfg.animations.motion(crate::config::AnimKind::LayerClose) else {
         return;
     };
