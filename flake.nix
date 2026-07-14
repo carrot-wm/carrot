@@ -35,7 +35,7 @@
       ];
 
       flake = {
-        homeModule = 
+        homeManagerModules =
           { config, lib, pkgs, ... }:
           let
             inherit (lib)
@@ -124,13 +124,38 @@
                 };
               };
             };
+            matcher = types.submodule {
+              options = {
+                app_id = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                };
+                title = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                };
+                is_fullscreen = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                };
+                is_floating = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                };
+                is_xwayland = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                };
+              };
+            };
           in
           {
-            options.carrot = {
+            options.wayland.windowManager.carrot = {
               enable = lib.mkEnableOption "Carrot, a pure Rust wayland compositor";
               package = mkOption {
                 type = types.nullOr types.package;
-                default = null;
+                default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot;
+                defaultText = "inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot";
               };
               settings = mkOption {
                 type = types.nullOr (types.submodule {
@@ -147,7 +172,7 @@
                             default = null;
                           };
                           args = mkOption {
-                            type = types.nullOr (types.listOf types.str);
+                            type = types.nullOr (types.listOf (types.either types.str types.int));
                             default = null;
                           };
                           on = mkOption {
@@ -210,7 +235,7 @@
                               };
                             });
                             default = null;
-                          };  
+                          };
                           touchpad = mkOption {
                             type = types.nullOr (types.submodule {
                               options = {
@@ -250,7 +275,7 @@
                             default = null;
                           };
                           devices = mkOption {
-                            type = types.nullOr (types.listOf (types.submodule {
+                            type = types.nullOr (types.attrsOf (types.submodule {
                               options = {
                                 accel_speed = mkOption {
                                   type = types.nullOr (types.numbers.between (-1.0) 1.0);
@@ -284,11 +309,11 @@
                       type = types.nullOr (types.listOf (types.submodule {
                         options = {
                           match = mkOption {
-                            type = types.nullOr types.str;
+                            type = types.nullOr (types.listOf matcher);
                             default = null;
                           };
                           exclude = mkOption {
-                            type = types.nullOr types.str;
+                            type = types.nullOr (types.listOf matcher);
                             default = null;
                           };
                           open_floating = mkOption {
@@ -340,7 +365,7 @@
                       default = null;
                     };
                     animations = mkOption {
-                      type = types.nullOr (types.listOf (types.submodule {
+                      type = types.nullOr (types.submodule {
                         options = {
                           off = mkOption {
                             type = types.nullOr types.bool;
@@ -399,7 +424,7 @@
                             default = null;
                           };
                         };
-                      }));
+                      });
                       default = null;
                     };
                     decoration = mkOption {
@@ -663,9 +688,6 @@
                   luaConfig = lib.generators.toLua { } cfg.settings;
                 in
                   ''
-                    -- This file was automatically generated using Home Manager
-                    -- Changes to this file are not permanent and are wiped on an another rebuild
-
                     carrot = ${luaConfig}
                   '';
               };
