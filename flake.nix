@@ -44,7 +44,22 @@
               types
               ;
               cfg = config.carrot;
-              actions = [];
+              actions = [
+                "spawn-sh" "spawn"
+                "focus-workspace" "move-to-workspace" "send-to-workspace"
+                "close-window"
+                "toggle-fullscreen" "toggle-floating"
+                "focus-prev" "focus-next"
+                "focus-left" "focus-right" "focus-down" "focus-up"
+                "swap-left" "swap-right" "swap-down" "swap-up"
+                "adjust-split-ratio"
+                "consume-or-expel-left" "consume-or-expel-right"
+                "cycle-column-width" "cycle-column-width-back" "toggle-full-width"
+                "center-column"
+                "pointer-move" "pointer-resize"
+                "set-layout"
+                "quit"
+              ];
               cfg_spring = lib.types.submodule {
                   options = {
                     damping_ratio = lib.mkOption {
@@ -75,10 +90,12 @@
                     type = lib.types.bool;
                   };
                   spring = lib.mkOption {
-                    type = cfg_spring;
+                    type = lib.types.nullOr cfg_spring;
+                    default = null;
                   };
                   ease = lib.mkOption {
-                    type = cfg_ease;
+                    type = lib.types.nullOr cfg_ease;
+                    default = null;
                   };
                   style = lib.mkOption {
                     type = lib.types.submodule {
@@ -179,7 +196,7 @@
                             type = types.submodule {
                               options = {
                                 accel_profile = mkOption {
-                                  type = types.string;
+                                  type = types.str;
                                 };
                                 accel_speed = mkOption {
                                   type = types.numbers.between -1.0 1.0;
@@ -194,7 +211,7 @@
                             type = types.submodule {
                               options = {
                                 accel_profile = mkOption {
-                                  type = types.string;
+                                  type = types.str;
                                 };
                                 accel_speed = mkOption {
                                   type = types.numbers.between -1.0 1.0;
@@ -361,7 +378,7 @@
                           mode = mkOption {
                             type = types.enum [ "scrolling" "dwindle" ];
                           };
-                          scrolling = {
+                          scrolling = mkOption {
                             type = types.submodule {
                               options = {
                                 preset_widths = mkOption {
@@ -471,11 +488,15 @@
                     };
                     debug = mkOption {
                       type = types.submodule {
-                        render_drm_device = mkOption {
-                          type = types.str;
-                        };
-                        ignore_drm_device = mkOption {
-                          type = types.str;
+                        options = {
+                          type = types.submodule {
+                            render_drm_device = mkOption {
+                              type = types.str;
+                            };
+                            ignore_drm_device = mkOption {
+                              type = types.str;
+                            };
+                          };
                         };
                       };
                     };
