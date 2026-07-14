@@ -35,6 +35,7 @@ mod config;
 mod dbus;
 mod ei;
 mod input;
+mod install;
 mod ipc;
 mod pipewire;
 mod portal;
@@ -119,6 +120,10 @@ fn main() {
     if let Some(i) = std::env::args().position(|a| a == "check-config") {
         let path = std::env::args().nth(i + 1);
         std::process::exit(config::check(path.as_deref()));
+    }
+    if let Some(i) = std::env::args().position(|a| a == "install") {
+        let rest: Vec<String> = std::env::args().skip(i + 1).collect();
+        std::process::exit(install::run(&rest));
     }
 
     if let Err(e) = run() {

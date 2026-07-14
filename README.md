@@ -164,7 +164,14 @@ git clone https://github.com/carrot-wm/carrot
 cd carrot
 nix develop   # pins the toolchain; or use rustup with the pinned toolchain
 cargo build --release
+sudo ./target/x86_64-unknown-linux-gnu/release/carrot install
 ```
+
+`carrot install` puts the binary, the `burrow` IPC client, a
+`wayland-sessions` entry, and the screencast portal registration under
+`/usr/local` - log out and pick "Carrot" at any display manager. Packagers
+can stage it: `carrot install --prefix /usr --root "$pkgdir"` writes under
+the root while the session entry points at the prefix.
 
 To hack on the libc itself, clone taproot next to carrot and flip the
 `[patch.crates-io]` entries in `Cargo.toml` to `path = "../taproot/..."`.
