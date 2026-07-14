@@ -1179,11 +1179,16 @@ impl SeatGlobal {
     /// the scene changed under a stationary cursor (map/unmap/arrange):
     /// re-resolve pointer focus without waiting for the next motion
     pub fn repick(self: &Rc<Self>, state: &Rc<State>) {
-        // an implicit grab pins focus; dnd re-targets on its own motion
-        if !self.ptr_buttons.borrow().is_empty()
-            || self.data.drag().is_some()
-            || self.active_lock().is_some()
-        {
+        // an implicit grab pins focus; dnd re-targets on its own motion.
+        // a lock pins too - but only while its window is still on the
+        // visible scene, else a workspace switch leaves relative motion
+        // flowing to a window nobody can see
+        let lock_pins = self.active_lock().is_some_and(|con| {
+            let root = con.surface.get_root();
+            crate::tree::window_for_surface_any(state, &root).is_none()
+                || crate::tree::window_for_surface(state, &root).is_some()
+        });
+        if !self.ptr_buttons.borrow().is_empty() || self.data.drag().is_some() || lock_pins {
             return;
         }
         self.pick_focus(state, self.ptr_x.get(), self.ptr_y.get());
@@ -1778,6 +1783,72 @@ mod tests {
         let bytes = client.queued_out_bytes();
         assert_eq!(count_events(&bytes, ptr, 1), leaves, "same surface, no leave");
         assert!(count_events(&bytes, ptr, 2) > motions, "a motion rebases the client's view");
+    }
+
+    #[test]
+    fn fullscreen_pins_directional_and_cycle_focus() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        for i in 0..3u32 {
+            let (s, x, _t) = crate::shell::xdg::tests::mk_toplevel(
+                &client,
+                &base,
+                11 + i * 3,
+                12 + i * 3,
+                13 + i * 3,
+            );
+            crate::shell::xdg::tests::map(&state, &client, &s, &x, 21 + i);
+        }
+        // the scrolling strip keeps laying out off-view columns; with the
+        // view scrolled to the strip's tail the head column sits fully
+        // past the left edge - not a focus candidate while a fullscreen
+        // surface buries everything
+        let ws = crate::tree::active(&state);
+        crate::tree::set_layout(&state, &ws, crate::config::LayoutMode::Scrolling);
+        let win = crate::tree::window_for_surface(&state, &sa).unwrap();
+        crate::tree::focus_window(&state, Some(&win));
+        while ws.tiling.strip.move_column(&win, false) {}
+        crate::tree::relayout(&state, &ws);
+        crate::tree::set_fullscreen(&state, &win, true);
+        crate::tree::focus_dir(&state, crate::config::Dir::Left);
+        let cur = crate::tree::focused_window(&state).unwrap();
+        assert!(Rc::ptr_eq(&cur, &win), "directional focus stays put");
+        crate::tree::focus_cycle(&state, 1);
+        let cur = crate::tree::focused_window(&state).unwrap();
+        assert!(Rc::ptr_eq(&cur, &win), "cycle focus stays put");
+    }
+
+    #[test]
+    fn a_workspace_switch_breaks_a_hidden_lock() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        seat.warp(&state, 400.0, 300.0);
+        assert!(seat.pointer_focus().is_some_and(|f| Rc::ptr_eq(&f, &sa)));
+        lock(&client, sa.id, 71, 2).unwrap();
+        let con = seat.constraint_for(&sa).unwrap();
+        assert!(con.active.get(), "locked while visible");
+        // the game's workspace goes hidden: the lock must break, pointer
+        // focus must leave, and deltas stop flowing to the crosshair
+        crate::tree::switch_workspace(&state, 1);
+        assert!(!con.active.get(), "hidden window cannot hold the lock");
+        assert!(
+            seat.pointer_focus().is_none_or(|f| !Rc::ptr_eq(&f, &sa)),
+            "pointer focus left the hidden surface"
+        );
+        assert!(crate::tree::focused_window(&state).is_none(), "empty workspace, no focus");
+        // coming back re-arms the persistent constraint
+        crate::tree::switch_workspace(&state, 0);
+        assert!(con.active.get(), "persistent lock re-locks on return");
     }
 
     #[test]

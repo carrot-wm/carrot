@@ -603,6 +603,11 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
             warp_to_workspace(state, &ws);
         }
     }
+    // the whole scene changed under a stationary cursor: pointer focus
+    // re-resolves, and a constraint pinned to a hidden window breaks
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.repick(state);
+    }
     // focus lands on whatever is under the cursor, else the first tile
     let target = {
         let (cx, cy) = cursor_pos(state);
@@ -777,6 +782,10 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
         return;
     }
     let cur = focused_window(state);
+    // everything else is buried; cycling would land on the invisible
+    if cur.as_ref().is_some_and(|c| c.fullscreen.get()) {
+        return;
+    }
     let from = cur.as_ref().map(|c| c.rect.get()).unwrap_or_default();
     let idx = cur.and_then(|c| wins.iter().position(|w| Rc::ptr_eq(w, &c)));
     let next = match idx {
@@ -855,11 +864,13 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
     let Some(cur) = focused_window(state) else {
         return;
     };
+    // a fullscreen window buries its neighbors; focus stays put rather
+    // than wandering onto something invisible
+    if cur.fullscreen.get() {
+        return;
+    }
     let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
-    if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
-        && !cur.floating.get()
-        && !cur.fullscreen.get()
-    {
+    if ws.tiling.mode() == crate::config::LayoutMode::Scrolling && !cur.floating.get() {
         ws.tiling.strip.note_focus(&cur);
         if let Some(next) = ws.tiling.strip.focus_dir(dir) {
             let from = cur.rect.get();
