@@ -703,10 +703,17 @@ fn anim_kind(
 /// { "name", perc = n, dir = ".." } through the shared style validator
 fn lua_style(v: &Value, family: super::StyleFamily) -> Result<super::Style, String> {
     let t = table(v, "style")?;
+    // name is the first positional entry ({ "popin", ... }); also accept a
+    // `name =` key so a config that can only emit named tables (the home-manager
+    // module goes through generators.toLua) still parses.
     let name = t
         .iter()
         .find_map(|(k, v)| if vint(&k) == Some(1) { vstr(&v) } else { None })
-        .ok_or("style wants { \"name\", ... }")?;
+        .or_else(|| {
+            t.iter()
+                .find_map(|(k, v)| if vstr(&k).as_deref() == Some("name") { vstr(&v) } else { None })
+        })
+        .ok_or("style wants { \"name\", ... } or name = \"...\"")?;
     let mut perc = None;
     let mut dir = None;
     for (k, v) in t.iter() {
