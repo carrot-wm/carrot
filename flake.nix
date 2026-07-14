@@ -54,6 +54,7 @@
                 "swap-left" "swap-right" "swap-down" "swap-up"
                 "adjust-split-ratio"
                 "consume-or-expel-left" "consume-or-expel-right"
+                "move-column-left" "move-column-right"
                 "cycle-column-width" "cycle-column-width-back" "toggle-full-width"
                 "center-column"
                 "pointer-move" "pointer-resize"
