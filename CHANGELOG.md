@@ -81,3 +81,4 @@
 - XDG Activation (Link Handoffs Focus the Running App and Follow It to Its Workspace)
 - Multi-File Configs (KDL include Nodes and a Lua include(), Paths Resolve Against the Including File)
 - Workspace Axis Choice (Dwindle Picks Horizontal or Vertical Switching; Scrolling Stays Vertical)
+- Move-Column Verbs (The Whole Column Leapfrogs the Strip; Directional Swap Trades Window Slots Between Columns)

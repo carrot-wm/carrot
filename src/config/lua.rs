@@ -918,6 +918,8 @@ fn action_from(name: &str, args: &[LuaArg]) -> Result<Action, String> {
         },
         "consume-or-expel-left" => Action::ConsumeOrExpelLeft,
         "consume-or-expel-right" => Action::ConsumeOrExpelRight,
+        "move-column-left" => Action::MoveColumnLeft,
+        "move-column-right" => Action::MoveColumnRight,
         "cycle-column-width" => Action::CycleColumnWidth,
         "cycle-column-width-back" => Action::CycleColumnWidthBack,
         "toggle-full-width" => Action::ToggleFullWidth,

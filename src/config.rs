@@ -45,6 +45,9 @@ pub enum Action {
     // scrolling-layout verbs; harmless no-ops on a dwindle workspace
     ConsumeOrExpelLeft,
     ConsumeOrExpelRight,
+    /// the focused window's whole column leapfrogs along the strip
+    MoveColumnLeft,
+    MoveColumnRight,
     CycleColumnWidth,
     CycleColumnWidthBack,
     ToggleFullWidth,

@@ -199,6 +199,14 @@ fn action(node: &KdlNode, cx: &mut Cx) -> Option<Action> {
             none(cx, name);
             Action::ConsumeOrExpelRight
         }
+        "move-column-left" => {
+            none(cx, name);
+            Action::MoveColumnLeft
+        }
+        "move-column-right" => {
+            none(cx, name);
+            Action::MoveColumnRight
+        }
         "cycle-column-width" => {
             none(cx, name);
             Action::CycleColumnWidth
@@ -263,6 +271,8 @@ mod tests {
         let c = parse_ok(
             "binds {\n\
              Mod+BracketLeft { consume-or-expel-left; }\n\
+             Mod+Ctrl+Left { move-column-left; }\n\
+             Mod+Ctrl+Right { move-column-right; }\n\
              Mod+R { cycle-column-width; }\n\
              Mod+Shift+R { cycle-column-width-back; }\n\
              Mod+W { toggle-full-width; }\n\
@@ -274,6 +284,8 @@ mod tests {
         );
         let acts: Vec<_> = c.binds.iter().map(|b| b.action.clone()).collect();
         assert!(acts.contains(&Action::ConsumeOrExpelLeft));
+        assert!(acts.contains(&Action::MoveColumnLeft));
+        assert!(acts.contains(&Action::MoveColumnRight));
         assert!(acts.contains(&Action::CycleColumnWidth));
         assert!(acts.contains(&Action::CycleColumnWidthBack));
         assert!(acts.contains(&Action::ToggleFullWidth));

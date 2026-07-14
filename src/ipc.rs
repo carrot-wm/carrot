@@ -222,6 +222,23 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
                 }
             }
         }
+        Action::MoveColumnLeft | Action::MoveColumnRight => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws
+                        .tiling
+                        .strip
+                        .move_column(&win, matches!(action, Action::MoveColumnLeft))
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
         Action::CycleColumnWidth | Action::CycleColumnWidthBack => {
             if let Some(win) = crate::tree::focused_window(state) {
                 let ws = crate::tree::workspace_of(state, &win)
