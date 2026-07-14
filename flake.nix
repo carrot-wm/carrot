@@ -113,9 +113,6 @@
                     };
                   };
                 };
-                config = lib.mkIf (config.spring != null && config.ease != null) {
-                  warnings = [ "You cant have both 'spring' and 'ease'" ];
-                };
               });
           in
           {
