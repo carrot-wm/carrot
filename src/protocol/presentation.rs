@@ -14,6 +14,7 @@ const CLOCK_MONOTONIC: u32 = 1;
 pub const FLAG_VSYNC: u32 = 0x1;
 pub const FLAG_HW_CLOCK: u32 = 0x2;
 pub const FLAG_HW_COMPLETION: u32 = 0x4;
+pub const FLAG_ZERO_COPY: u32 = 0x8;
 
 pub struct PresentationGlobal;
 

@@ -1,0 +1,62 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.channel }}
+    - env:
+        TARGET: ${{ matrix.target }}
+        CHANNEL: ${{ matrix.channel }}
+        FEATURES: ${{ matrix.features }}
+        OP: ${{ matrix.op }}
+      run: sh ci/run.sh
+    strategy:
+      matrix:
+        include:
+          # Test all architectures with std or use-syscall on stable
+          - target: x86_64-unknown-linux-gnu
+            channel: stable
+            features: "std"
+            op: test
+          - target: x86_64-unknown-linux-gnu
+            channel: stable
+            features: "use-syscall"
+            op: test
+          - target: aarch64-unknown-linux-gnu
+            channel: stable
+            features: "std"
+            op: build
+          - target: aarch64-unknown-linux-gnu
+            channel: stable
+            features: "use-syscall"
+            op: build
+          - target: riscv64gc-unknown-linux-gnu
+            channel: stable
+            features: "std"
+            op: build
+          - target: riscv64gc-unknown-linux-gnu
+            channel: stable
+            features: "use-syscall"
+            op: build
+          # Test MSRV and non-syscall path on x86_64
+          - target: x86_64-unknown-linux-gnu
+            channel: 1.93.0
+            features: "std"
+            op: test
+          - target: x86_64-unknown-linux-gnu
+            channel: 1.93.0
+            features: "use-syscall"
+            op: test

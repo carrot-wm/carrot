@@ -13,7 +13,7 @@ use crate::drm::sys;
 use crate::engine::SpawnedFuture;
 use crate::format::XRGB8888;
 use crate::rect::Rect;
-use crate::render::renderer::{FrameTarget, RenderOp, Renderer, Texture};
+use crate::render::renderer::{Frame, FrameTarget, PrePass, PreUpload, RenderOp, Renderer, Texture};
 use crate::render::vulkan::VkCore;
 use crate::state::State;
 use crate::surface::WlSurface;
@@ -319,6 +319,13 @@ pub struct Output {
     /// textures pulled from the cache this frame; destroyed only after
     /// the frame fence proves the last sampler is done
     retired_tex: RefCell<Vec<Texture>>,
+    /// offscreen work deferred by compose; the next submit (present or
+    /// capture) drains both into its command buffer
+    prepasses: RefCell<Vec<PrePass>>,
+    preuploads: RefCell<Vec<PreUpload>>,
+    /// keys captures sampled recently, with the feed time; the sweep
+    /// spares them so cast ticks stop re-importing every frame
+    cast_keep: RefCell<HashMap<(ClientId, u64), u64>>,
     /// card's dev_t, matches logind pause/resume signals
     devnum: u64,
     /// vt elsewhere; render but never commit until resume
@@ -353,6 +360,116 @@ pub struct Output {
     pub ws_switch: RefCell<Option<WsSwitch>>,
     /// unmapped layer surfaces still animating out
     pub closing_layers: RefCell<Vec<ClosingWindow>>,
+    /// blurred-backdrop cache; levels[0] doubles as the finished result
+    pub blur: RefCell<Option<BlurCache>>,
+    /// the backdrop changed since the cache was built
+    pub blur_dirty: Cell<bool>,
+    /// submitted frames whose gpu work may still be running; a side task
+    /// waits each render fence and retires them off the present loop
+    gpu_done: crate::util::AsyncQueue<CleanupJob>,
+    /// late-latch scheduler state
+    sched: Sched,
+    /// direct-scanout state; the queued flip's zero-copy-ness rides along
+    /// for its presentation feedback
+    scanout: RefCell<ScanoutState>,
+    inflight_zero_copy: Cell<bool>,
+}
+
+/// everything whose lifetime ends at a frame's render fence
+struct CleanupJob {
+    frame: Frame,
+    sync: Option<Rc<std::os::fd::OwnedFd>>,
+    retired: Vec<Texture>,
+    /// when the frame was submitted; the fence-signal instant closes the
+    /// gpu-tail sample for the latch scheduler
+    submit_ns: u64,
+}
+
+/// the timing model behind late latching: how long a frame costs on the
+/// cpu (latch to flip-queued) and on the gpu (submit to fence), plus an
+/// adaptive safety margin. all nanoseconds
+struct Sched {
+    ewma_cpu: Cell<u64>,
+    ewma_gpu: Cell<u64>,
+    /// AIMD: doubles on a missed vblank, decays linearly on a met one,
+    /// never below the configured floor
+    margin: Cell<u64>,
+    misses: Cell<u32>,
+    clean: Cell<u32>,
+    /// enough consecutive misses park the policy on render-at-flip-done
+    /// until the pipe proves stable again
+    fallback: Cell<bool>,
+    /// the glass instant the queued flip aimed for; 0 = nothing aimed
+    target_ns: Cell<u64>,
+    /// last flip-done actually accounted, so each is counted once
+    last_seq: Cell<u64>,
+}
+
+impl Default for Sched {
+    fn default() -> Sched {
+        Sched {
+            // deliberately fat startup estimates; real samples pull them in
+            ewma_cpu: Cell::new(1_000_000),
+            ewma_gpu: Cell::new(2_000_000),
+            margin: Cell::new(0),
+            misses: Cell::new(0),
+            clean: Cell::new(0),
+            fallback: Cell::new(false),
+            target_ns: Cell::new(0),
+            last_seq: Cell::new(0),
+        }
+    }
+}
+
+impl Sched {
+    fn ewma(cell: &Cell<u64>, sample: u64) {
+        let e = cell.get();
+        cell.set(e - e / 8 + sample / 8);
+    }
+
+    fn budget_ns(&self, floor_ns: u64) -> u64 {
+        self.ewma_cpu.get() + self.ewma_gpu.get() + self.margin.get().max(floor_ns)
+    }
+}
+
+/// direct-scanout bookkeeping: the client buffer on the primary plane,
+/// the one the queued flip is replacing, and the fb cache
+#[derive(Default)]
+struct ScanoutState {
+    /// on glass, or queued to be
+    cur: Option<Rc<crate::protocol::shm::WlBuffer>>,
+    /// replaced by the in-flight flip; releases at its flip-done
+    prev: Option<Rc<crate::protocol::shm::WlBuffer>>,
+    /// per-buffer drm framebuffers, keyed by wl_buffer uid
+    fbs: HashMap<u64, ScanoutFb>,
+    /// gem handles are deduplicated by the kernel per drm fd, so two fbs
+    /// over one bo share handles; close only when the last user goes
+    handles: HashMap<u32, u32>,
+    /// monotonically counts scanout flips; ages cache entries
+    tick: u64,
+}
+
+struct ScanoutFb {
+    fb: u32,
+    handles: Vec<u32>,
+    last_used: u64,
+}
+
+/// cache entries idle this many scanout flips get evicted
+const SCANOUT_FB_IDLE: u64 = 600;
+
+/// how many misses in a row park late-latching, and how many met deadlines
+/// afterwards un-park it
+const MISS_PARK: u32 = 4;
+const CLEAN_RESTORE: u32 = 240;
+/// linear decay of the miss margin per met deadline
+const MARGIN_DECAY_NS: u64 = 20_000;
+/// a deadline closer than this isn't worth a timer round-trip
+const MIN_SLACK_NS: u64 = 100_000;
+
+pub struct BlurCache {
+    /// full res first, then each kawase level at half the previous
+    levels: Vec<Texture>,
 }
 
 #[derive(Clone)]
@@ -710,7 +827,9 @@ pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: boo
             waits.push(sem);
         }
     }
-    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+    let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+    let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+    let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
         Ok(px) => px,
         Err(e) => {
             eprintln!("carrot: screencopy render failed: {e}");
@@ -747,17 +866,30 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     if rect.is_empty() {
         return None;
     }
+    // rule-hidden: the stream gets an opaque black frame, never pixels
+    if win.rule_no_capture.get() {
+        let n = rect.width() as usize * rect.height() as usize;
+        let mut px = vec![0u8; n * 4];
+        for p in px.chunks_exact_mut(4) {
+            p[3] = 0xff;
+        }
+        return Some(px);
+    }
     let geo = win.geometry();
     let mut ops = Vec::new();
     let mut live = Vec::new();
-    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, &mut ops, &mut live);
+    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, 0.0, &mut ops, &mut live);
+    // hidden-window casts land here; spare their textures from the sweep
+    note_cast_keys(&out, &live);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
             waits.push(sem);
         }
     }
-    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+    let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+    let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+    let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
         Ok(px) => px,
         Err(e) => {
             eprintln!("carrot: window capture render failed: {e}");
@@ -796,13 +928,25 @@ pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
             waits.push(sem);
         }
     }
-    match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+    let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+    let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+    match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
         Ok(px) => Some(px),
         Err(e) => {
             eprintln!("carrot: workspace copy render failed: {e}");
             None
         }
     }
+}
+
+/// a live workspace-switch blends two scenes on glass; casts wait it out
+pub fn switching(state: &Rc<State>, name: &str) -> bool {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return false };
+    let outs = d.outputs.borrow();
+    outs.iter()
+        .find(|o| o.conn.name == name)
+        .is_some_and(|o| o.ws_switch.borrow().is_some())
 }
 
 /// output-local full rect + size lookup for the screencopy protocol
@@ -849,12 +993,15 @@ fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>, 
             }
         };
         let row = (w * 4) as usize;
-        let res = out.renderer.upload_texture(&tex, |dst| {
+        let res = out.renderer.stage_upload(&tex, |dst| {
             dst[..row * h as usize].copy_from_slice(&pixels[..row * h as usize]);
         });
-        if let Err(e) = res {
-            eprintln!("carrot: cursor upload failed: {e}");
-            return;
+        match res {
+            Ok(up) => out.preuploads.borrow_mut().push(up),
+            Err(e) => {
+                eprintln!("carrot: cursor upload failed: {e}");
+                return;
+            }
         }
         if let Some(old) = out.cursor_tex.borrow_mut().replace(tex) {
             out.renderer.destroy_texture(&old);
@@ -1471,6 +1618,9 @@ fn init_output(
         usable: Cell::new(Rect::default()),
         textures: RefCell::new(HashMap::new()),
         retired_tex: RefCell::new(Vec::new()),
+        prepasses: RefCell::new(Vec::new()),
+        preuploads: RefCell::new(Vec::new()),
+        cast_keep: RefCell::new(HashMap::new()),
         devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
@@ -1488,7 +1638,326 @@ fn init_output(
         anim_pending: Cell::new(false),
         ws_switch: RefCell::new(None),
         closing_layers: RefCell::new(Vec::new()),
+        blur: RefCell::new(None),
+        blur_dirty: Cell::new(true),
+        gpu_done: crate::util::AsyncQueue::default(),
+        sched: Sched::default(),
+        scanout: RefCell::new(ScanoutState::default()),
+        inflight_zero_copy: Cell::new(false),
     })
+}
+
+/// one refresh period in nanoseconds; 0 when unknown or variable
+fn period_ns(out: &Output) -> u64 {
+    out.conn
+        .pipe
+        .borrow()
+        .as_ref()
+        .map(|p| {
+            let m = &p.mode;
+            m.htotal as u64 * m.vtotal as u64 * 1_000_000_000 / (m.clock.max(1) as u64 * 1000)
+        })
+        .unwrap_or(0)
+}
+
+/// account a completed flip against the deadline it aimed for
+fn sched_note_flip(out: &Rc<Output>) {
+    let seq = out.conn.seq64.get();
+    let sched = &out.sched;
+    if seq == 0 || seq == sched.last_seq.replace(seq) {
+        return;
+    }
+    let target = sched.target_ns.replace(0);
+    if target == 0 {
+        return;
+    }
+    let period = period_ns(out);
+    let (sec, usec) = out.conn.flip_time.get();
+    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+    if period == 0 || flip_ns == 0 {
+        return;
+    }
+    if flip_ns > target + period / 2 {
+        // missed the aimed-for vblank: back off multiplicatively, and
+        // after a burst park the policy entirely
+        let m = sched.margin.get().max(MARGIN_DECAY_NS);
+        sched.margin.set((m * 2).min(period));
+        sched.clean.set(0);
+        let misses = sched.misses.get() + 1;
+        sched.misses.set(misses);
+        if misses >= MISS_PARK && !sched.fallback.replace(true) {
+            crate::trace!("late-latch parked after {} misses", misses);
+        }
+    } else {
+        sched.misses.set(0);
+        sched.margin.set(sched.margin.get().saturating_sub(MARGIN_DECAY_NS));
+        let clean = sched.clean.get() + 1;
+        sched.clean.set(clean);
+        if clean >= CLEAN_RESTORE && sched.fallback.replace(false) {
+            crate::trace!("late-latch restored after {} met deadlines", clean);
+        }
+    }
+}
+
+/// a frame that is exactly one client buffer needs no compose at all: the
+/// buffer goes on the primary plane and the gpu stays idle. eligibility
+/// mirrors what a present compose would draw - anything beyond the bare
+/// fullscreen surface falls back to compositing
+fn scanout_candidate(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+) -> Option<(Rc<WlSurface>, Rc<crate::protocol::shm::WlBuffer>)> {
+    if crate::protocol::session_lock::locked(state) || tearing_wanted(state, out) {
+        return None;
+    }
+    if out.anim_pending.get() || out.ws_switch.borrow().is_some() {
+        return None;
+    }
+    // a composited cursor or drag icon needs pixels
+    {
+        let d = state.display.borrow();
+        let d = d.as_ref()?;
+        let plane_less = out.conn.pipe.borrow().as_ref().is_none_or(|p| p.cursor.is_none());
+        if let Some(seat) = state.seat.borrow().clone() {
+            if (d.sw.get() || plane_less)
+                && !d.sw_hidden.get()
+                && !out.cursor_locked.get()
+                && d.sw_image.borrow().is_some()
+                && out.rect().contains(seat.ptr_x.get() as i32, seat.ptr_y.get() as i32)
+            {
+                return None;
+            }
+            if seat.data.drag().is_some_and(|drag| drag.icon.borrow().is_some()) {
+                return None;
+            }
+        }
+    }
+    let ws = state.workspaces.borrow().get(out.ws.get())?.clone();
+    let win = ws.fullscreen.borrow().clone()?;
+    let cfg = state.config.borrow();
+    if cfg.layout.float_above_fullscreen && !ws.floats.borrow().is_empty() {
+        return None;
+    }
+    drop(cfg);
+    // overlay layers draw above fullscreen
+    if state.layers.borrow().iter().any(|ls| {
+        ls.current.get().layer == crate::shell::layer::OVERLAY
+            && ls.mapped()
+            && ls.output.get() == out.index.get()
+    }) {
+        return None;
+    }
+    if win.anims_live(state.anim_clock.now()) || win.rule_opacity.get().unwrap_or(1.0) < 1.0 {
+        return None;
+    }
+    let surface = win.surface();
+    if !surface.mapped.get() {
+        return None;
+    }
+    if surface
+        .children
+        .borrow()
+        .as_ref()
+        .is_some_and(|ch| ch.below.iter().chain(ch.above.iter()).any(|e| !e.pending.get()))
+    {
+        return None;
+    }
+    if let Some(tl) = win.xdg_opt() {
+        let mut popups = false;
+        tl.xdg.for_each_popup(|p| popups |= p.xdg.surface.mapped.get());
+        if popups {
+            return None;
+        }
+    }
+    if surface.transform.get() != crate::surface::Transform::Normal || surface.scale.get() != 1 {
+        return None;
+    }
+    let buf = surface.buffer.borrow().as_ref()?.buf.clone();
+    let img = buf.dmabuf()?;
+    // the buffer must be the whole frame: mode-sized, geometry-aligned,
+    // and with no alpha for the plane to blend
+    if buf.rect.width() != out.width as i32
+        || buf.rect.height() != out.height as i32
+        || buf.format.has_alpha()
+    {
+        return None;
+    }
+    let geo = win.geometry();
+    if geo != Rect::new_sized_saturating(0, 0, buf.rect.width(), buf.rect.height())
+        || win.rect.get() != out.rect()
+    {
+        return None;
+    }
+    // the primary plane has to take this format+modifier as-is
+    {
+        let pipe = out.conn.pipe.borrow();
+        let plane = &pipe.as_ref()?.primary;
+        if !plane.supports(buf.format.drm) {
+            return None;
+        }
+        let mods = plane.modifiers(buf.format.drm);
+        if mods.is_empty() {
+            // no IN_FORMATS: only implicit/linear layouts are expressible
+            if img.modifier != 0 {
+                return None;
+            }
+        } else if !mods.contains(&img.modifier) {
+            return None;
+        }
+    }
+    Some((surface, buf))
+}
+
+/// the drm framebuffer for a client buffer, imported once per wl_buffer
+fn scanout_fb(out: &Rc<Output>, buf: &Rc<crate::protocol::shm::WlBuffer>) -> Option<u32> {
+    use crate::drm::sys;
+    let mut st = out.scanout.borrow_mut();
+    let tick = st.tick + 1;
+    st.tick = tick;
+    if let Some(e) = st.fbs.get_mut(&buf.uid) {
+        e.last_used = tick;
+        return Some(e.fb);
+    }
+    let img = buf.dmabuf()?;
+    let fd = out.dev.fd.as_fd();
+    let mut handles = Vec::new();
+    let mut pitches = Vec::new();
+    let mut offsets = Vec::new();
+    for plane in &img.planes {
+        match sys::prime_fd_to_handle(fd, plane.fd.as_fd()) {
+            Ok(h) => {
+                *st.handles.entry(h).or_insert(0) += 1;
+                handles.push(h);
+                pitches.push(plane.stride);
+                offsets.push(plane.offset);
+            }
+            Err(e) => {
+                crate::trace!("scanout: prime import failed: {e}");
+                scanout_release_handles(&mut st, fd, &handles);
+                return None;
+            }
+        }
+    }
+    // IN_FORMATS present means the kernel takes explicit modifiers
+    let explicit = out
+        .conn
+        .pipe
+        .borrow()
+        .as_ref()
+        .map(|p| !p.primary.modifiers(buf.format.drm).is_empty())
+        .unwrap_or(false);
+    let modifier = explicit.then_some(img.modifier);
+    let fb = match sys::addfb2(
+        fd,
+        buf.rect.width() as u32,
+        buf.rect.height() as u32,
+        buf.format.drm,
+        &handles,
+        &pitches,
+        &offsets,
+        modifier,
+    ) {
+        Ok(fb) => fb,
+        Err(e) => {
+            crate::trace!("scanout: addfb2 failed: {e}");
+            scanout_release_handles(&mut st, fd, &handles);
+            return None;
+        }
+    };
+    st.fbs.insert(buf.uid, ScanoutFb { fb, handles, last_used: tick });
+    // age out fbs of buffers the client stopped rotating through
+    let keep_cur = st.cur.as_ref().map(|b| b.uid);
+    let keep_prev = st.prev.as_ref().map(|b| b.uid);
+    let stale: Vec<u64> = st
+        .fbs
+        .iter()
+        .filter(|(uid, e)| {
+            tick.saturating_sub(e.last_used) > SCANOUT_FB_IDLE
+                && Some(**uid) != keep_cur
+                && Some(**uid) != keep_prev
+        })
+        .map(|(uid, _)| *uid)
+        .collect();
+    for uid in stale {
+        if let Some(e) = st.fbs.remove(&uid) {
+            let _ = sys::rmfb(fd, e.fb);
+            scanout_release_handles(&mut st, fd, &e.handles);
+        }
+    }
+    Some(fb)
+}
+
+fn scanout_release_handles(
+    st: &mut ScanoutState,
+    fd: std::os::fd::BorrowedFd<'_>,
+    handles: &[u32],
+) {
+    for h in handles {
+        if let Some(rc) = st.handles.get_mut(h) {
+            *rc -= 1;
+            if *rc == 0 {
+                st.handles.remove(h);
+                let _ = crate::drm::sys::gem_close(fd, *h);
+            }
+        }
+    }
+}
+
+/// a buffer left the plane: its parked attachment may release now
+fn scanout_retire(state: &Rc<State>, buf: &Rc<crate::protocol::shm::WlBuffer>) {
+    let mut uids = state.scanout_uids.borrow_mut();
+    if let Some(i) = uids.iter().position(|&u| u == buf.uid) {
+        uids.swap_remove(i);
+    }
+    let gone = !uids.contains(&buf.uid);
+    drop(uids);
+    if gone {
+        // dropping the attachment sends the release
+        state.scanout_hold.borrow_mut().retain(|a| a.buf.uid != buf.uid);
+    }
+}
+
+/// drop every plane reference this output holds (vt away, flip errors)
+fn scanout_reset(state: &Rc<State>, out: &Rc<Output>) {
+    let (cur, prev) = {
+        let mut st = out.scanout.borrow_mut();
+        (st.cur.take(), st.prev.take())
+    };
+    for b in [cur, prev].into_iter().flatten() {
+        scanout_retire(state, &b);
+    }
+}
+
+/// the latest instant a latch can start and still make the next vblank,
+/// and the vblank it would make. None = no meaningful fixed deadline.
+/// a parked policy still aims - met deadlines are what un-park it - but
+/// the caller skips the sleep
+fn latch_deadline(state: &Rc<State>, out: &Rc<Output>) -> Option<(u64, u64)> {
+    if state.config.borrow().debug.latency_policy != crate::config::LatencyPolicy::LateLatch {
+        return None;
+    }
+    if vrr_wanted(state, out) || tearing_wanted(state, out) {
+        return None;
+    }
+    let period = period_ns(out);
+    let (sec, usec) = out.conn.flip_time.get();
+    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+    if period == 0 || flip_ns == 0 {
+        return None;
+    }
+    let floor_ns = state
+        .config
+        .borrow()
+        .debug
+        .latch_margin_us
+        .map(|us| us as u64 * 1000)
+        .unwrap_or(500_000);
+    let budget = out.sched.budget_ns(floor_ns);
+    let now = Time::now().nsec();
+    // the first vblank whose latch instant is still ahead of us
+    let k = (now + budget).saturating_sub(flip_ns).div_ceil(period).max(1);
+    let target = flip_ns + k * period;
+    Some((target - budget, target))
 }
 
 /// both scenes travel one step apart; out exits opposite the in's entry
@@ -1517,7 +1986,7 @@ pub fn start_ws_switch(state: &Rc<State>, out: &Rc<Output>, from: usize, to: usi
     let mut sw = out.ws_switch.borrow_mut();
     let anim = match &*sw {
         // a switch mid-slide restarts from the current progress
-        Some(cur) if !cur.anim.is_done(now) => crate::config::build_anim(
+        Some(cur) if !cur.anim.settled(now) => crate::config::build_anim(
             &state.anim_clock,
             motion,
             &cfg.animations,
@@ -1531,10 +2000,18 @@ pub fn start_ws_switch(state: &Rc<State>, out: &Rc<Output>, from: usize, to: usi
 }
 
 async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
+    let _cleanup = {
+        let st = state.clone();
+        let o = out.clone();
+        state
+            .eng
+            .spawn("present cleanup", async move { gpu_cleanup_loop(&st, &o).await })
+    };
     let mut dirty = false;
     loop {
         EitherEvent(&out.damage, &out.conn.vblank).await;
         let _ = out.conn.vblank.take();
+        sched_note_flip(out);
         // the completed flip carries the kernel timestamp its feedbacks
         // have been waiting for
         if !out.conn.flip_pending.get() && !out.inflight_fbs.borrow().is_empty() {
@@ -1543,24 +2020,33 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 // no fixed period exists under variable refresh
                 0
             } else {
-                out.conn
-                    .pipe
-                    .borrow()
-                    .as_ref()
-                    .map(|p| {
-                        let m = &p.mode;
-                        (m.htotal as u64 * m.vtotal as u64 * 1_000_000 / m.clock.max(1) as u64)
-                            as u32
-                    })
-                    .unwrap_or(0)
+                period_ns(out) as u32
             };
             let mut flags = crate::protocol::presentation::FLAG_HW_CLOCK
                 | crate::protocol::presentation::FLAG_HW_COMPLETION;
             if out.inflight_vsync.get() {
                 flags |= crate::protocol::presentation::FLAG_VSYNC;
             }
+            if out.inflight_zero_copy.get() {
+                flags |= crate::protocol::presentation::FLAG_ZERO_COPY;
+            }
+            crate::trace!(
+                "fb-present: n={} seq={} flip_t={}.{:06} t={}",
+                out.inflight_fbs.borrow().len(),
+                out.conn.seq64.get(),
+                sec,
+                usec,
+                Time::now().nsec()
+            );
             for fb in out.inflight_fbs.borrow_mut().drain(..) {
                 fb.presented(&out.conn.name, sec, usec * 1000, refresh, out.conn.seq64.get(), flags);
+            }
+        }
+        // the completed flip replaced whatever was on the plane before it
+        if !out.conn.flip_pending.get() {
+            let prev = out.scanout.borrow_mut().prev.take();
+            if let Some(p) = prev {
+                scanout_retire(state, &p);
             }
         }
         dirty |= out.damage.take();
@@ -1569,7 +2055,78 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         if !dirty || out.conn.flip_pending.get() || out.paused.get() {
             continue;
         }
+        // late latch: sleep until just before the last instant that still
+        // makes the coming vblank, so the freshest input and commits glass
+        let mut aim_ns = 0;
+        if let Some((deadline, target)) = latch_deadline(state, out) {
+            aim_ns = target;
+            if !out.sched.fallback.get() && deadline > Time::now().nsec() + MIN_SLACK_NS {
+                let _ = state.ring.timeout(Time::from_nsec(deadline)).await;
+                // whatever arrived with the timer - input completions,
+                // commits - routes before the scene is latched
+                state.eng.yield_now().await;
+                dirty |= out.damage.take();
+                if out.paused.get() {
+                    continue;
+                }
+            }
+        }
         dirty = false;
+        let latch_ns = Time::now().nsec();
+
+        // one client buffer as the whole frame: onto the plane, no render
+        if let Some((surface, buf)) = scanout_candidate(state, out) {
+            if let Some(fb) = scanout_fb(out, &buf) {
+                let fence = buf.dmabuf().and_then(|img| img.read_fence());
+                out.conn.vrr_want.set(vrr_wanted(state, out));
+                match out.conn.flip(&out.dev, fb, fence.as_ref().map(|f| f.as_raw_fd())) {
+                    Ok(FlipResult::Queued) => {
+                        out.inflight_vsync.set(true);
+                        out.inflight_zero_copy.set(true);
+                        if aim_ns != 0 {
+                            out.sched.target_ns.set(aim_ns);
+                        }
+                        // no compose collected these; they ride directly
+                        out.inflight_fbs
+                            .borrow_mut()
+                            .append(&mut surface.latched_feedbacks.borrow_mut());
+                        surface.shown.set(true);
+                        {
+                            let mut st = out.scanout.borrow_mut();
+                            if st.cur.as_ref().is_none_or(|c| c.uid != buf.uid) {
+                                state.scanout_uids.borrow_mut().push(buf.uid);
+                                st.prev = st.cur.replace(buf.clone());
+                            }
+                        }
+                        fire_callback_sweep(state);
+                        // captures compose their own copy of the scene; a
+                        // scanout frame still owes them the new-frame kick
+                        crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
+                        crate::protocol::session_lock::output_presented(state, &out.conn.name);
+                        crate::portal::cast::output_presented(state, &out.conn.name);
+                        continue;
+                    }
+                    Ok(FlipResult::NotPresented) => {
+                        dirty = true;
+                        out.damage.trigger();
+                        continue;
+                    }
+                    Err(crate::drm::device::DrmError::LostMaster) => {
+                        for fb in out.inflight_fbs.borrow_mut().drain(..) {
+                            fb.discarded();
+                        }
+                        scanout_reset(state, out);
+                        out.paused.set(true);
+                        dirty = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        // odd rejection: the composite path still owes a frame
+                        crate::trace!("scanout flip failed: {e}");
+                    }
+                }
+            }
+        }
 
         let back = 1 - out.front.get();
         let buf = &out.bufs[back];
@@ -1599,10 +2156,17 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             height: out.height,
             undefined: buf.undefined.get(),
         };
-        let frame = match out
-            .renderer
-            .render(&target, Some([0.1, 0.1, 0.1, 1.0]), &ops, waits)
-        {
+        // one submit: staged uploads, deferred offscreen passes, the scene
+        let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+        let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+        let frame = match out.renderer.render_frame(
+            uploads,
+            passes,
+            &target,
+            Some([0.1, 0.1, 0.1, 1.0]),
+            &ops,
+            waits,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("carrot: render failed: {e}");
@@ -1611,6 +2175,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         };
         state.frames_in_flight.set(state.frames_in_flight.get() + 1);
         buf.undefined.set(false);
+        let submit_ns = Time::now().nsec();
 
         // render fence into the commit
         let sync = frame.export_sync_file(&out.renderer).ok().map(Rc::new);
@@ -1640,13 +2205,31 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         match res {
             Ok(FlipResult::Queued) => {
                 out.front.set(back);
+                crate::trace!(
+                    "fb-flip: queued n={} t={}",
+                    out.present_fbs.borrow().len(),
+                    Time::now().nsec()
+                );
                 out.inflight_fbs
                     .borrow_mut()
                     .append(&mut out.present_fbs.borrow_mut());
+                if aim_ns != 0 {
+                    out.sched.target_ns.set(aim_ns);
+                    Sched::ewma(&out.sched.ewma_cpu, submit_ns.saturating_sub(latch_ns));
+                }
+                // a composited frame replaces any client buffer on the plane
+                out.inflight_zero_copy.set(false);
+                let mut st = out.scanout.borrow_mut();
+                if let Some(c) = st.cur.take() {
+                    st.prev = Some(c);
+                }
             }
             Ok(FlipResult::NotPresented) => {
-                // retry next wakeup with a fresh frame
+                // the pipe was momentarily busy (a cursor commit can hold
+                // it between vblanks) and no event follows: self-wake, or
+                // the retry waits on unrelated damage
                 dirty = true;
+                out.damage.trigger();
             }
             Err(crate::drm::device::DrmError::LostMaster) => {
                 // vt left between the pause signal and our commit; resume
@@ -1657,6 +2240,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 for fb in out.inflight_fbs.borrow_mut().drain(..) {
                     fb.discarded();
                 }
+                scanout_reset(state, out);
                 out.paused.set(true);
                 dirty = true;
             }
@@ -1667,16 +2251,58 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             }
         }
 
-        // fence fd doubles as the completion signal; drives cleanup + callbacks
-        let completed = sync.is_some();
-        if let Some(fd) = sync {
-            let _ = state.ring.readable(&fd).await;
+        // callbacks fire the moment the scene is latched and the flip is
+        // queued - the gpu tail is not the client's wait. a client that
+        // renders now still catches the next latch
+        fire_callback_sweep(state);
+        // everything gated on the render fence retires off-loop
+        let retired = if sync.is_some() {
+            std::mem::take(&mut *out.retired_tex.borrow_mut())
+        } else {
+            // no fence to wait: keep them for the next round, like before
+            Vec::new()
+        };
+        out.gpu_done.push(CleanupJob { frame, sync, retired, submit_ns });
+    }
+}
+
+/// frame callbacks for everything some compose (or scanout) marked shown
+/// since the last sweep; clients nobody can see stop rendering into the void
+fn fire_callback_sweep(state: &Rc<State>) {
+    let ms = (Time::now().nsec() / 1_000_000) as u32;
+    // the cursor surface never rides a scene walk but its client still
+    // paces animated cursors off frame callbacks
+    if let Some(seat) = state.seat.borrow().clone() {
+        if let crate::input::seat::CursorState::Surface(s) = &*seat.cursor.borrow() {
+            s.shown.set(true);
         }
-        // this frame is done sampling: retired textures can go now (kept
-        // for the next round if the fence export failed)
+    }
+    state.clients.for_each(|c| {
+        c.objects.for_each_surface(|s| {
+            if s.mapped.get() && s.shown.replace(false) {
+                s.fire_frame_callbacks(ms);
+            }
+        });
+    });
+}
+
+/// the render-fence side of a frame: texture retirement, dmabuf release
+/// accounting, frame recycling, and capture completion all wait on the gpu
+/// here, off the present loop
+async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
+    loop {
+        let job = out.gpu_done.pop().await;
+        let completed = job.sync.is_some();
+        if let Some(fd) = &job.sync {
+            let _ = state.ring.readable(fd).await;
+            // the gpu-tail sample for the latch scheduler; capped so a
+            // stalled queue can't poison the estimate for seconds
+            let tail = Time::now().nsec().saturating_sub(job.submit_ns);
+            Sched::ewma(&out.sched.ewma_gpu, tail.min(50_000_000));
+        }
         if completed {
-            for t in out.retired_tex.borrow_mut().drain(..) {
-                out.renderer.destroy_texture(&t);
+            for t in &job.retired {
+                out.renderer.destroy_texture(t);
             }
         }
         // frame done: parked dmabuf attachments release once NO output still
@@ -1686,17 +2312,8 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         if inflight == 0 {
             state.retired.borrow_mut().clear();
         }
-        out.renderer.recycle_frame(frame);
-        let ms = (Time::now().nsec() / 1_000_000) as u32;
-        state.clients.for_each(|c| {
-            c.objects.for_each_surface(|s| {
-                if s.mapped.get() {
-                    s.fire_frame_callbacks(ms);
-                }
-            });
-        });
-        // this present only ran because content changed: pending output
-        // captures complete against the frame just shown
+        out.renderer.recycle_frame(job.frame);
+        // pending output captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
         crate::protocol::session_lock::output_presented(state, &out.conn.name);
         crate::portal::cast::output_presented(state, &out.conn.name);
@@ -1842,6 +2459,32 @@ enum CapCursor {
     Never,
 }
 
+/// a cast source stays cached this long after its last feed
+const CAST_KEEP_NS: u64 = 1_000_000_000;
+
+/// captures mark what they sampled; the present sweep leaves those keys
+/// cached so the next tick reuses them
+fn note_cast_keys(out: &Rc<Output>, live: &[((ClientId, u64), u64)]) {
+    let now = Time::now().nsec();
+    let mut keep = out.cast_keep.borrow_mut();
+    for (k, _) in live {
+        keep.insert(*k, now);
+    }
+}
+
+/// how a composition treats animation state
+#[derive(Clone, Copy, PartialEq)]
+enum DrawMode {
+    /// the frame going to glass: full effects, prunes, bakes
+    Present,
+    /// offscreen copy of the live scene: reuse the presents' animation
+    /// visuals, never bake or prune
+    Capture,
+    /// offscreen copy of a hidden scene, pinned to rest: final rects,
+    /// no transforms
+    Rest,
+}
+
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     // presentation feedbacks are claimed only by display composes, never
     // by captures
@@ -1857,44 +2500,77 @@ fn compose_ops(
     cursor: CapCursor,
     ws_override: Option<usize>,
 ) -> Vec<RenderOp> {
-    // animations sample the moment this frame will glass, not "now"
-    let (sec, usec) = out.conn.flip_time.get();
-    let period_ns = out
-        .conn
-        .pipe
-        .borrow()
-        .as_ref()
-        .map(|p| {
-            let m = &p.mode;
-            m.htotal as u64 * m.vtotal as u64 * 1_000_000_000 / (m.clock.max(1) as u64 * 1000)
-        })
-        .unwrap_or(0);
-    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
-    let target = if flip_ns == 0 || period_ns == 0 || out.conn.vrr_want.get() {
-        crate::util::Time::now().nsec()
-    } else {
-        flip_ns + period_ns
-    };
-    state.anim_clock.freeze(target);
-    out.anim_pending.set(false);
+    let present = cursor == CapCursor::Present;
+    if present {
+        // animations sample the moment this frame will glass, not "now"
+        let (sec, usec) = out.conn.flip_time.get();
+        let period_ns = out
+            .conn
+            .pipe
+            .borrow()
+            .as_ref()
+            .map(|p| {
+                let m = &p.mode;
+                m.htotal as u64 * m.vtotal as u64 * 1_000_000_000 / (m.clock.max(1) as u64 * 1000)
+            })
+            .unwrap_or(0);
+        let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+        let target = if flip_ns == 0 || period_ns == 0 || out.conn.vrr_want.get() {
+            crate::util::Time::now().nsec()
+        } else {
+            // a flip that idled goes stale; the next glass is never
+            // earlier than now, and a past clock replays settled anims
+            (flip_ns + period_ns).max(crate::util::Time::now().nsec())
+        };
+        state.anim_clock.freeze(target);
+        out.anim_pending.set(false);
+        out.retired_tex
+            .borrow_mut()
+            .extend(state.retire_tex.borrow_mut().drain(..));
+    }
+    // captures sample at the already-frozen clock and must not disturb
+    // the present's redraw latch: their scene isn't the one on glass
+    let latch = out.anim_pending.get();
+    let ops = compose_scene(state, out, cursor, ws_override);
+    if !present {
+        out.anim_pending.set(latch);
+    }
+    ops
+}
 
+fn compose_scene(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    cursor: CapCursor,
+    ws_override: Option<usize>,
+) -> Vec<RenderOp> {
+    let mode = if cursor == CapCursor::Present {
+        DrawMode::Present
+    } else if ws_override.is_some() {
+        DrawMode::Rest
+    } else {
+        DrawMode::Capture
+    };
     let mut ops = Vec::new();
-    let mut live: Vec<(ClientId, u64)> = Vec::new();
+    let mut live: Vec<((ClientId, u64), u64)> = Vec::new();
     // a locked session shows nothing but the lock surface; an output
     // without one stays a cleared frame
     if crate::protocol::session_lock::locked(state) {
         let screen = out.rect();
         if let Some(s) = crate::protocol::session_lock::compose_locked(state, &out.conn.name) {
-            draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, &mut ops, &mut live);
+            draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, 0.0, &mut ops, &mut live);
         }
         if cursor != CapCursor::Never {
             draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
+        }
+        if mode != DrawMode::Present {
+            return ops;
         }
         // normal content must not keep textures alive across the lock
         let mut textures = out.textures.borrow_mut();
         let stale: Vec<_> = textures
             .keys()
-            .filter(|k| !live.contains(k))
+            .filter(|k| !live.iter().any(|(lk, _)| lk == *k))
             .copied()
             .collect();
         for k in stale {
@@ -1920,18 +2596,23 @@ fn compose_ops(
     let fs = ws.fullscreen.borrow().clone();
     let screen = out.rect();
     let cfg = state.config.borrow().clone();
+    ensure_blur_cache(state, out, screen, &cfg);
 
     // paint order: background, bottom, tiled, fullscreen, floats, top,
     // overlay, layer popups; fullscreen hides everything below itself
     // except overlay
+    // rest composes pin layers too: no anim transforms, no prunes
+    let lrest = mode == DrawMode::Rest;
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
-        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
+        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live, lrest);
+        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live, lrest);
     }
     let sw = out.ws_switch.borrow().clone();
     let now = state.anim_clock.now();
     match &sw {
-        Some(s) if !s.anim.is_done(now) => {
+        // a live switch belongs to the glass; rest composes show their
+        // workspace in place
+        Some(s) if mode != DrawMode::Rest && !s.anim.settled(now) => {
             let p = s.anim.clamped_value(now);
             // full ndc span plus a tenth of it as the gap between scenes
             let step = 2.2 * s.dist;
@@ -1940,28 +2621,28 @@ fn compose_ops(
             let from = state.workspaces.borrow().get(s.from_ws).cloned();
             if let Some(from) = from {
                 let mark = ops.len();
-                ws_scene(state, out, &from, &focused, &cfg, screen, &mut ops, &mut live);
+                ws_scene(state, out, &from, &focused, &cfg, screen, &mut ops, &mut live, mode);
                 let d = if s.vert { [0.0, off_out as f32] } else { [off_out as f32, 0.0] };
-                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_out, d);
+                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_out, d, out_dims(out));
             }
             let mark = ops.len();
-            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live);
+            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live, mode);
             let d = if s.vert { [0.0, off_in as f32] } else { [off_in as f32, 0.0] };
-            apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_in, d);
+            apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_in, d, out_dims(out));
             out.anim_pending.set(true);
         }
         _ => {
-            if sw.is_some() {
+            if sw.is_some() && mode == DrawMode::Present {
                 *out.ws_switch.borrow_mut() = None;
             }
-            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live);
+            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live, mode);
         }
     }
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live);
-        draw_closing_list(state, out, &out.closing_layers, &mut ops);
+        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live, lrest);
+        draw_closing_list(state, out, &out.closing_layers, &mut ops, mode);
     }
-    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
+    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live, lrest);
     draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
     // a drag icon rides the pointer, above everything but the cursor
     if ws_override.is_none() {
@@ -1970,7 +2651,7 @@ fn compose_ops(
                 if let Some(icon) = drag.icon.borrow().clone() {
                     let (dx, dy) = drag.icon_off.get();
                     let (px, py) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
-                    draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, &mut ops, &mut live);
+                    draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, 0.0, &mut ops, &mut live);
                 }
             }
         }
@@ -1979,15 +2660,25 @@ fn compose_ops(
         draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
     }
 
-    // an override composes a side scene; only the present retires textures
+    // an override composes a side scene: mark its sources so the present
+    // sweep keeps them cached between ticks instead of evict/import churn
     if ws_override.is_some() {
+        note_cast_keys(out, &live);
         return ops;
     }
-    // textures for gone buffers don't outlive the frame
+    // captures observe; only the present's sweep evicts
+    if mode != DrawMode::Present {
+        return ops;
+    }
+    // textures for gone buffers don't outlive the frame, except cast
+    // sources fed within the last second
+    let now_ns = Time::now().nsec();
+    let mut keep = out.cast_keep.borrow_mut();
+    keep.retain(|_, t| now_ns.saturating_sub(*t) < CAST_KEEP_NS);
     let mut textures = out.textures.borrow_mut();
     let stale: Vec<_> = textures
         .keys()
-        .filter(|k| !live.contains(k))
+        .filter(|k| !live.iter().any(|(lk, _)| lk == *k) && !keep.contains_key(*k))
         .copied()
         .collect();
     for k in stale {
@@ -2007,15 +2698,23 @@ fn draw_surface_tree(
     y: i32,
     clip: Rect,
     alpha: f32,
+    round: f32,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     if !surface.mapped.get() {
         return;
     }
+    surface.shown.set(true);
     if out.collect_fbs.get() {
         let mut latched = surface.latched_feedbacks.borrow_mut();
         if !latched.is_empty() {
+            crate::trace!(
+                "fb-collect: surface {} n={} t={}",
+                surface.id,
+                latched.len(),
+                Time::now().nsec()
+            );
             out.present_fbs.borrow_mut().append(&mut latched);
         }
     }
@@ -2032,16 +2731,16 @@ fn draw_surface_tree(
         drop(children);
         for sub in &stack[..below] {
             let (px, py) = sub.position.get();
-            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, ops, live);
+            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, round, ops, live);
         }
-        draw_buffer(out, surface, x, y, clip, alpha, ops, live);
+        draw_buffer(out, surface, x, y, clip, alpha, round, ops, live);
         for sub in &stack[below..] {
             let (px, py) = sub.position.get();
-            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, ops, live);
+            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, round, ops, live);
         }
     } else {
         drop(children);
-        draw_buffer(out, surface, x, y, clip, alpha, ops, live);
+        draw_buffer(out, surface, x, y, clip, alpha, round, ops, live);
     }
 }
 
@@ -2053,7 +2752,7 @@ fn draw_popup(
     oy: i32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     if !p.xdg.surface.mapped.get() {
         return;
@@ -2061,7 +2760,7 @@ fn draw_popup(
     let (rx, ry) = p.rel.get();
     let (px, py) = (ox + rx, oy + ry);
     let geo = p.xdg.geometry();
-    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, 1.0, ops, live);
+    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, 1.0, 0.0, ops, live);
     draw_popups(state, out, &p.xdg, px, py, screen, ops, live);
 }
 
@@ -2073,19 +2772,21 @@ fn draw_popups(
     oy: i32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
 }
 
-// one shell layer, mapping order = z within it
+// one shell layer, mapping order = z within it. rest draws for offscreen
+// bakes: no anim transform, no latch arming, no last_batch overwrite
 fn draw_layer(
     state: &Rc<State>,
     out: &Rc<Output>,
     layer: u32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+    rest: bool,
 ) {
     let layers = state.layers.borrow().clone();
     for ls in layers.iter() {
@@ -2098,12 +2799,28 @@ fn draw_layer(
         let r = ls.rect.get();
         let mark = ops.len();
         let lmark = live.len();
-        draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, ops, live);
+        draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, 0.0, ops, live);
+        // the backdrop clips to the surface's own alpha, so it can only be
+        // built once draw_buffer cached the texture; it slides under the
+        // surface here and stays out of the seized batch (the cache view
+        // isn't the batch's to keep)
+        let mut cmark = mark;
+        if layer > crate::shell::layer::BOTTOM {
+            if let Some(thr) = layer_blur(&state.config.borrow().clone(), &ls.namespace) {
+                if let Some(op) = blur_mask_op(out, &ls.surface, r, thr) {
+                    ops.insert(mark, op);
+                    cmark += 1;
+                }
+            }
+        }
+        if rest {
+            continue;
+        }
         let anim = ls.anim.borrow().clone();
         if let Some((a, style)) = anim {
             use crate::config::Style;
             let now = state.anim_clock.now();
-            if a.is_done(now) {
+            if a.settled(now) {
                 *ls.anim.borrow_mut() = None;
             } else {
                 let p = a.clamped_value(now);
@@ -2118,11 +2835,15 @@ fn draw_layer(
                     }
                     _ => (1.0, 1.0, [0.0, 0.0]),
                 };
-                apply_batch(&mut ops[mark..], center_ndc(out, r), scale, alpha, d);
+                apply_batch(&mut ops[mark..], center_ndc(out, r), scale, alpha, d, out_dims(out));
                 out.anim_pending.set(true);
             }
         }
-        *ls.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
+        *ls.last_batch.borrow_mut() = (
+            ops[cmark..].to_vec(),
+            live[lmark..].to_vec(),
+            0..(ops.len() - cmark),
+        );
     }
 }
 
@@ -2134,7 +2855,7 @@ fn draw_layer_popups(
     fs_active: bool,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     let layers = state.layers.borrow().clone();
     for ls in layers.iter() {
@@ -2158,8 +2879,9 @@ fn draw_buffer(
     y: i32,
     clip: Rect,
     alpha: f32,
+    round: f32,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
 ) {
     let buffer = s.buffer.borrow();
     let Some(att) = buffer.as_ref() else { return };
@@ -2236,7 +2958,7 @@ fn draw_buffer(
             let res = if let Some(px) = shadow.as_ref().filter(|p| p.len() >= need) {
                 // the commit-time shadow is the source of truth
                 out.renderer
-                    .upload_texture(&entry.0, |dst| dst[..need].copy_from_slice(&px[..need]))
+                    .stage_upload(&entry.0, |dst| dst[..need].copy_from_slice(&px[..need]))
             } else {
                 // no shadow (capture failed): read the client buffer,
                 // zero-filling any short row instead of leaking staging
@@ -2245,7 +2967,7 @@ fn draw_buffer(
                     Some(a) => a,
                     None => return,
                 };
-                out.renderer.upload_texture(&entry.0, |dst| match access {
+                out.renderer.stage_upload(&entry.0, |dst| match access {
                     ShmAccess::Ptr(p) => {
                         for yy in 0..bh as usize {
                             unsafe {
@@ -2278,46 +3000,323 @@ fn draw_buffer(
                     }
                 })
             };
-            if let Err(e) = res {
-                eprintln!("carrot: upload failed: {e}");
-                return;
+            match res {
+                Ok(up) => out.preuploads.borrow_mut().push(up),
+                Err(e) => {
+                    eprintln!("carrot: upload failed: {e}");
+                    return;
+                }
             }
             entry.1 = cur;
         }
     }
-    live.push(key);
+    let textures = out.textures.borrow();
+    let (tex, _) = textures.get(&key).unwrap();
+    live.push((key, tex.uid));
     let (sw, sh) = s.size.get();
     let dst = Rect::new_sized_saturating(x, y, sw, sh);
     let vis = dst.intersect(clip);
     if vis.is_empty() {
         return;
     }
-    let textures = out.textures.borrow();
-    let (tex, _) = textures.get(&key).unwrap();
     let (gx, gy) = out.pos.get();
     let fx = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
     let fy = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
-    ops.push(RenderOp::Tex {
-        view: tex.view,
-        pos: [fx(vis.x1), fy(vis.y1)],
-        size: [
-            (vis.width()) as f32 / out.width as f32 * 2.0,
-            (vis.height()) as f32 / out.height as f32 * 2.0,
-        ],
-        uv_pos: [
-            (vis.x1 - dst.x1) as f32 / sw as f32,
-            (vis.y1 - dst.y1) as f32 / sh as f32,
-        ],
-        uv_size: [
-            vis.width() as f32 / sw as f32,
-            vis.height() as f32 / sh as f32,
-        ],
-        mul: alpha,
-        opaque: opaque && alpha >= 1.0,
+    let pos = [fx(vis.x1), fy(vis.y1)];
+    let size = [
+        (vis.width()) as f32 / out.width as f32 * 2.0,
+        (vis.height()) as f32 / out.height as f32 * 2.0,
+    ];
+    let uv_pos = [
+        (vis.x1 - dst.x1) as f32 / sw as f32,
+        (vis.y1 - dst.y1) as f32 / sh as f32,
+    ];
+    let uv_size = [
+        vis.width() as f32 / sw as f32,
+        vis.height() as f32 / sh as f32,
+    ];
+    if round >= 0.5 {
+        // clip corners against the window geometry, not this quad
+        ops.push(RenderOp::TexR {
+            view: tex.view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: alpha,
+            geo_px: [
+                (clip.x1 - gx) as f32,
+                (clip.y1 - gy) as f32,
+                clip.width() as f32,
+                clip.height() as f32,
+            ],
+            radius: round,
+        });
+    } else {
+        ops.push(RenderOp::Tex {
+            view: tex.view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: alpha,
+            opaque: opaque && alpha >= 1.0,
+        });
+    }
+}
+
+/// a layer surface whose namespace hits a blur rule samples the cache;
+/// the value is the rule's alpha gate (0 = the whole rect)
+fn layer_blur(cfg: &crate::config::Config, ns: &str) -> Option<f32> {
+    cfg.decoration.blur.as_ref()?;
+    cfg.layer_rules
+        .iter()
+        .find(|r| r.blur && r.matches.iter().any(|m| m.matches(ns)))
+        .map(|r| r.ignore_alpha.unwrap_or(0.0) as f32)
+}
+
+fn blur_consumers_visible(state: &Rc<State>, out: &Rc<Output>, cfg: &crate::config::Config) -> bool {
+    if cfg.decoration.blur.is_none() {
+        return false;
+    }
+    let ws = state.workspaces.borrow().get(out.ws.get()).cloned();
+    let fs = ws.as_ref().and_then(|w| w.fullscreen.borrow().clone());
+    for ls in state.layers.borrow().iter() {
+        // the cache's own sources can't consume it, and fullscreen hides
+        // every band but the overlay
+        let layer = ls.current.get().layer;
+        if ls.output.get() == out.index.get()
+            && ls.mapped()
+            && layer > crate::shell::layer::BOTTOM
+            && (fs.is_none() || layer == crate::shell::layer::OVERLAY)
+            && layer_blur(cfg, &ls.namespace).is_some()
+        {
+            return true;
+        }
+    }
+    let mut hit = false;
+    if let Some(ws) = &ws {
+        if fs.is_none() {
+            ws.for_each(|w| hit |= w.rule_blur.get());
+        } else if cfg.layout.float_above_fullscreen {
+            for w in ws.floats.borrow().iter() {
+                hit |= w.rule_blur.get();
+            }
+        }
+    }
+    hit
+}
+
+/// rebuild the blurred backdrop when needed; any failure leaves the cache
+/// empty and the consumers draw without it
+fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &crate::config::Config) {
+    let Some(bc) = &cfg.decoration.blur else {
+        if let Some(old) = out.blur.borrow_mut().take() {
+            state.retire_tex.borrow_mut().extend(old.levels);
+        }
+        return;
+    };
+    if !blur_consumers_visible(state, out, cfg) {
+        return;
+    }
+    // a clean cache is only reusable at the current mode's dimensions
+    let fits_now = out.blur.borrow().as_ref().is_some_and(|c| {
+        c.levels.first().is_some_and(|t| (t.width, t.height) == (out.width, out.height))
     });
+    if !out.blur_dirty.replace(false) && fits_now {
+        return;
+    }
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live, true);
+    draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live, true);
+    let passes = bc.passes.clamp(1, 4) as u32;
+    let need: Vec<(u32, u32)> = (0..=passes)
+        .map(|i| ((out.width >> i).max(1), (out.height >> i).max(1)))
+        .collect();
+    {
+        let mut slot = out.blur.borrow_mut();
+        let fits = slot.as_ref().is_some_and(|c| {
+            c.levels.len() == need.len()
+                && c.levels.iter().zip(&need).all(|(t, n)| (t.width, t.height) == *n)
+        });
+        if !fits {
+            if let Some(old) = slot.take() {
+                state.retire_tex.borrow_mut().extend(old.levels);
+            }
+            let mut levels = Vec::new();
+            for (w, h) in &need {
+                match out.renderer.create_render_texture(*w, *h) {
+                    Ok(t) => levels.push(t),
+                    Err(e) => {
+                        eprintln!("carrot: blur cache alloc failed: {e}");
+                        state.retire_tex.borrow_mut().extend(levels);
+                        return;
+                    }
+                }
+            }
+            *slot = Some(BlurCache { levels });
+        }
+    }
+    // the whole chain defers into the next submit; each pass samples the
+    // previous one through its release barrier, never a cpu wait
+    let slot = out.blur.borrow();
+    let cache = slot.as_ref().unwrap();
+    let mut pp = out.prepasses.borrow_mut();
+    let black = Some([0.0, 0.0, 0.0, 1.0]);
+    pp.push(PrePass::new(&cache.levels[0], black, ops));
+    let sz = bc.size as f32;
+    for i in 0..passes as usize {
+        let (src, dst) = (&cache.levels[i], &cache.levels[i + 1]);
+        let hp = [0.5 / dst.width as f32 * sz, 0.5 / dst.height as f32 * sz];
+        let first = i == 0;
+        let op = RenderOp::Blur {
+            view: src.view,
+            halfpixel: hp,
+            extra_a: if first { bc.contrast as f32 } else { 1.0 },
+            extra_b: if first { bc.brightness as f32 } else { 1.0 },
+            up: false,
+        };
+        pp.push(PrePass::new(dst, black, vec![op]));
+    }
+    for i in (0..passes as usize).rev() {
+        let (src, dst) = (&cache.levels[i + 1], &cache.levels[i]);
+        // both directions space taps by the render target's half-pixel;
+        // source-derived spacing doubled the upsample kernel per level
+        let hp = [0.5 / dst.width as f32 * sz, 0.5 / dst.height as f32 * sz];
+        let last = i == 0;
+        let op = RenderOp::Blur {
+            view: src.view,
+            halfpixel: hp,
+            extra_a: if last { bc.noise as f32 } else { 0.0 },
+            extra_b: 0.0,
+            up: true,
+        };
+        pp.push(PrePass::new(dst, black, vec![op]));
+    }
+}
+
+/// the backdrop gated by the surface's own alpha; needs the texture
+/// draw_buffer cached earlier in this compose. None (no cache, no buffer,
+/// import failed) means no backdrop at all - better than a full-rect smudge
+fn blur_mask_op(out: &Rc<Output>, s: &Rc<WlSurface>, r: Rect, threshold: f32) -> Option<RenderOp> {
+    let slot = out.blur.borrow();
+    let cache = slot.as_ref()?;
+    let buffer = s.buffer.borrow();
+    let att = buffer.as_ref()?;
+    let key = if att.buf.dmabuf().is_some() {
+        (s.client.id, att.buf.uid)
+    } else {
+        (s.client.id, s.uid)
+    };
+    let textures = out.textures.borrow();
+    let (tex, _) = textures.get(&key)?;
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    Some(RenderOp::BlurMask {
+        cache_view: cache.levels.first()?.view,
+        surface_view: tex.view,
+        pos: [fxp(r.x1), fyp(r.y1)],
+        size: [
+            r.width() as f32 / out.width as f32 * 2.0,
+            r.height() as f32 / out.height as f32 * 2.0,
+        ],
+        buv_pos: [
+            (r.x1 - gx) as f32 / out.width as f32,
+            (r.y1 - gy) as f32 / out.height as f32,
+        ],
+        buv_size: [
+            r.width() as f32 / out.width as f32,
+            r.height() as f32 / out.height as f32,
+        ],
+        threshold,
+        mul: 1.0,
+    })
+}
+
+/// solid black over the window's box, rounded like the content it hides
+fn push_blackout(out: &Rc<Output>, rect: Rect, round: f32, ops: &mut Vec<RenderOp>) {
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    let pos = [fxp(rect.x1), fyp(rect.y1)];
+    let size = [
+        rect.width() as f32 / out.width as f32 * 2.0,
+        rect.height() as f32 / out.height as f32 * 2.0,
+    ];
+    let black = [0.0, 0.0, 0.0, 1.0];
+    if round >= 0.5 {
+        // a ring wider than the box is a rounded fill
+        ops.push(RenderOp::Border {
+            pos,
+            size,
+            rect_px: [
+                (rect.x1 - gx) as f32,
+                (rect.y1 - gy) as f32,
+                rect.width() as f32,
+                rect.height() as f32,
+            ],
+            radius: round,
+            width: rect.width().max(rect.height()) as f32,
+            color: black,
+        });
+    } else {
+        ops.push(RenderOp::Fill { pos, size, color: black });
+    }
+}
+
+/// the blurred backdrop under a rect, rounded to taste
+fn push_blur_backdrop(out: &Rc<Output>, r: Rect, round: f32, ops: &mut Vec<RenderOp>) {
+    let slot = out.blur.borrow();
+    let Some(cache) = slot.as_ref() else { return };
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    let pos = [fxp(r.x1), fyp(r.y1)];
+    let size = [
+        r.width() as f32 / out.width as f32 * 2.0,
+        r.height() as f32 / out.height as f32 * 2.0,
+    ];
+    let uv_pos = [
+        (r.x1 - gx) as f32 / out.width as f32,
+        (r.y1 - gy) as f32 / out.height as f32,
+    ];
+    let uv_size = [
+        r.width() as f32 / out.width as f32,
+        r.height() as f32 / out.height as f32,
+    ];
+    if round >= 0.5 {
+        ops.push(RenderOp::TexR {
+            view: cache.levels[0].view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: 1.0,
+            geo_px: [
+                (r.x1 - gx) as f32,
+                (r.y1 - gy) as f32,
+                r.width() as f32,
+                r.height() as f32,
+            ],
+            radius: round,
+        });
+    } else {
+        ops.push(RenderOp::Tex {
+            view: cache.levels[0].view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: 1.0,
+            opaque: true,
+        });
+    }
 }
 
 /// one workspace's content: tiled, closings, fullscreen, floats
+#[allow(clippy::too_many_arguments)]
 fn ws_scene(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -2326,36 +3325,198 @@ fn ws_scene(
     cfg: &crate::config::Config,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+    mode: DrawMode,
 ) {
     let fs = ws.fullscreen.borrow().clone();
     if fs.is_none() {
         let mark = ops.len();
         ws.tiling
-            .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live));
-        draw_closings(state, out, ws, ops);
-        if ws.tiling.mode() == crate::config::LayoutMode::Scrolling {
+            .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live, mode));
+        draw_closings(state, out, ws, ops, mode);
+        if ws.tiling.mode() == crate::config::LayoutMode::Scrolling && mode != DrawMode::Rest {
             let now = state.anim_clock.now();
             let dx = ws.tiling.strip.draw_offset_px(now);
             if dx.abs() >= 0.5 {
                 let d = [(dx / out.width as f64 * 2.0) as f32, 0.0];
-                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, 1.0, d);
+                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, 1.0, d, out_dims(out));
                 out.anim_pending.set(true);
-            } else {
+            } else if mode == DrawMode::Present {
                 *ws.tiling.strip.view_anim.borrow_mut() = None;
             }
         }
     }
     if let Some(f) = &fs {
-        draw_window(state, out, focused, cfg, screen, f, ops, live);
+        draw_window(state, out, focused, cfg, screen, f, ops, live, mode);
     }
     if fs.is_none() || cfg.layout.float_above_fullscreen {
         for win in ws.floats.borrow().iter() {
-            draw_window(state, out, focused, cfg, screen, win, ops, live);
+            draw_window(state, out, focused, cfg, screen, win, ops, live, mode);
         }
     }
 }
 
+/// re-express screen-space ops in the local ndc of a texture covering `r`
+fn remap_local(ops: &mut [RenderOp], out: &Output, r: Rect) {
+    let (gx, gy) = out.pos.get();
+    let rx = (r.x1 - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let ry = (r.y1 - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    let rw = (r.width() as f32 / out.width as f32 * 2.0).max(1e-6);
+    let rh = (r.height() as f32 / out.height as f32 * 2.0).max(1e-6);
+    let (px, py) = ((r.x1 - gx) as f32, (r.y1 - gy) as f32);
+    let map_pos = |pos: &mut [f32; 2], size: &mut [f32; 2]| {
+        pos[0] = (pos[0] - rx) / rw * 2.0 - 1.0;
+        pos[1] = (pos[1] - ry) / rh * 2.0 - 1.0;
+        size[0] = size[0] / rw * 2.0;
+        size[1] = size[1] / rh * 2.0;
+    };
+    for op in ops {
+        match op {
+            RenderOp::Fill { pos, size, .. } => map_pos(pos, size),
+            RenderOp::Tex { pos, size, .. } => map_pos(pos, size),
+            RenderOp::TexR { pos, size, geo_px, .. } => {
+                map_pos(pos, size);
+                geo_px[0] -= px;
+                geo_px[1] -= py;
+            }
+            RenderOp::Border { pos, size, rect_px, .. } => {
+                map_pos(pos, size);
+                rect_px[0] -= px;
+                rect_px[1] -= py;
+            }
+            RenderOp::Shadow { pos, size, win_px, .. } => {
+                map_pos(pos, size);
+                win_px[0] -= px;
+                win_px[1] -= py;
+            }
+            RenderOp::Xfade { pos, size, geo_px, .. } => {
+                map_pos(pos, size);
+                geo_px[0] -= px;
+                geo_px[1] -= py;
+            }
+            RenderOp::Blur { .. } => {}
+            RenderOp::BlurMask { pos, size, .. } => map_pos(pos, size),
+        }
+    }
+}
+
+/// bake/refresh the crossfade textures and emit the mixing quad; false
+/// means degrade to a plain draw (the caller snaps the anim)
+#[allow(clippy::too_many_arguments)]
+fn draw_resize_xfade(
+    out: &Rc<Output>,
+    win: &Rc<crate::tree::Window>,
+    arect: Rect,
+    round: f32,
+    progress: f64,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+) -> bool {
+    let surface = win.surface();
+    let target = win.rect.get();
+    let geo = win.geometry();
+    // current content, drawn fresh at the target size into the live side
+    let mut tmp = Vec::new();
+    let mut tl = Vec::new();
+    draw_surface_tree(
+        out,
+        &surface,
+        target.x1 - geo.x1,
+        target.y1 - geo.y1,
+        target,
+        1.0,
+        0.0,
+        &mut tmp,
+        &mut tl,
+    );
+    if tmp.is_empty() {
+        return false;
+    }
+    remap_local(&mut tmp, out, target);
+    let mut m = win.anims.borrow_mut();
+    let Some(rz) = m.resize.as_mut() else { return false };
+    // the old content bakes exactly once, from the last composed batch:
+    // surface ops only (decorations draw live), and never from views whose
+    // textures were destroyed or replaced since - a key can outlive its
+    // texture (shm reallocs and re-imports reuse it), so match uids
+    if rz.snapshot.is_none() {
+        let (all_ops, keys, srange) = win.last_batch.borrow().clone();
+        if all_ops.is_empty() || srange.is_empty() {
+            return false;
+        }
+        {
+            let t = out.textures.borrow();
+            if keys
+                .iter()
+                .any(|(k, uid)| t.get(k).map(|(tex, _)| tex.uid) != Some(*uid))
+            {
+                return false;
+            }
+        }
+        let mut old_ops = all_ops[srange].to_vec();
+        remap_local(&mut old_ops, out, rz.from_rect);
+        let (fw, fh) = (rz.from_rect.width().max(1), rz.from_rect.height().max(1));
+        let tex = match out.renderer.create_render_texture(fw as u32, fh as u32) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        out.prepasses
+            .borrow_mut()
+            .push(PrePass::new(&tex, Some([0.0; 4]), old_ops));
+        rz.snapshot = Some(tex);
+    }
+    // the live side re-renders every frame. the texture is allocated once
+    // per fade - the mixing quad stretches 0..1 either way, so a retarget
+    // just changes the render's resolution, never the allocation
+    if rz.live.is_none() {
+        let (tw, th) = (target.width().max(1) as u32, target.height().max(1) as u32);
+        match out.renderer.create_render_texture(tw, th) {
+            Ok(t) => rz.live = Some(t),
+            Err(_) => return false,
+        }
+    }
+    let live_tex = rz.live.as_ref().unwrap();
+    out.prepasses
+        .borrow_mut()
+        .push(PrePass::new(live_tex, Some([0.0; 4]), tmp));
+    live.extend(tl);
+    push_xfade_op(out, arect, round, progress, rz.snapshot.as_ref().unwrap(), live_tex, ops);
+    true
+}
+
+/// the mixing quad between two baked sides of a resize
+fn push_xfade_op(
+    out: &Rc<Output>,
+    arect: Rect,
+    round: f32,
+    progress: f64,
+    from: &Texture,
+    to: &Texture,
+    ops: &mut Vec<RenderOp>,
+) {
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    ops.push(RenderOp::Xfade {
+        from_view: from.view,
+        to_view: to.view,
+        pos: [fxp(arect.x1), fyp(arect.y1)],
+        size: [
+            arect.width() as f32 / out.width as f32 * 2.0,
+            arect.height() as f32 / out.height as f32 * 2.0,
+        ],
+        progress: progress as f32,
+        geo_px: [
+            (arect.x1 - gx) as f32,
+            (arect.y1 - gy) as f32,
+            arect.width() as f32,
+            arect.height() as f32,
+        ],
+        radius: round,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_window(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -2364,7 +3525,8 @@ fn draw_window(
     screen: Rect,
     win: &Rc<crate::tree::Window>,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, u64)>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+    mode: DrawMode,
 ) {
     let surface = win.surface();
     if !surface.mapped.get() {
@@ -2372,9 +3534,95 @@ fn draw_window(
     }
     let mark = ops.len();
     let lmark = live.len();
-    let rect = win.visual_rect(state);
-    if win.anims_live(state.anim_clock.now()) {
-        out.anim_pending.set(true);
+    let rect = if mode == DrawMode::Rest {
+        win.rect.get()
+    } else {
+        win.visual_rect(state)
+    };
+    // a settled crossfade retires its textures; a live one shrinks the
+    // drawn rect to the animated size. only presents prune - captures
+    // observing a settled anim just draw plainly
+    let rz_progress = if mode == DrawMode::Rest {
+        None
+    } else {
+        let now = state.anim_clock.now();
+        let mut m = win.anims.borrow_mut();
+        match &mut m.resize {
+            Some(rz) if rz.anim.settled(now) => {
+                if mode == DrawMode::Present {
+                    let mut q = state.retire_tex.borrow_mut();
+                    q.extend(rz.snapshot.take());
+                    q.extend(rz.live.take());
+                    m.resize = None;
+                    // one more compose drains the retire queue it just fed
+                    out.anim_pending.set(true);
+                }
+                None
+            }
+            Some(rz) => Some((rz.anim.clamped_value(now), rz.from)),
+            None => None,
+        }
+    };
+    let rect = match rz_progress {
+        Some((p, from)) => {
+            let w = from.0 as f64 + (rect.width() - from.0) as f64 * p;
+            let h = from.1 as f64 + (rect.height() - from.1) as f64 * p;
+            Rect::new_sized_saturating(
+                rect.x1,
+                rect.y1,
+                (w.round() as i32).max(1),
+                (h.round() as i32).max(1),
+            )
+        }
+        None => rect,
+    };
+    let round = if win.fullscreen.get() {
+        0.0
+    } else {
+        win.rule_rounding
+            .get()
+            .unwrap_or(cfg.decoration.rounding)
+            .max(0) as f32
+    };
+    // a rule-hidden window leaves the compositor only as a black stand-in
+    if mode != DrawMode::Present && win.rule_no_capture.get() {
+        push_blackout(out, rect, round, ops);
+        return;
+    }
+    if win.rule_blur.get() && !win.fullscreen.get() {
+        push_blur_backdrop(out, rect, round, ops);
+    }
+    let cmark = ops.len();
+    if !win.fullscreen.get() && win.rule_shadow.get().unwrap_or(true) {
+        if let Some(sc) = &cfg.decoration.shadow {
+            let (gx, gy) = out.pos.get();
+            let (ox, oy) = sc.offset;
+            let sr = Rect {
+                x1: rect.x1 - sc.size + ox,
+                y1: rect.y1 - sc.size + oy,
+                x2: rect.x2 + sc.size + ox,
+                y2: rect.y2 + sc.size + oy,
+            };
+            let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+            let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+            ops.push(RenderOp::Shadow {
+                pos: [fxp(sr.x1), fyp(sr.y1)],
+                size: [
+                    sr.width() as f32 / out.width as f32 * 2.0,
+                    sr.height() as f32 / out.height as f32 * 2.0,
+                ],
+                win_px: [
+                    (rect.x1 - gx + ox) as f32,
+                    (rect.y1 - gy + oy) as f32,
+                    rect.width() as f32,
+                    rect.height() as f32,
+                ],
+                radius: round,
+                range: sc.size as f32,
+                power: sc.power as f32,
+                color: sc.color,
+            });
+        }
     }
     if !win.fullscreen.get() {
         let want = match focused {
@@ -2388,17 +3636,93 @@ fn draw_window(
             None => cfg.layout.border.inactive,
         };
         let color = win.border_color_now(state, want);
-        push_borders(out, rect, cfg.layout.border.width, color, ops);
+        push_borders(out, rect, cfg.layout.border.width, round, color, ops);
     }
     let geo = win.geometry();
     let alpha = win.rule_opacity.get().unwrap_or(1.0);
-    draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, ops, live);
+    let smark = ops.len();
+    let mut xfaded = false;
+    if let Some((p, _)) = rz_progress {
+        if mode == DrawMode::Present {
+            xfaded = draw_resize_xfade(out, win, rect, round, p, ops, live);
+            if !xfaded {
+                // degrade: snap the crossfade, draw plainly
+                let mut m = win.anims.borrow_mut();
+                if let Some(rz) = &mut m.resize {
+                    let mut q = state.retire_tex.borrow_mut();
+                    q.extend(rz.snapshot.take());
+                    q.extend(rz.live.take());
+                }
+                m.resize = None;
+                out.anim_pending.set(true);
+            }
+        } else {
+            // captures reuse whatever the presents already baked; a
+            // missing side draws plain, snapping nothing
+            let m = win.anims.borrow();
+            if let Some(rz) = &m.resize {
+                if let (Some(snap), Some(livet)) = (&rz.snapshot, &rz.live) {
+                    push_xfade_op(out, rect, round, p, snap, livet, ops);
+                    xfaded = true;
+                }
+            }
+        }
+    }
+    if !xfaded {
+        draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, round, ops, live);
+    }
+    let send = ops.len();
     if let Some(tl) = win.xdg_opt() {
         draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
     }
+    // captured before dim and the open transform, minus the blur backdrop:
+    // close anims and resize snapshots replay clean, untransformed content
+    if !xfaded {
+        *win.last_batch.borrow_mut() = (
+            ops[cmark..].to_vec(),
+            live[lmark..].to_vec(),
+            (smark - cmark)..(send - cmark),
+        );
+    }
+    let is_focused = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, &surface));
+    let dim_want = if is_focused || win.fullscreen.get() || !win.rule_dim.get().unwrap_or(true) {
+        0.0
+    } else {
+        cfg.decoration.dim_inactive
+    };
+    let dim = win.dim_now(state, dim_want);
+    if dim > 0.004 {
+        let (gx, gy) = out.pos.get();
+        let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+        let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+        let pos = [fxp(rect.x1), fyp(rect.y1)];
+        let size = [
+            rect.width() as f32 / out.width as f32 * 2.0,
+            rect.height() as f32 / out.height as f32 * 2.0,
+        ];
+        let shade = [0.0, 0.0, 0.0, dim as f32];
+        if round >= 0.5 {
+            // a ring wider than the box is a rounded fill
+            ops.push(RenderOp::Border {
+                pos,
+                size,
+                rect_px: [
+                    (rect.x1 - gx) as f32,
+                    (rect.y1 - gy) as f32,
+                    rect.width() as f32,
+                    rect.height() as f32,
+                ],
+                radius: round,
+                width: rect.width().max(rect.height()) as f32,
+                color: shade,
+            });
+        } else {
+            ops.push(RenderOp::Fill { pos, size, color: shade });
+        }
+    }
     let open = win.anims.borrow().open.clone();
     if let Some((a, style)) = open {
-        if !win.fullscreen.get() {
+        if !win.fullscreen.get() && mode != DrawMode::Rest {
             use crate::config::Style;
             let p = a.clamped_value(state.anim_clock.now());
             let (scale, alpha, d) = match &style {
@@ -2407,10 +3731,14 @@ fn draw_window(
                 Style::Slide { dir } => (1.0, 1.0, slide_delta(out, rect, *dir, 1.0 - p)),
                 _ => (1.0, 1.0, [0.0, 0.0]),
             };
-            apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d);
+            apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d, out_dims(out));
         }
     }
-    *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
+    // gated last: the dim/border retargets above start their fades inside
+    // this draw, and their first frame must arm the redraw latch too
+    if win.anims_live(state.anim_clock.now()) {
+        out.anim_pending.set(true);
+    }
 }
 
 // -- closing windows: the final batch outlives the surface --
@@ -2422,28 +3750,54 @@ pub struct ClosingWindow {
     pub rect: Rect,
     pub anim: crate::anim::Anim,
     pub style: crate::config::Style,
+    /// the window's capture rule survives it; captures skip the replay
+    pub no_capture: bool,
 }
 
-/// wrap a cached final batch, taking ownership of its textures
+/// wrap a cached final batch, taking ownership of its textures. a batch
+/// whose textures were evicted - or replaced under the same key - references
+/// destroyed views; those must never reach the gpu, so the capture is
+/// refused instead (uid mismatch counts as missing)
 pub fn seize_batch(
     out: &Rc<Output>,
-    batch: (Vec<RenderOp>, Vec<(ClientId, u64)>),
+    batch: (Vec<RenderOp>, Vec<((ClientId, u64), u64)>, std::ops::Range<usize>),
     rect: Rect,
     anim: crate::anim::Anim,
     style: crate::config::Style,
+    no_capture: bool,
 ) -> Option<ClosingWindow> {
-    let (ops, keys) = batch;
+    let (ops, keys, _) = batch;
     if ops.is_empty() {
         return None;
     }
     let mut keep = Vec::new();
-    let mut textures = out.textures.borrow_mut();
-    for k in &keys {
-        if let Some((t, _)) = textures.remove(k) {
-            keep.push(t);
+    let mut taken: Vec<(ClientId, u64)> = Vec::new();
+    let mut missing = false;
+    {
+        let mut textures = out.textures.borrow_mut();
+        for (k, uid) in &keys {
+            if taken.contains(k) {
+                continue;
+            }
+            match textures.remove(k) {
+                Some((t, _)) if t.uid == *uid => {
+                    keep.push(t);
+                    taken.push(*k);
+                }
+                // a replacement: the window is going away, retire it too
+                Some((t, _)) => {
+                    keep.push(t);
+                    missing = true;
+                }
+                None => missing = true,
+            }
         }
     }
-    Some(ClosingWindow { ops, keep, rect, anim, style })
+    if missing {
+        out.retired_tex.borrow_mut().extend(keep);
+        return None;
+    }
+    Some(ClosingWindow { ops, keep, rect, anim, style, no_capture })
 }
 
 /// seize the window's cached final batch and its textures
@@ -2455,7 +3809,7 @@ pub fn capture_closing(
     style: crate::config::Style,
 ) -> Option<ClosingWindow> {
     let batch = std::mem::take(&mut *win.last_batch.borrow_mut());
-    seize_batch(out, batch, rect, anim, style)
+    seize_batch(out, batch, rect, anim, style, win.rule_no_capture.get())
 }
 
 fn cap_evict(list: &mut Vec<ClosingWindow>) -> Option<ClosingWindow> {
@@ -2487,8 +3841,9 @@ fn draw_closings(
     out: &Rc<Output>,
     ws: &crate::tree::workspace::Workspace,
     ops: &mut Vec<RenderOp>,
+    mode: DrawMode,
 ) {
-    draw_closing_list(state, out, &ws.closing, ops);
+    draw_closing_list(state, out, &ws.closing, ops, mode);
 }
 
 fn draw_closing_list(
@@ -2496,20 +3851,26 @@ fn draw_closing_list(
     out: &Rc<Output>,
     list: &RefCell<Vec<ClosingWindow>>,
     ops: &mut Vec<RenderOp>,
+    mode: DrawMode,
 ) {
     use crate::config::Style;
     let now = state.anim_clock.now();
     let mut list = list.borrow_mut();
-    let mut i = 0;
-    while i < list.len() {
-        if list[i].anim.is_done(now) {
-            let cw = list.remove(i);
-            out.retired_tex.borrow_mut().extend(cw.keep);
-            continue;
+    if mode == DrawMode::Present {
+        let mut i = 0;
+        while i < list.len() {
+            if list[i].anim.settled(now) {
+                let cw = list.remove(i);
+                out.retired_tex.borrow_mut().extend(cw.keep);
+                continue;
+            }
+            i += 1;
         }
-        i += 1;
     }
     for c in list.iter() {
+        if c.no_capture && mode != DrawMode::Present {
+            continue;
+        }
         // presence runs 1 -> 0
         let p = c.anim.clamped_value(now);
         let mark = ops.len();
@@ -2517,10 +3878,10 @@ fn draw_closing_list(
         let (scale, alpha, d) = match &c.style {
             Style::Fade => (1.0, p as f32, [0.0, 0.0]),
             Style::Slide { dir } => (1.0, 1.0, slide_delta(out, c.rect, *dir, 1.0 - p)),
-            // popin and everything else: shrink toward 80% while fading
+            Style::Popin { perc } => ((perc + (1.0 - perc) * p) as f32, p as f32, [0.0, 0.0]),
             _ => ((0.8 + 0.2 * p) as f32, p as f32, [0.0, 0.0]),
         };
-        apply_batch(&mut ops[mark..], center_ndc(out, c.rect), scale, alpha, d);
+        apply_batch(&mut ops[mark..], center_ndc(out, c.rect), scale, alpha, d, out_dims(out));
         out.anim_pending.set(true);
     }
 }
@@ -2529,7 +3890,20 @@ fn draw_closing_list(
 
 /// scale about an ndc center, multiply alpha, then translate; the whole
 /// window (borders, subsurfaces, popups) moves as one
-fn apply_batch(ops: &mut [RenderOp], center: [f32; 2], scale: f32, alpha: f32, d: [f32; 2]) {
+fn apply_batch(
+    ops: &mut [RenderOp],
+    center: [f32; 2],
+    scale: f32,
+    alpha: f32,
+    d: [f32; 2],
+    dims: [f32; 2],
+) {
+    // the rounding geo lives in pixel space; mirror the ndc transform there
+    let px_center = [
+        (center[0] + 1.0) * 0.5 * dims[0],
+        (center[1] + 1.0) * 0.5 * dims[1],
+    ];
+    let px_d = [d[0] * 0.5 * dims[0], d[1] * 0.5 * dims[1]];
     for op in ops {
         match op {
             RenderOp::Fill { pos, size, color } => {
@@ -2549,8 +3923,62 @@ fn apply_batch(ops: &mut [RenderOp], center: [f32; 2], scale: f32, alpha: f32, d
                     *opaque = false;
                 }
             }
+            RenderOp::TexR { pos, size, mul, geo_px, radius, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    geo_px[i] = px_center[i] + (geo_px[i] - px_center[i]) * scale + px_d[i];
+                    geo_px[i + 2] *= scale;
+                }
+                *radius *= scale;
+                *mul *= alpha;
+            }
+            RenderOp::Border { pos, size, rect_px, radius, width, color } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    rect_px[i] = px_center[i] + (rect_px[i] - px_center[i]) * scale + px_d[i];
+                    rect_px[i + 2] *= scale;
+                }
+                *radius *= scale;
+                *width *= scale;
+                color[3] *= alpha;
+            }
+            RenderOp::Shadow { pos, size, win_px, radius, range, color, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    win_px[i] = px_center[i] + (win_px[i] - px_center[i]) * scale + px_d[i];
+                    win_px[i + 2] *= scale;
+                }
+                *radius *= scale;
+                *range *= scale;
+                color[3] *= alpha;
+            }
+            RenderOp::Xfade { pos, size, geo_px, radius, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    geo_px[i] = px_center[i] + (geo_px[i] - px_center[i]) * scale + px_d[i];
+                    geo_px[i + 2] *= scale;
+                }
+                *radius *= scale;
+            }
+            RenderOp::BlurMask { pos, size, mul, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                }
+                *mul *= alpha;
+            }
+            // pre-pass only; never inside a window batch
+            RenderOp::Blur { .. } => {}
         }
     }
+}
+
+fn out_dims(out: &Output) -> [f32; 2] {
+    [out.width as f32, out.height as f32]
 }
 
 fn center_ndc(out: &Output, r: Rect) -> [f32; 2] {
@@ -2588,8 +4016,35 @@ fn slide_delta(out: &Output, r: Rect, dir: Option<crate::config::Dir>, remaining
     ]
 }
 
-/// four fills just outside the window box
-fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Vec<RenderOp>) {
+/// four fills just outside the window box, or one rounded ring
+fn push_borders(
+    out: &Rc<Output>,
+    r: Rect,
+    b: i32,
+    round: f32,
+    color: [f32; 4],
+    ops: &mut Vec<RenderOp>,
+) {
+    if round >= 0.5 && b > 0 {
+        let (gx, gy) = out.pos.get();
+        let (ox1, oy1) = (r.x1 - b, r.y1 - b);
+        let (ow, oh) = (r.width() + 2 * b, r.height() + 2 * b);
+        // quad pads one px past the ring for the aa edge
+        let fx = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+        let fy = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+        ops.push(RenderOp::Border {
+            pos: [fx(ox1 - 1), fy(oy1 - 1)],
+            size: [
+                (ow + 2) as f32 / out.width as f32 * 2.0,
+                (oh + 2) as f32 / out.height as f32 * 2.0,
+            ],
+            rect_px: [(ox1 - gx) as f32, (oy1 - gy) as f32, ow as f32, oh as f32],
+            radius: round + b as f32,
+            width: b as f32,
+            color,
+        });
+        return;
+    }
     let sides = [
         Rect { x1: r.x1 - b, y1: r.y1 - b, x2: r.x2 + b, y2: r.y1 },
         Rect { x1: r.x1 - b, y1: r.y2, x2: r.x2 + b, y2: r.y2 + b },
@@ -2637,6 +4092,7 @@ mod tests {
             rect: Rect { x1: x, y1: 0, x2: x + 10, y2: 10 },
             anim: crate::anim::Anim::ease(&clock, 1.0, 0.0, 150, crate::anim::Curve::Linear),
             style: crate::config::Style::Fade,
+            no_capture: false,
         };
         let mut list: Vec<ClosingWindow> = (0..8).map(mk).collect();
         let evicted = cap_evict(&mut list);
@@ -2652,7 +4108,7 @@ mod tests {
             size: [1.0, 1.0],
             color: [1.0; 4],
         }];
-        apply_batch(&mut ops, [0.0, 0.0], 0.5, 0.5, [0.25, 0.0]);
+        apply_batch(&mut ops, [0.0, 0.0], 0.5, 0.5, [0.25, 0.0], [1000.0, 600.0]);
         let RenderOp::Fill { pos, size, color } = &ops[0] else {
             panic!("op kind changed");
         };

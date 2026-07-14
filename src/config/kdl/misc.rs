@@ -92,6 +92,17 @@ fn debug(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     cfg.debug.ignore_drm_devices.push(s);
                 }
             }
+            "latency-policy" => match cx.str_(c).as_deref() {
+                Some("late-latch") => cfg.debug.latency_policy = LatencyPolicy::LateLatch,
+                Some("vblank") => cfg.debug.latency_policy = LatencyPolicy::Vblank,
+                Some(other) => cx.at(c, &format!("unknown latency-policy \"{other}\"")),
+                None => {}
+            },
+            "latch-margin-us" => {
+                if let Some(v) = cx.int(c) {
+                    cfg.debug.latch_margin_us = Some(v.max(0) as u32);
+                }
+            }
             other => cx.at(c, &format!("unknown debug key \"{other}\"")),
         }
     }

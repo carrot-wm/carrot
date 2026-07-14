@@ -106,8 +106,11 @@ pub(crate) fn spring_pos(k: &SpringK, x0: f64, v0: f64, t: f64) -> f64 {
         let w1 = (k.omega0 * k.omega0 - k.beta * k.beta).sqrt();
         env * (x0 * (w1 * t).cos() + ((k.beta * x0 + v0) / w1) * (w1 * t).sin())
     } else {
+        // cosh/sinh folded into the envelope: both exponents stay negative
+        // (w2 < beta), so large t can't reach exp-underflow * cosh-overflow
         let w2 = (k.beta * k.beta - k.omega0 * k.omega0).sqrt();
-        env * (x0 * (w2 * t).cosh() + ((k.beta * x0 + v0) / w2) * (w2 * t).sinh())
+        let c = (k.beta * x0 + v0) / w2;
+        0.5 * ((x0 + c) * ((w2 - k.beta) * t).exp() + (x0 - c) * (-(w2 + k.beta) * t).exp())
     }
 }
 
@@ -129,22 +132,34 @@ pub(crate) fn spring_duration(k: &SpringK, x0: f64, v0: f64) -> f64 {
 }
 
 pub(crate) fn spring_clamped(k: &SpringK, x0: f64, v0: f64) -> f64 {
-    // first touch of the target: millisecond stepping, capped at 3s. a
-    // sign flip between grid points is a touch too - the crossing itself
-    // can dodge the epsilon band entirely
-    let dur = spring_duration(k, x0, v0);
-    let eps = k.epsilon.clamp(1e-7, 0.5) * x0.abs().max(1e-9);
-    let mut t = 0.0;
-    let mut prev = x0;
-    while t < dur.min(3.0) {
-        let pos = spring_pos(k, x0, v0, t);
-        if pos.abs() <= eps || pos.signum() != prev.signum() {
-            return t;
-        }
-        prev = pos;
-        t += 0.001;
+    // first touch of the target: the analytic first zero crossing where
+    // one exists, otherwise the rest duration; capped at 3s
+    let dur = spring_duration(k, x0, v0).min(3.0);
+    if x0 == 0.0 {
+        return 0.0;
     }
-    dur.min(3.0)
+    let cross = if (k.beta - k.omega0).abs() <= f32::EPSILON as f64 {
+        // e^(-bt)(x0 + (b*x0+v0)t) crosses once iff velocity opposes
+        let a = k.beta * x0 + v0;
+        let t = -x0 / a;
+        if t > 0.0 { t } else { f64::INFINITY }
+    } else if k.beta < k.omega0 {
+        // R e^(-bt) cos(w1 t - phi): first zero at w1 t = phi + pi/2
+        let w1 = (k.omega0 * k.omega0 - k.beta * k.beta).sqrt();
+        let c = (k.beta * x0 + v0) / w1;
+        let mut t = (c.atan2(x0) + std::f64::consts::FRAC_PI_2) / w1;
+        if t <= 0.0 {
+            t += std::f64::consts::PI / w1;
+        }
+        t
+    } else {
+        // (x0+c)e^(2 w2 t) = c - x0 from the two-exponential form
+        let w2 = (k.beta * k.beta - k.omega0 * k.omega0).sqrt();
+        let c = (k.beta * x0 + v0) / w2;
+        let r = (c - x0) / (c + x0);
+        if r.is_finite() && r > 1.0 { r.ln() / (2.0 * w2) } else { f64::INFINITY }
+    };
+    cross.min(dur)
 }
 
 use std::cell::Cell;
@@ -163,8 +178,11 @@ impl AnimClock {
             slowdown: Cell::new(1.0),
         }
     }
+    /// forward-only, like touch(): a predicted present derived from a
+    /// stale flip (idle wake, missed deadline) must not rewind time behind
+    /// anim starts already stamped at event time
     pub fn freeze(&self, ns: u64) {
-        self.now_ns.set(ns);
+        self.now_ns.set(self.now_ns.get().max(ns));
     }
     /// forward-only bump to real monotonic time; anim starts happen in
     /// event context where the compose-frozen stamp can be seconds stale
@@ -213,11 +231,15 @@ impl Anim {
     }
 
     pub fn spring(clock: &AnimClock, from: f64, to: f64, v0: f64, k: SpringK) -> Anim {
+        // a poisoned handoff velocity must not poison the whole spring
+        let v0 = if v0.is_finite() { v0 } else { 0.0 };
         let x0 = from - to;
         let (dur, clamped) = if clock.off.get() || x0 == 0.0 {
             (0.0, 0.0)
         } else {
-            (spring_duration(&k, x0, v0), spring_clamped(&k, x0, v0))
+            // 3s ceiling matches the clamped scan: the render loop must go
+            // quiescent even for pathologically soft parameters
+            (spring_duration(&k, x0, v0).min(3.0), spring_clamped(&k, x0, v0))
         };
         Anim {
             from,
@@ -242,8 +264,17 @@ impl Anim {
         self.elapsed_ns(now) >= self.dur_ns
     }
 
+    /// quiescence for clamped_value consumers: they pin at the target from
+    /// clamped_ns on, so the scene is static while the envelope tail runs
+    pub fn settled(&self, now: u64) -> bool {
+        self.elapsed_ns(now) >= self.clamped_ns
+    }
+
     pub fn value(&self, now: u64) -> f64 {
-        let el = self.elapsed_ns(now);
+        self.value_at(self.elapsed_ns(now))
+    }
+
+    fn value_at(&self, el: u64) -> f64 {
         if el >= self.dur_ns {
             return self.to;
         }
@@ -275,9 +306,12 @@ impl Anim {
         self.to += d;
     }
 
-    /// units per second, finite difference over 1ms
+    /// units per second of ANIM time, finite difference over 1ms: handoff
+    /// v0 feeds springs that run on the same scaled timeline, so slowdown
+    /// must not leak into the measurement
     pub fn velocity(&self, now: u64) -> f64 {
-        (self.value(now + 1_000_000) - self.value(now)) * 1000.0
+        let el = self.elapsed_ns(now);
+        (self.value_at(el + 1_000_000) - self.value_at(el)) * 1000.0
     }
 }
 
@@ -505,6 +539,112 @@ mod tests {
         }
         let mid = lerp_oklab(red, blue, 0.5);
         assert!((mid[3] - 0.75).abs() < 1e-6, "alpha lerps linearly");
+    }
+
+    #[test]
+    fn spring_overdamped_extremes_stay_finite() {
+        // damping 10 once hit exp-underflow * cosh-overflow = NaN, which
+        // saturated dur_ns to u64::MAX and pinned the render loop
+        let k = SpringK::new(10.0, 800.0, 0.0001);
+        for i in 0..=1000 {
+            let x = spring_pos(&k, 1.0, 0.0, i as f64 * 0.01);
+            assert!(x.is_finite(), "t={}", i as f64 * 0.01);
+        }
+        let d = spring_duration(&k, 1.0, 0.0);
+        assert!(d.is_finite());
+        assert!(spring_pos(&k, 1.0, 0.0, d).abs() <= 0.0001 * 1.001);
+    }
+
+    #[test]
+    fn anim_spring_duration_capped_at_3s() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        // softest legal spring: the envelope alone runs past 9s
+        let a = Anim::spring(&clock, 0.0, 100.0, 0.0, SpringK::new(1.0, 1.0, 0.0001));
+        assert!(!a.is_done(2_900_000_000));
+        assert!(a.is_done(3_000_000_000));
+    }
+
+    #[test]
+    fn anim_spring_swallows_poisoned_velocity() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        let a = Anim::spring(&clock, 0.0, 1.0, f64::NAN, SpringK::new(1.0, 800.0, 0.0001));
+        assert!(a.value(100_000_000).is_finite());
+        assert!(a.is_done(3_000_000_001));
+    }
+
+    #[test]
+    fn settled_at_first_touch_done_at_rest() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        let k = SpringK::new(0.5, 800.0, 0.0001);
+        let a = Anim::spring(&clock, 0.0, 1.0, 0.0, k);
+        let ns = (spring_clamped(&k, -1.0, 0.0) * 1e9) as u64 + 1_000_000;
+        // underdamped touches the target long before the envelope rests:
+        // clamped consumers are static there, raw values still oscillate
+        assert!(a.settled(ns));
+        assert!(!a.is_done(ns));
+        assert_eq!(a.clamped_value(ns), 1.0);
+    }
+
+    #[test]
+    fn clamped_matches_a_fine_scan() {
+        // the analytic first touch must agree with brute force across
+        // regimes: under/critical/overdamped, with and without opposing v0
+        for (d, s, v0) in [
+            (0.5, 800.0, 0.0),
+            (0.8, 200.0, 3.0),
+            (1.0, 800.0, 0.0),
+            (1.0, 400.0, -80.0),
+            (2.0, 800.0, 0.0),
+            (2.0, 800.0, -150.0),
+            (3.0, 100.0, -40.0),
+        ] {
+            let k = SpringK::new(d, s, 0.0001);
+            let got = spring_clamped(&k, 1.0, v0);
+            let dur = spring_duration(&k, 1.0, v0).min(3.0);
+            let mut cross = None;
+            let mut prev = 1.0f64;
+            let mut t = 0.0;
+            while t < dur {
+                let pos = spring_pos(&k, 1.0, v0, t);
+                if pos.signum() != prev.signum() {
+                    cross = Some(t);
+                    break;
+                }
+                prev = pos;
+                t += 0.0001;
+            }
+            match cross {
+                Some(tc) => {
+                    assert!((got - tc).abs() < 0.001, "d={d} s={s} v0={v0}: {got} vs {tc}")
+                }
+                None => assert_eq!(got, dur, "d={d} s={s} v0={v0}: no crossing means rest"),
+            }
+        }
+    }
+
+    #[test]
+    fn velocity_measures_anim_time() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        clock.set_global(false, 2.0);
+        let a = Anim::ease(&clock, 0.0, 1.0, 100, Curve::Linear);
+        // linear over 100ms of ANIM time is 10/s; slowdown must not leak
+        // into the handoff measurement
+        assert!((a.velocity(50_000_000) - 10.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn clock_freeze_never_rewinds() {
+        let clock = AnimClock::new();
+        clock.freeze(5_000_000_000);
+        // a stale predicted present must not undercut event-time starts
+        clock.freeze(1_000_000_000);
+        assert_eq!(clock.now(), 5_000_000_000);
+        clock.freeze(6_000_000_000);
+        assert_eq!(clock.now(), 6_000_000_000);
     }
 
     #[test]

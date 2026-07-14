@@ -205,6 +205,115 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
                 }
             }
         }
+        Action::ConsumeOrExpelLeft | Action::ConsumeOrExpelRight => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws
+                        .tiling
+                        .strip
+                        .consume_or_expel(&win, matches!(action, Action::ConsumeOrExpelLeft))
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::MoveColumnLeft | Action::MoveColumnRight => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws
+                        .tiling
+                        .strip
+                        .move_column(&win, matches!(action, Action::MoveColumnLeft))
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::CycleColumnWidth | Action::CycleColumnWidthBack => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                let scfg = state.config.borrow().layout.scrolling.clone();
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws.tiling.strip.cycle_width(
+                        &win,
+                        &scfg,
+                        matches!(action, Action::CycleColumnWidthBack),
+                    )
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::ToggleFullWidth => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws.tiling.strip.toggle_full_width(&win)
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::CenterColumn => {
+            let ws = crate::tree::active(state);
+            if ws.tiling.mode() == crate::config::LayoutMode::Scrolling {
+                ws.tiling
+                    .strip
+                    .center_active(crate::tree::tiling_area_for(state, &ws));
+                crate::tree::relayout(state, &ws);
+                state.damage.trigger();
+            }
+        }
+        Action::SetLayout(arg) => {
+            let ws = crate::tree::active(state);
+            let mode = match arg {
+                crate::config::SetLayoutArg::Dwindle => crate::config::LayoutMode::Dwindle,
+                crate::config::SetLayoutArg::Scrolling => crate::config::LayoutMode::Scrolling,
+                crate::config::SetLayoutArg::Toggle => match ws.tiling.mode() {
+                    crate::config::LayoutMode::Dwindle => crate::config::LayoutMode::Scrolling,
+                    crate::config::LayoutMode::Scrolling => crate::config::LayoutMode::Dwindle,
+                },
+            };
+            crate::tree::set_layout(state, &ws, mode);
+        }
+        Action::PointerMove => {
+            if let Some(seat) = state.seat.borrow().clone() {
+                let (x, y) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
+                if let Some((win, ..)) = crate::tree::window_at(state, x, y) {
+                    seat.start_move_grab(state, win);
+                }
+            }
+        }
+        Action::PointerResize => {
+            if let Some(seat) = state.seat.borrow().clone() {
+                let (x, y) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
+                if let Some((win, ..)) = crate::tree::window_at(state, x, y) {
+                    use crate::tree::dwindle::{EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT, EDGE_TOP};
+                    let r = win.rect.get();
+                    let edges = if x < (r.x1 + r.x2) / 2 { EDGE_LEFT } else { EDGE_RIGHT }
+                        | if y < (r.y1 + r.y2) / 2 { EDGE_TOP } else { EDGE_BOTTOM };
+                    seat.start_resize_grab(state, win, edges);
+                }
+            }
+        }
         Action::Spawn(argv) => spawn_argv(state, argv),
         Action::SpawnSh(cmd) => spawn_sh(state, cmd),
         Action::Quit => state.ring.stop(),
@@ -283,9 +392,9 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
         }
     };
     let parsed = if path.extension().is_some_and(|e| e == "lua") {
-        crate::config::lua::parse(&text)
+        crate::config::lua::parse_at(&text, &path)
     } else {
-        crate::config::parse(&text)
+        crate::config::kdl::parse_at(&text, &path)
     };
     let cfg = match parsed {
         Ok(c) => c,
@@ -320,6 +429,12 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
     if let Some(d) = state.display.borrow().as_ref() {
         d.set_software_cursor(state, sw);
     }
+    if let Some(d) = state.display.borrow().as_ref() {
+        for out in d.outputs.borrow().iter() {
+            out.blur_dirty.set(true);
+        }
+    }
+    crate::tree::reapply_rules(state);
     let ws = crate::tree::active(state);
     crate::tree::relayout(state, &ws);
     crate::shell::layer::arrange(state);
@@ -402,6 +517,10 @@ fn workspaces_json(state: &Rc<State>) -> Value {
                 "windows": count,
                 "active": i == state.active_ws.get(),
                 "output": output,
+                "layout": match w.tiling.mode() {
+                    crate::config::LayoutMode::Dwindle => "dwindle",
+                    crate::config::LayoutMode::Scrolling => "scrolling",
+                },
             })
         })
         .collect();

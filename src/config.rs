@@ -12,7 +12,6 @@ pub mod kdl;
 pub mod lua;
 
 pub use default::DEFAULT_CONFIG;
-pub use kdl::parse;
 
 // action names double as the ipc vocabulary; every bind has a wire twin
 // by construction
@@ -43,9 +42,34 @@ pub enum Action {
     SwapDir(Dir),
     /// nudge the focused window's parent split; signed fraction of the span
     AdjustSplitRatio(f64),
+    // scrolling-layout verbs; harmless no-ops on a dwindle workspace
+    ConsumeOrExpelLeft,
+    ConsumeOrExpelRight,
+    /// the focused window's whole column leapfrogs along the strip
+    MoveColumnLeft,
+    MoveColumnRight,
+    CycleColumnWidth,
+    CycleColumnWidthBack,
+    ToggleFullWidth,
+    CenterColumn,
+    SetLayout(SetLayoutArg),
+    /// grab the window under the cursor and let the pointer carry it
+    /// while the chord is held: a mouse bind ends on button release, a
+    /// key bind ends when its key comes back up
+    PointerMove,
+    /// same grab, resizing by the quadrant the pointer started in
+    PointerResize,
     Spawn(Vec<String>),
     SpawnSh(String),
     Quit,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SetLayoutArg {
+    Dwindle,
+    Scrolling,
+    Toggle,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +153,15 @@ pub enum CenterFocus {
     OnOverflow,
 }
 
+/// which way the workspace stack runs on dwindle; scrolling always
+/// stacks vertically because the strip owns the horizontal axis
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum WsAxis {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScrollCfg {
     pub preset_widths: Vec<f64>,
@@ -160,7 +193,64 @@ pub struct LayoutCfg {
     pub gaps_out: i32,
     pub border: BorderCfg,
     pub float_above_fullscreen: bool,
+    pub ws_axis: WsAxis,
     pub scrolling: ScrollCfg,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowCfg {
+    pub size: i32,
+    pub color: [f32; 4],
+    pub offset: (i32, i32),
+    /// falloff exponent; higher hugs the window tighter
+    pub power: f64,
+}
+
+impl Default for ShadowCfg {
+    fn default() -> ShadowCfg {
+        ShadowCfg { size: 20, color: [0.0, 0.0, 0.0, 0.6], offset: (0, 4), power: 2.0 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlurCfg {
+    pub passes: i32,
+    /// per-level tap offset in that level's half-pixels; the dual-kawase
+    /// reference wants ~1.5-3, past 6 the taps alias into banding
+    pub size: f64,
+    pub noise: f64,
+    pub contrast: f64,
+    pub brightness: f64,
+}
+
+impl Default for BlurCfg {
+    fn default() -> BlurCfg {
+        BlurCfg { passes: 3, size: 2.5, noise: 0.02, contrast: 1.0, brightness: 1.0 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecoCfg {
+    /// corner radius px; 0 = square
+    pub rounding: i32,
+    /// parsed and stored; the shader family is circular until a
+    /// superellipse need shows up
+    pub rounding_power: f64,
+    pub dim_inactive: f64,
+    pub shadow: Option<ShadowCfg>,
+    pub blur: Option<BlurCfg>,
+}
+
+impl Default for DecoCfg {
+    fn default() -> DecoCfg {
+        DecoCfg {
+            rounding: 0,
+            rounding_power: 2.0,
+            dim_inactive: 0.0,
+            shadow: None,
+            blur: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -189,6 +279,19 @@ pub struct DebugCfg {
     pub render_drm_device: Option<String>,
     /// secondary gpus to leave alone entirely
     pub ignore_drm_devices: Vec<String>,
+    pub latency_policy: LatencyPolicy,
+    /// floor under the adaptive latch margin, microseconds
+    pub latch_margin_us: Option<u32>,
+}
+
+/// when the present loop starts rendering a dirty frame
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum LatencyPolicy {
+    /// sleep until just before the deadline, then latch the freshest state
+    #[default]
+    LateLatch,
+    /// render as soon as the pipe frees up (one frame of queue depth)
+    Vblank,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
@@ -262,13 +365,26 @@ pub struct WindowRule {
     pub opacity: Option<f64>,
     pub allow_tearing: bool,
     pub no_anim: bool,
+    /// captures and casts see a black stand-in instead of the content
+    pub no_capture: bool,
     /// open/close style override, window-style grammar
     pub animation: Option<Style>,
+    pub rounding: Option<i32>,
+    pub shadow: Option<bool>,
+    pub dim: Option<bool>,
+    pub blur: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct LayerRule {
-    pub matches: Vec<String>,
+    pub matches: Vec<Pattern>,
+    pub blur: bool,
+    /// backdrop only where surface alpha >= this; unset covers the whole
+    /// rect. argb surfaces only - xrgb views pin alpha to one
+    pub ignore_alpha: Option<f64>,
+    /// maps and unmaps appear instantly; shells that remap layers on
+    /// state changes opt out of the open/close styles
+    pub no_anim: bool,
 }
 
 // -- animations: per-kind spring/ease motion plus visual styles --
@@ -520,6 +636,7 @@ pub struct Config {
     pub remaps: Vec<RemapProfile>,
     pub debug: DebugCfg,
     pub animations: AnimsCfg,
+    pub decoration: DecoCfg,
 }
 
 impl Default for Config {
@@ -546,6 +663,7 @@ pub(crate) fn empty() -> Config {
         remaps: Vec::new(),
         debug: DebugCfg::default(),
         animations: AnimsCfg::default(),
+        decoration: DecoCfg::default(),
     }
 }
 
@@ -603,9 +721,9 @@ pub fn load() -> Loaded {
         }
     };
     let parsed = if path.extension().is_some_and(|e| e == "lua") {
-        lua::parse(&text)
+        lua::parse_at(&text, &path)
     } else {
-        parse(&text)
+        kdl::parse_at(&text, &path)
     };
     match parsed {
         Ok(cfg) => Loaded::Ok(cfg),
@@ -618,6 +736,36 @@ pub fn load() -> Loaded {
                 eprintln!("carrot: config: {e}");
             }
             Loaded::Fallback { errors }
+        }
+    }
+}
+
+/// `carrot check-config [path]`: parse and report without a session.
+/// exit 0 clean, 1 broken
+pub fn check(path: Option<&str>) -> i32 {
+    let path = path.map(std::path::PathBuf::from).unwrap_or_else(config_path);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("carrot: {}: {e}", path.display());
+            return 1;
+        }
+    };
+    let parsed = if path.extension().is_some_and(|e| e == "lua") {
+        lua::parse_at(&text, &path)
+    } else {
+        kdl::parse_at(&text, &path)
+    };
+    match parsed {
+        Ok(_) => {
+            println!("{}: ok", path.display());
+            0
+        }
+        Err(errors) => {
+            for e in errors {
+                eprintln!("{}: {e}", path.display());
+            }
+            1
         }
     }
 }
@@ -686,6 +834,29 @@ pub(crate) fn accel_profile(p: &str) -> Result<String, String> {
 pub(crate) fn regex(s: &str) -> Result<String, String> {
     regex_lite::Regex::new(s).map_err(|e| format!("bad regex \"{s}\": {e}"))?;
     Ok(s.to_string())
+}
+
+/// a regex compiled once at parse; per-frame matchers never rebuild
+#[derive(Clone, Debug)]
+pub struct Pattern {
+    pub src: String,
+    re: regex_lite::Regex,
+}
+
+impl Pattern {
+    pub fn new(s: &str) -> Result<Pattern, String> {
+        let re = regex_lite::Regex::new(s).map_err(|e| format!("bad regex \"{s}\": {e}"))?;
+        Ok(Pattern { src: s.to_string(), re })
+    }
+    pub fn matches(&self, hay: &str) -> bool {
+        self.re.is_match(hay)
+    }
+}
+
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Pattern) -> bool {
+        self.src == other.src
+    }
 }
 
 pub(crate) fn parse_mode(s: &str) -> Option<(u32, u32, Option<u32>)> {
@@ -769,7 +940,9 @@ pub(crate) fn keycode(name: &str) -> Option<u32> {
         "f11" => 87, "f12" => 88,
         "ro" => 89, "katakana" => 90, "hiragana" => 91, "henkan" => 92,
         "katakanahiragana" => 93, "muhenkan" => 94, "kpjpcomma" => 95,
-        "kpenter" => 96, "rightctrl" | "ctrl_r" => 97, "kpslash" => 98, "sysrq" => 99,
+        "kpenter" => 96, "rightctrl" | "ctrl_r" => 97, "kpslash" => 98,
+        // the physical prtsc key reports sysrq, not the ac-print code
+        "sysrq" | "print" => 99,
         "rightalt" | "alt_r" => 100, "linefeed" => 101,
         "home" => 102, "up" => 103, "pageup" => 104, "left" => 105,
         "right" => 106, "end" => 107, "down" => 108, "pagedown" => 109,
@@ -806,7 +979,7 @@ pub(crate) fn keycode(name: &str) -> Option<u32> {
         "playcd" => 200, "pausecd" => 201, "prog3" => 202, "prog4" => 203,
         "all_applications" | "dashboard" => 204, "suspend" => 205,
         "close" => 206, "play" => 207, "fastforward" => 208,
-        "bassboost" => 209, "print" => 210, "hp" => 211, "camera" => 212,
+        "bassboost" => 209, "hp" => 211, "camera" => 212,
         "sound" => 213, "question" => 214, "email" => 215, "chat" => 216,
         "search" => 217, "connect" => 218, "finance" => 219, "sport" => 220,
         "shop" => 221, "alterase" => 222, "cancel" => 223,
@@ -820,7 +993,7 @@ pub(crate) fn keycode(name: &str) -> Option<u32> {
         "video_next" => 241, "video_prev" => 242,
         "brightness_cycle" => 243, "brightness_auto" | "brightness_zero" => 244,
         "display_off" => 245, "wwan" | "wimax" => 246, "rfkill" => 247,
-        "micmute" => 248,
+        "micmute" | "xf86audiomicmute" => 248,
         // mouse buttons share the code space; chords say Mod+MouseLeft
         "btn_left" | "mouse_left" | "mouseleft" => 272,
         "btn_right" | "mouse_right" | "mouseright" => 273,
@@ -842,7 +1015,12 @@ pub struct RuleFx {
     pub size: Option<(i32, i32)>,
     pub center: bool,
     pub no_anim: bool,
+    pub no_capture: bool,
     pub animation: Option<Style>,
+    pub rounding: Option<i32>,
+    pub shadow: Option<bool>,
+    pub dim: Option<bool>,
+    pub blur: Option<bool>,
 }
 
 fn matcher_hits(
@@ -902,8 +1080,21 @@ pub fn rule_effects(
         }
         fx.center |= r.open_centered;
         fx.no_anim |= r.no_anim;
+        fx.no_capture |= r.no_capture;
         if let Some(a) = &r.animation {
             fx.animation = Some(a.clone());
+        }
+        if let Some(v) = r.rounding {
+            fx.rounding = Some(v);
+        }
+        if let Some(v) = r.shadow {
+            fx.shadow = Some(v);
+        }
+        if let Some(v) = r.dim {
+            fx.dim = Some(v);
+        }
+        if let Some(v) = r.blur {
+            fx.blur = Some(v);
         }
     }
     fx
@@ -957,6 +1148,7 @@ pub fn resolve_remap(
 
 #[cfg(test)]
 mod tests {
+    use super::kdl::parse;
     use super::*;
 
     #[test]
@@ -980,6 +1172,43 @@ mod tests {
     }
 
     #[test]
+    fn includes_merge_across_files() {
+        let dir = std::env::temp_dir().join(format!("carrot-inc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("binds.kdl"), "binds { Mod+Return { spawn \"foot\"; } }")
+            .unwrap();
+        std::fs::write(dir.join("main.kdl"), "layout { gaps-in 7 }\ninclude \"binds.kdl\"")
+            .unwrap();
+        let text = std::fs::read_to_string(dir.join("main.kdl")).unwrap();
+        let cfg = kdl::parse_at(&text, &dir.join("main.kdl")).unwrap();
+        assert_eq!(cfg.layout.gaps_in, 7);
+        // the included binds section reset the embedded default's binds
+        assert_eq!(cfg.binds.len(), 1);
+        // cycles and missing files fail loudly, labeled by file
+        std::fs::write(dir.join("a.kdl"), "include \"b.kdl\"").unwrap();
+        std::fs::write(dir.join("b.kdl"), "include \"a.kdl\"").unwrap();
+        let text = std::fs::read_to_string(dir.join("a.kdl")).unwrap();
+        let errs = kdl::parse_at(&text, &dir.join("a.kdl")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("cycle")), "{errs:?}");
+        let errs = kdl::parse_at("include \"missing.kdl\"", &dir.join("main.kdl")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("missing.kdl")), "{errs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lua_include_runs_sibling_files() {
+        let dir = std::env::temp_dir().join(format!("carrot-linc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extra.lua"), "carrot.layout = { gaps_in = 9 }").unwrap();
+        let main = "carrot = {}\ninclude(\"extra.lua\")";
+        let cfg = lua::parse_at(main, &dir.join("carrot.lua")).unwrap();
+        assert_eq!(cfg.layout.gaps_in, 9);
+        // without a file anchor the loader stays out of the sandbox
+        assert!(lua::parse(main).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rules_match_by_regex_and_merge_in_order() {
         let cfg = parse(
             r##"
@@ -993,6 +1222,7 @@ mod tests {
                 open-floating #true
                 default-size 800 600
                 open-on-workspace 3
+                no-capture
             }
             "##,
         )
@@ -1003,6 +1233,7 @@ mod tests {
         assert_eq!(fx.floating, Some(true), "second rule stacked");
         assert_eq!(fx.size, Some((800, 600)));
         assert_eq!(fx.workspace, Some(2), "parser stores 0-based");
+        assert!(fx.no_capture, "flag accumulates like the other booleans");
         // non-matching app id gets nothing
         let fx = rule_effects(&cfg, "foot", "shell", false, false);
         assert_eq!(fx, RuleFx::default());
@@ -1139,6 +1370,8 @@ mod tests {
         assert_eq!(k, 28);
         let (_, k) = chord("Mod+MouseLeft").unwrap();
         assert_eq!(k, 272);
+        let (_, k) = chord("Print").unwrap();
+        assert_eq!(k, 99, "prtsc emits sysrq");
         assert!(chord("Mod+Shift").is_err(), "no key");
         assert!(chord("Q+W").is_err(), "two keys");
     }

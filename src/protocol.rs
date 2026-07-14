@@ -22,6 +22,7 @@ pub mod screencopy;
 pub mod shm;
 pub mod tearing;
 pub mod wire;
+pub mod xdg_activation;
 
 use std::fmt;
 
@@ -197,6 +198,8 @@ macro_rules! wl_protocol {
                 self_id: ObjectId
                 $(, $arg: $crate::wl_protocol!(@param $ty))*
             ) {
+                // zero-arg events never touch the writer before finish
+                #[allow(unused_mut)]
                 let mut w = MsgWriter::new(o, self_id, OPCODE);
                 $($crate::wl_protocol!(@write $ty, w, $arg);)*
                 w.finish();

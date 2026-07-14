@@ -1,5 +1,9 @@
 // module layout carved up front; empty mods are intentional.
 
+// the render loader donates a #[thread_local] surplus block to drivers
+// built with static tls; the attribute is the one nightly gate in the tree
+#![feature(thread_local)]
+
 // links origin (startup) + c-gull (libc) so std runs with zero linked C
 extern crate eyra;
 
@@ -35,21 +39,25 @@ mod config;
 mod dbus;
 mod ei;
 mod input;
+mod install;
 mod ipc;
 mod pipewire;
 mod portal;
+mod doctor;
 mod sighand;
 mod tree;
 mod xwayland;
 
-/// mirror stderr into /tmp/carrot-last.log so a wedged session still
-/// leaves its story behind; the tty keeps getting everything
+/// the recent stderr tail, kept in memory for the crash report
+const CRASH_TAIL: usize = 256 * 1024;
+static CRASH_BUF: std::sync::Mutex<std::collections::VecDeque<u8>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// mirror stderr into the in-memory tail so a crash can still tell its
+/// story; the tty keeps getting everything
 fn tee_stderr() {
     use std::io::{Read, Write};
     use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
-    let Ok(file) = std::fs::File::create("/tmp/carrot-last.log") else {
-        return;
-    };
     let tty = unsafe { BorrowedFd::borrow_raw(2) };
     let Ok(tty) = rustix::io::fcntl_dupfd_cloexec(tty, 3) else {
         return;
@@ -68,7 +76,6 @@ fn tee_stderr() {
     drop(w);
     let mut tty = std::fs::File::from(tty);
     let mut src = std::fs::File::from(r);
-    let mut log = file;
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -76,21 +83,114 @@ fn tee_stderr() {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
                     let _ = tty.write_all(&buf[..n]);
-                    let _ = log.write_all(&buf[..n]);
-                    let _ = log.flush();
+                    let mut q = CRASH_BUF.lock().unwrap_or_else(|e| e.into_inner());
+                    q.extend(&buf[..n]);
+                    let over = q.len().saturating_sub(CRASH_TAIL);
+                    if over > 0 {
+                        q.drain(..over);
+                    }
                 }
             }
         }
     });
 }
 
+/// $XDG_CACHE_HOME/carrot, else ~/.cache/carrot
+fn crash_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+        })?;
+    Some(base.join("carrot"))
+}
+
+/// one past the highest <prefix><n>.log already there
+fn next_report_number(dir: &std::path::Path, prefix: &str) -> u64 {
+    let mut top = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(n) = name
+                .strip_prefix(prefix)
+                .and_then(|r| r.strip_suffix(".log"))
+                .and_then(|r| r.parse::<u64>().ok())
+            {
+                top = top.max(n);
+            }
+        }
+    }
+    top + 1
+}
+
+/// every crash gets its own numbered file; nothing ever overwrites
+fn write_crash_log(info: &std::panic::PanicHookInfo) -> Option<std::path::PathBuf> {
+    write_crash_report(&crash_dir()?, info)
+}
+
+fn write_crash_report(
+    dir: &std::path::Path,
+    info: &dyn std::fmt::Display,
+) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).ok()?;
+    let mut n = next_report_number(dir, "carrotCrashLog");
+    loop {
+        let path = dir.join(format!("carrotCrashLog{n}.log"));
+        let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                continue;
+            }
+            Err(_) => return None,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "carrot {} crashed at unix {now}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(f, "{info}");
+        // the message is on disk before the riskier captures run
+        let _ = f.flush();
+        let _ = writeln!(f, "{}", std::backtrace::Backtrace::force_capture());
+        let _ = writeln!(f, "-- stderr tail --");
+        // try_lock: a panic on the tee thread itself must not deadlock here
+        if let Ok(q) = CRASH_BUF.try_lock() {
+            let (a, b) = q.as_slices();
+            let _ = f.write_all(a);
+            let _ = f.write_all(b);
+        } else {
+            let _ = writeln!(f, "(tail unavailable)");
+        }
+        return Some(path);
+    }
+}
+
+/// panic=abort still runs the hook: the report lands before the process dies
+fn install_crash_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("carrot: {info}");
+        match write_crash_log(info) {
+            Some(p) => eprintln!("carrot: crash report: {}", p.display()),
+            None => eprintln!("carrot: crash report could not be written"),
+        }
+    }));
+}
+
 fn main() {
+    install_crash_hook();
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("carrot {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if std::env::args().any(|a| a == "spike-scanout") {
         std::process::exit(spike::run());
+    }
+    if std::env::args().any(|a| a == "doctor") {
+        std::process::exit(doctor::run());
     }
     if std::env::args().any(|a| a == "drm-probe") {
         std::process::exit(drm::device::probe_dump());
@@ -115,6 +215,14 @@ fn main() {
     }
     if std::env::args().any(|a| a == "portal-probe") {
         std::process::exit(portal::probe());
+    }
+    if let Some(i) = std::env::args().position(|a| a == "check-config") {
+        let path = std::env::args().nth(i + 1);
+        std::process::exit(config::check(path.as_deref()));
+    }
+    if let Some(i) = std::env::args().position(|a| a == "install") {
+        let rest: Vec<String> = std::env::args().skip(i + 1).collect();
+        std::process::exit(install::run(&rest));
     }
 
     if let Err(e) = run() {
@@ -183,6 +291,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::tearing::TearingManagerGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::xdg_activation::ActivationGlobal));
     state
         .globals
         .add(std::rc::Rc::new(protocol::relative_pointer::RelativePointerManagerGlobal));
@@ -350,4 +461,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     engine.clear();
     res?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crash_logs_number_past_the_highest() {
+        let dir = std::env::temp_dir().join(format!("carrot-crashnum-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::next_report_number(&dir, "carrotCrashLog"), 1, "empty dir starts at 1");
+        std::fs::write(dir.join("carrotCrashLog1.log"), b"x").unwrap();
+        std::fs::write(dir.join("carrotCrashLog7.log"), b"x").unwrap();
+        std::fs::write(dir.join("carrotCrashLognope.log"), b"x").unwrap();
+        std::fs::write(dir.join("unrelated.log"), b"x").unwrap();
+        assert_eq!(super::next_report_number(&dir, "carrotCrashLog"), 8, "counts past the highest");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn crash_reports_land_numbered_and_complete() {
+        let dir = std::env::temp_dir().join(format!("carrot-crashrep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p1 = super::write_crash_report(&dir, &"boom one").unwrap();
+        let p2 = super::write_crash_report(&dir, &"boom two").unwrap();
+        assert!(p1.ends_with("carrotCrashLog1.log"));
+        assert!(p2.ends_with("carrotCrashLog2.log"), "the first report survives");
+        let body = std::fs::read_to_string(&p1).unwrap();
+        assert!(body.contains("boom one"));
+        assert!(body.contains("crashed at unix"));
+        assert!(body.contains("-- stderr tail --"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

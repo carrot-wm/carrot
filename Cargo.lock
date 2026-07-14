@@ -77,47 +77,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "c-gull"
-version = "0.22.3"
-dependencies = [
- "c-scape",
- "errno",
- "libc",
- "rustix",
- "tz-rs",
-]
-
-[[package]]
-name = "c-scape"
-version = "0.22.3"
-dependencies = [
- "bitflags 2.13.0",
- "errno",
- "libc",
- "libm",
- "memoffset",
- "num-complex",
- "origin",
- "posix-regex",
- "printf-compat",
- "rand 0.9.4",
- "rand_core 0.9.5",
- "rand_pcg",
- "realpath-ext",
- "rustix",
- "rustix-dlmalloc",
- "rustix-futex-sync",
- "rustix-openpty",
- "unwinding",
-]
-
-[[package]]
 name = "carrot"
 version = "0.1.0"
 dependencies = [
  "ash",
  "dlopen-rs",
- "eyra",
+ "elf_loader",
  "kbvm",
  "kdl",
  "piccolo",
@@ -126,6 +91,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "taproot-eyra",
 ]
 
 [[package]]
@@ -204,8 +170,6 @@ dependencies = [
 [[package]]
 name = "dlopen-rs"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3b5f4729554ae9d8602c413ebcfc2df6937e13dc9824bd52b357b2d8c634f41"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",
@@ -248,8 +212,6 @@ checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 [[package]]
 name = "elf_loader"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0297947a5f5b79b1b86ae08aba48e25e1367637ded59b1112393e5b9176fe2ae"
 dependencies = [
  "bitflags 2.13.0",
  "cc",
@@ -277,15 +239,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "eyra"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d078978c2928c2fe452abedd1f1d73c42e8eb2006ca803d997b3ce31c81ba97"
-dependencies = [
- "c-gull",
 ]
 
 [[package]]
@@ -588,20 +541,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "origin"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "692d98a33ca8355280e87c3dea4f62e3361c0fb64a76557d8d3988f070cd3c30"
-dependencies = [
- "bitflags 2.13.0",
- "linux-raw-sys 0.9.4",
- "rustix",
- "rustix-futex-sync",
- "smallvec",
- "unwinding",
-]
 
 [[package]]
 name = "piccolo"
@@ -927,6 +866,68 @@ checksum = "81c645a4de0d803ced6ef0388a2646aa1ef8467173b5d59a2c33c88de4ab76e7"
 dependencies = [
  "serde",
  "serde_repr",
+]
+
+[[package]]
+name = "taproot-c-gull"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "081e9d3440e663d92965ea25b946f4bb9332260ad00c9e94a2aefe7c7f620ad5"
+dependencies = [
+ "errno",
+ "libc",
+ "rustix",
+ "taproot-c-scape",
+ "tz-rs",
+]
+
+[[package]]
+name = "taproot-c-scape"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e10483bdc00ce8f41162d4a010f4da9832bc5ed9956d333e464bbe0a51e8b2a"
+dependencies = [
+ "bitflags 2.13.0",
+ "errno",
+ "libc",
+ "libm",
+ "memoffset",
+ "num-complex",
+ "posix-regex",
+ "printf-compat",
+ "rand 0.9.4",
+ "rand_core 0.9.5",
+ "rand_pcg",
+ "realpath-ext",
+ "rustix",
+ "rustix-dlmalloc",
+ "rustix-futex-sync",
+ "rustix-openpty",
+ "taproot-origin",
+ "unwinding",
+]
+
+[[package]]
+name = "taproot-eyra"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65a831d6cb392cbfe7d63c6bb8b74271e657ea57f23238db70aa56ff361ec777"
+dependencies = [
+ "taproot-c-gull",
+]
+
+[[package]]
+name = "taproot-origin"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c62b608cbfe78162e14456957c4adf798d8ea9d3eeac3209850f37b92cdfcce7"
+dependencies = [
+ "bitflags 2.13.0",
+ "linux-raw-sys 0.9.4",
+ "rustix",
+ "rustix-futex-sync",
+ "smallvec",
+ "unwinding",
 ]
 
 [[package]]

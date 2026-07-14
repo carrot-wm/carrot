@@ -528,14 +528,8 @@ impl XdgSurface {
             XdgExt::Toplevel(tl) => {
                 let (w, h) = tl.desired.get();
                 let states = tl.states_bytes();
-                // size changes are load-bearing; catch a spurious one mid-drag
                 if tl.last_logged.replace((w, h)) != (w, h) {
-                    eprintln!(
-                        "carrot: configure {}x{} -> \"{}\"",
-                        w,
-                        h,
-                        tl.title.borrow()
-                    );
+                    crate::trace!("configure {}x{} -> {}", w, h, tl.title.borrow());
                 }
                 self.client.event(|o| {
                     xdg_toplevel::configure::send(o, tl.id, w, h, &states);
@@ -906,7 +900,11 @@ impl XdgToplevel {
     }
 
     pub fn configure_size(&self, w: i32, h: i32) {
-        self.desired.set((w, h));
+        // state-only changes schedule directly; an unchanged size is a
+        // no-op, not a configure broadcast
+        if self.desired.replace((w, h)) == (w, h) {
+            return;
+        }
         self.xdg.schedule_configure();
     }
 
@@ -990,7 +988,7 @@ impl xdg_toplevel::Handler for XdgToplevel {
             return Ok(());
         };
         if seat.move_resize_grab_valid(&self.xdg.surface, req.serial) {
-            seat.start_move_grab(win);
+            seat.start_move_grab(&self.client.state, win);
         }
         Ok(())
     }
@@ -1010,7 +1008,7 @@ impl xdg_toplevel::Handler for XdgToplevel {
             return Ok(());
         };
         if seat.move_resize_grab_valid(&self.xdg.surface, req.serial) {
-            seat.start_resize_grab(win, req.edges);
+            seat.start_resize_grab(&self.client.state, win, req.edges);
         }
         Ok(())
     }
@@ -2460,14 +2458,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tiled_windows_do_not_move_grab() {
+    fn dragging_a_tile_swaps_it_under_the_pointer() {
         let (state, _client, seat, tl1, tl2) = grab_setup();
         let win1 = tl1.window.borrow().clone().unwrap();
+        let win2 = tl2.window.borrow().clone().unwrap();
+        assert_eq!(win1.rect.get().x2, 400);
         let serial = press(&state, &seat);
         tl2.r#move(xdg_toplevel::r#move::Request { seat: ObjectId(0), serial })
             .unwrap();
+        // crossing onto the left tile trades the slots
         seat.pointer_motion(&state, 3_000, -300.0, 0.0, -300.0, 0.0);
-        assert_eq!(win1.rect.get().x2, 400, "layout untouched");
+        assert_eq!(win1.rect.get().x1, 400, "first window took the right slot");
+        assert_eq!(win2.rect.get().x1, 0, "dragged window landed left");
+        // sitting inside its own new slot swaps nothing further
+        seat.pointer_motion(&state, 4_000, -50.0, 0.0, -50.0, 0.0);
+        assert_eq!(win2.rect.get().x1, 0);
+        seat.pointer_button(&state, 5_000, 0x110, false);
     }
 
     #[test]

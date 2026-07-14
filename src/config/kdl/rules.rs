@@ -105,6 +105,34 @@ pub(super) fn window_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     rule.no_anim = b;
                 }
             }
+            "no-capture" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.no_capture = b;
+                }
+            }
+            "rounding" => {
+                if let Some(v) = cx.int(c) {
+                    match int_in(v, "rounding", 0, 200) {
+                        Ok(v) => rule.rounding = Some(v as i32),
+                        Err(e) => cx.leaf(c, e),
+                    }
+                }
+            }
+            "shadow" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.shadow = Some(b);
+                }
+            }
+            "dim" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.dim = Some(b);
+                }
+            }
+            "blur" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.blur = Some(b);
+                }
+            }
             "animation" => {
                 if let Some(s) = cx.str_(c) {
                     match style_from(
@@ -132,11 +160,29 @@ pub(super) fn layer_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
     let mut rule = LayerRule::default();
     for c in children(node) {
         match c.name().value() {
-            "match" => match c.get("namespace").and_then(|v| v.as_string()).map(regex) {
+            "match" => match c.get("namespace").and_then(|v| v.as_string()).map(Pattern::new) {
                 Some(Ok(p)) => rule.matches.push(p),
                 Some(Err(err)) => cx.leaf(c, err),
                 None => cx.at(c, "match wants namespace=, a regex string"),
             },
+            "blur" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.blur = b;
+                }
+            }
+            "ignore-alpha" => {
+                if let Some(v) = cx.float(c) {
+                    match f64_in(v, "ignore-alpha", 0.0, 1.0) {
+                        Ok(v) => rule.ignore_alpha = Some(v),
+                        Err(e) => cx.leaf(c, e),
+                    }
+                }
+            }
+            "no-anim" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.no_anim = b;
+                }
+            }
             other => cx.at(c, &format!("unknown layer-rule key \"{other}\"")),
         }
     }

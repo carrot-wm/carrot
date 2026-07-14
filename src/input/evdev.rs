@@ -65,6 +65,17 @@ fn ev_read<T>(fd: BorrowedFd<'_>, nr: u8, data: &mut T) -> Result<(), Errno> {
     unsafe { ioctl(fd, EvIoctl { opcode: op, data }) }
 }
 
+/// EVIOCSCLOCKID: event timestamps on the monotonic clock, the base every
+/// synthetic event and presentation time already uses. the default is
+/// CLOCK_REALTIME, which steps under ntp
+pub fn set_monotonic(fd: BorrowedFd<'_>) {
+    let mut clock: i32 = 1; // CLOCK_MONOTONIC
+    let op = opcode::write::<i32>(b'E', 0xa0);
+    if let Err(e) = unsafe { ioctl(fd, EvIoctl { opcode: op, data: &mut clock }) } {
+        crate::trace!("EVIOCSCLOCKID failed: {e}");
+    }
+}
+
 pub fn name(fd: BorrowedFd<'_>) -> String {
     let mut buf = [0u8; 256];
     // EVIOCGNAME
@@ -253,6 +264,7 @@ impl Manager {
             session.release_device(devnum);
             return None;
         };
+        set_monotonic(fd.as_fd());
         let dev = Rc::new(Device {
             devnum,
             name: name(fd.as_fd()),
@@ -297,6 +309,7 @@ impl Manager {
                     }
                 }
                 DeviceEvent::Resume { fd, .. } => {
+                    set_monotonic(fd.as_fd());
                     *d.fd.borrow_mut() = fd;
                     d.active.set(true);
                     // keys pressed while away: kernel bitmask is truth, seed so releases route

@@ -1,13 +1,14 @@
-// renderer core. a frame: acquire target from the display side, one
-// dynamic-rendering pass of quads, release it, one queue_submit2. blending
-// only where alpha exists.
+// renderer core. a frame: staging copies, then offscreen pre-passes, then
+// the target pass - one cb, one queue_submit2, the pass releases ordering
+// every later consumer. blending only where alpha exists.
 //
-// INVARIANT: views handed to Tex ops must already be SHADER_READ_ONLY_OPTIMAL.
+// INVARIANT: views handed to Tex ops must already be SHADER_READ_ONLY_OPTIMAL
+// (or become so by an earlier upload/pre-pass in the same frame).
 
 use crate::render::shaders;
 use crate::render::vulkan::{RenderError, VkCore};
 use ash::vk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::rc::Rc;
 
@@ -27,6 +28,75 @@ struct TexPush {
     uv_pos: [f32; 2],
     uv_size: [f32; 2],
     mul: f32,
+}
+
+#[repr(C)]
+struct BorderPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    rect_px: [f32; 4],
+    radius: f32,
+    width: f32,
+    aa: f32,
+    _pad: f32,
+    color: [f32; 4],
+}
+
+#[repr(C)]
+struct ShadowPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    win_px: [f32; 4],
+    radius: f32,
+    range: f32,
+    power: f32,
+    aa: f32,
+    color: [f32; 4],
+}
+
+#[repr(C)]
+struct XfadePush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    progress: f32,
+    radius: f32,
+    aa: f32,
+    _pad: f32,
+    geo_pos: [f32; 2],
+    geo_size: [f32; 2],
+}
+
+#[repr(C)]
+struct BlurPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    halfpixel: [f32; 2],
+    extra_a: f32,
+    extra_b: f32,
+}
+
+#[repr(C)]
+struct BlurMaskPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    buv_pos: [f32; 2],
+    buv_size: [f32; 2],
+    threshold: f32,
+    mul: f32,
+}
+
+#[repr(C)]
+struct TexRPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    uv_pos: [f32; 2],
+    uv_size: [f32; 2],
+    mul: f32,
+    _pad: f32, // spir-v vec2 members sit on 8-byte offsets
+    geo_pos: [f32; 2],
+    geo_size: [f32; 2],
+    radius: f32,
+    aa: f32,
 }
 
 fn push_bytes<T>(v: &T) -> &[u8] {
@@ -52,6 +122,70 @@ pub enum RenderOp {
         mul: f32,
         opaque: bool,
     },
+    /// a rounded ring in one quad; rect/radius in output-local pixels.
+    /// width past half the rect turns the ring into a rounded fill
+    Border {
+        pos: [f32; 2],
+        size: [f32; 2],
+        rect_px: [f32; 4],
+        radius: f32,
+        width: f32,
+        color: [f32; 4],
+    },
+    /// distance-falloff halo around a rounded window body
+    Shadow {
+        pos: [f32; 2],
+        size: [f32; 2],
+        win_px: [f32; 4],
+        radius: f32,
+        range: f32,
+        power: f32,
+        color: [f32; 4],
+    },
+    /// one kawase step over the whole target; down: a=contrast b=brightness,
+    /// up: a=noise
+    Blur {
+        view: vk::ImageView,
+        halfpixel: [f32; 2],
+        extra_a: f32,
+        extra_b: f32,
+        up: bool,
+    },
+    /// blurred backdrop clipped to the surface's own coverage: the cache
+    /// sample is gated by step(threshold, surface alpha). buv is the
+    /// cache's uv window in output space
+    BlurMask {
+        cache_view: vk::ImageView,
+        surface_view: vk::ImageView,
+        pos: [f32; 2],
+        size: [f32; 2],
+        buv_pos: [f32; 2],
+        buv_size: [f32; 2],
+        threshold: f32,
+        mul: f32,
+    },
+    /// two textures stretched to the quad, mixed by progress, clipped to
+    /// the rounded geometry; the resize crossfade
+    Xfade {
+        from_view: vk::ImageView,
+        to_view: vk::ImageView,
+        pos: [f32; 2],
+        size: [f32; 2],
+        progress: f32,
+        geo_px: [f32; 4],
+        radius: f32,
+    },
+    /// tex clipped to a rounded rect; geo/radius in output-local pixels
+    TexR {
+        view: vk::ImageView,
+        pos: [f32; 2],
+        size: [f32; 2],
+        uv_pos: [f32; 2],
+        uv_size: [f32; 2],
+        mul: f32,
+        geo_px: [f32; 4],
+        radius: f32,
+    },
 }
 
 impl RenderOp {
@@ -59,6 +193,12 @@ impl RenderOp {
         match self {
             RenderOp::Fill { color, .. } => color[3] < 1.0,
             RenderOp::Tex { opaque, mul, .. } => !opaque || *mul < 1.0,
+            RenderOp::TexR { .. } => true,
+            RenderOp::Border { .. } => true,
+            RenderOp::Shadow { .. } => true,
+            RenderOp::Xfade { .. } => true,
+            RenderOp::Blur { .. } => false,
+            RenderOp::BlurMask { .. } => true,
         }
     }
 }
@@ -72,12 +212,64 @@ pub struct FrameTarget {
     pub undefined: bool,
 }
 
-/// a submitted frame. wait() is for bring-up; the present loop exports the
-/// fence instead and never blocks.
+/// an offscreen color pass recorded ahead of the main pass; the target
+/// comes out sampleable for everything later in the same submit. the
+/// texture must outlive the frame (retire queues, never direct destroys)
+pub struct PrePass {
+    image: vk::Image,
+    view: vk::ImageView,
+    width: u32,
+    height: u32,
+    undefined: bool,
+    clear: Option<[f32; 4]>,
+    ops: Vec<RenderOp>,
+}
+
+impl PrePass {
+    pub fn new(tex: &Texture, clear: Option<[f32; 4]>, ops: Vec<RenderOp>) -> PrePass {
+        let p = PrePass {
+            image: tex.image,
+            view: tex.view,
+            width: tex.width,
+            height: tex.height,
+            undefined: tex.undefined.get(),
+            clear,
+            ops,
+        };
+        tex.undefined.set(false);
+        p
+    }
+}
+
+/// a filled staging buffer waiting for its copy; recorded before every
+/// draw pass of the frame, freed when the frame's fence signals
+pub struct PreUpload {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    undefined: bool,
+}
+
+/// offscreen target + readback buffer the captures reuse call to call
+struct CaptureTarget {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    buffer: vk::Buffer,
+    bmem: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+}
+
+/// a submitted frame. wait() is for bring-up and captures; the present
+/// loop exports the fence instead and never blocks.
 pub struct Frame {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     waits: Vec<vk::Semaphore>,
+    staging: Vec<PreUpload>,
 }
 
 impl Frame {
@@ -107,6 +299,13 @@ struct Pipelines {
     fill_blend: vk::Pipeline,
     tex_opaque: vk::Pipeline,
     tex_blend: vk::Pipeline,
+    texr_blend: vk::Pipeline,
+    border_blend: vk::Pipeline,
+    shadow_blend: vk::Pipeline,
+    xfade_blend: vk::Pipeline,
+    blur_down: vk::Pipeline,
+    blur_up: vk::Pipeline,
+    blur_mask_blend: vk::Pipeline,
 }
 
 pub struct Renderer {
@@ -115,10 +314,19 @@ pub struct Renderer {
     sampler: vk::Sampler,
     tex_set_layout: vk::DescriptorSetLayout,
     tex_layout: vk::PipelineLayout,
+    texr_layout: vk::PipelineLayout,
+    xfade_set_layout: vk::DescriptorSetLayout,
+    xfade_layout: vk::PipelineLayout,
+    blur_layout: vk::PipelineLayout,
+    blur_mask_layout: vk::PipelineLayout,
+    border_layout: vk::PipelineLayout,
+    shadow_layout: vk::PipelineLayout,
     fill_layout: vk::PipelineLayout,
     pipes: Pipelines,
     pool: vk::CommandPool,
     free_cbs: RefCell<Vec<vk::CommandBuffer>>,
+    tex_uid: Cell<u64>,
+    capture: RefCell<Option<CaptureTarget>>,
 }
 
 impl Renderer {
@@ -164,17 +372,104 @@ impl Renderer {
             .push_constant_ranges(&tex_range);
         let tex_layout = unsafe { dev.create_pipeline_layout(&tex_layout_info, None) }?;
 
+        let texr_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<TexRPush>() as u32)];
+        let texr_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&texr_range);
+        let texr_layout = unsafe { dev.create_pipeline_layout(&texr_layout_info, None) }?;
+
+        // two combined samplers for the crossfade
+        let b0 = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&samplers);
+        let b1 = vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&samplers);
+        let xf_bindings = [b0, b1];
+        let xf_set_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+            .bindings(&xf_bindings);
+        let xfade_set_layout = unsafe { dev.create_descriptor_set_layout(&xf_set_info, None) }?;
+        let xfade_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<XfadePush>() as u32)];
+        let xf_set_layouts = [xfade_set_layout];
+        let xfade_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&xf_set_layouts)
+            .push_constant_ranges(&xfade_range);
+        let xfade_layout = unsafe { dev.create_pipeline_layout(&xfade_layout_info, None) }?;
+
+        let blur_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<BlurPush>() as u32)];
+        let blur_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&blur_range);
+        let blur_layout = unsafe { dev.create_pipeline_layout(&blur_layout_info, None) }?;
+
+        // masked backdrop shares the two-sampler set with the crossfade
+        let blur_mask_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<BlurMaskPush>() as u32)];
+        let blur_mask_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&xf_set_layouts)
+            .push_constant_ranges(&blur_mask_range);
+        let blur_mask_layout = unsafe { dev.create_pipeline_layout(&blur_mask_layout_info, None) }?;
+
+        let border_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<BorderPush>() as u32)];
+        let border_layout_info =
+            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&border_range);
+        let border_layout = unsafe { dev.create_pipeline_layout(&border_layout_info, None) }?;
+
+        let shadow_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<ShadowPush>() as u32)];
+        let shadow_layout_info =
+            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&shadow_range);
+        let shadow_layout = unsafe { dev.create_pipeline_layout(&shadow_layout_info, None) }?;
+
         let fill_module = create_module(dev, shaders::FILL)?;
         let tex_module = create_module(dev, shaders::TEX)?;
+        let texr_module = create_module(dev, shaders::TEXR)?;
+        let border_module = create_module(dev, shaders::BORDER)?;
+        let shadow_module = create_module(dev, shaders::SHADOW)?;
+        let xfade_module = create_module(dev, shaders::XFADE)?;
+        let blur_down_module = create_module(dev, shaders::BLUR_DOWN)?;
+        let blur_up_module = create_module(dev, shaders::BLUR_UP)?;
+        let blur_mask_module = create_module(dev, shaders::BLUR_MASK)?;
         let pipes = Pipelines {
             fill_opaque: create_pipeline(dev, format, fill_module, fill_layout, false)?,
             fill_blend: create_pipeline(dev, format, fill_module, fill_layout, true)?,
             tex_opaque: create_pipeline(dev, format, tex_module, tex_layout, false)?,
             tex_blend: create_pipeline(dev, format, tex_module, tex_layout, true)?,
+            texr_blend: create_pipeline(dev, format, texr_module, texr_layout, true)?,
+            border_blend: create_pipeline(dev, format, border_module, border_layout, true)?,
+            shadow_blend: create_pipeline(dev, format, shadow_module, shadow_layout, true)?,
+            xfade_blend: create_pipeline(dev, format, xfade_module, xfade_layout, true)?,
+            blur_down: create_pipeline(dev, format, blur_down_module, blur_layout, false)?,
+            blur_up: create_pipeline(dev, format, blur_up_module, blur_layout, false)?,
+            blur_mask_blend: create_pipeline(dev, format, blur_mask_module, blur_mask_layout, true)?,
         };
         unsafe {
             dev.destroy_shader_module(fill_module, None);
             dev.destroy_shader_module(tex_module, None);
+            dev.destroy_shader_module(texr_module, None);
+            dev.destroy_shader_module(border_module, None);
+            dev.destroy_shader_module(shadow_module, None);
+            dev.destroy_shader_module(xfade_module, None);
+            dev.destroy_shader_module(blur_down_module, None);
+            dev.destroy_shader_module(blur_up_module, None);
+            dev.destroy_shader_module(blur_mask_module, None);
         }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -191,11 +486,28 @@ impl Renderer {
             sampler,
             tex_set_layout,
             tex_layout,
+            texr_layout,
+            xfade_set_layout,
+            xfade_layout,
+            blur_layout,
+            blur_mask_layout,
+            border_layout,
+            shadow_layout,
             fill_layout,
             pipes,
             pool,
             free_cbs: RefCell::new(Vec::new()),
+            tex_uid: Cell::new(0),
+            capture: RefCell::new(None),
         })
+    }
+
+    /// textures are cached under stable keys; the uid tells a replacement
+    /// apart from the texture a stored batch actually sampled
+    fn next_tex_uid(&self) -> u64 {
+        let u = self.tex_uid.get();
+        self.tex_uid.set(u + 1);
+        u
     }
 
     /// sync_file (previous scanout's OUT fence) -> submit wait; temporary
@@ -226,13 +538,31 @@ impl Renderer {
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
+        self.render_frame(Vec::new(), Vec::new(), target, clear, ops, waits)
+    }
+
+    /// the whole frame in one submit: staging copies, offscreen pre-passes
+    /// in list order, then the scanout pass. each pre-pass release is the
+    /// ordering barrier for whoever samples it later in the cb - nothing
+    /// here ever blocks the cpu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame(
+        &self,
+        uploads: Vec<PreUpload>,
+        passes: Vec<PrePass>,
+        target: &FrameTarget,
+        clear: Option<[f32; 4]>,
+        ops: &[RenderOp],
+        waits: Vec<vk::Semaphore>,
+    ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
         let cb = self.take_cb()?;
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        self.record_pre(cb, &uploads, &passes);
 
-        // take the target from the display side
+        // take the target from the display side, hand it back after
         let acquire = image_barrier(target.image)
             .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
             .dst_queue_family_index(self.core.queue_family)
@@ -246,10 +576,165 @@ impl Renderer {
             .dst_access_mask(
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
             );
-        barrier2(dev, cb, &[acquire]);
+        let release = image_barrier(target.image)
+            .src_queue_family_index(self.core.queue_family)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+            );
+        self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
+        unsafe { dev.end_command_buffer(cb) }?;
+        self.submit_frame(cb, waits, uploads)
+    }
 
+    /// staging copies, then the offscreen pre-passes in list order
+    fn record_pre(&self, cb: vk::CommandBuffer, uploads: &[PreUpload], passes: &[PrePass]) {
+        let dev = &self.core.device;
+        if !uploads.is_empty() {
+            let to_dst: Vec<_> = uploads
+                .iter()
+                .map(|u| {
+                    image_barrier(u.image)
+                        .old_layout(if u.undefined {
+                            vk::ImageLayout::UNDEFINED
+                        } else {
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        })
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                })
+                .collect();
+            barrier2(dev, cb, &to_dst);
+            for u in uploads {
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: u.width,
+                        height: u.height,
+                        depth: 1,
+                    });
+                unsafe {
+                    dev.cmd_copy_buffer_to_image(
+                        cb,
+                        u.buffer,
+                        u.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                }
+            }
+            let to_sample: Vec<_> = uploads
+                .iter()
+                .map(|u| {
+                    image_barrier(u.image)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                })
+                .collect();
+            barrier2(dev, cb, &to_sample);
+        }
+
+        for p in passes {
+            // src fragment stage: the previous frame (or an earlier pass)
+            // may still be sampling this target when the writes start
+            let acquire = image_barrier(p.image)
+                .old_layout(if p.undefined {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                })
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(
+                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+                );
+            let release = image_barrier(p.image)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
+            self.record_pass(cb, p.view, p.width, p.height, p.clear, &p.ops, acquire, release);
+        }
+    }
+
+    /// exportable fence so the commit path can take a sync_file; failure
+    /// releases everything the frame would have owned
+    fn submit_frame(
+        &self,
+        cb: vk::CommandBuffer,
+        waits: Vec<vk::Semaphore>,
+        staging: Vec<PreUpload>,
+    ) -> Result<Frame, RenderError> {
+        let dev = &self.core.device;
+        let mut export = vk::ExportFenceCreateInfo::default()
+            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+        let fence_info = vk::FenceCreateInfo::default().push_next(&mut export);
+        let fence = unsafe { dev.create_fence(&fence_info, None) }?;
+
+        let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let wait_infos: Vec<_> = waits
+            .iter()
+            .map(|&s| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(s)
+                    .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            })
+            .collect();
+        let submit = vk::SubmitInfo2::default()
+            .command_buffer_infos(&cbs)
+            .wait_semaphore_infos(&wait_infos);
+        let res = unsafe { dev.queue_submit2(self.core.queue, &[submit], fence) };
+        if let Err(e) = res {
+            unsafe {
+                dev.destroy_fence(fence, None);
+                for s in &waits {
+                    dev.destroy_semaphore(*s, None);
+                }
+                for u in &staging {
+                    dev.destroy_buffer(u.buffer, None);
+                    dev.free_memory(u.memory, None);
+                }
+            }
+            self.free_cbs.borrow_mut().push(cb);
+            return Err(e.into());
+        }
+        Ok(Frame { cb, fence, waits, staging })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_pass(
+        &self,
+        cb: vk::CommandBuffer,
+        view: vk::ImageView,
+        width: u32,
+        height: u32,
+        clear: Option<[f32; 4]>,
+        ops: &[RenderOp],
+        acquire: vk::ImageMemoryBarrier2,
+        release: vk::ImageMemoryBarrier2,
+    ) {
+        let dev = &self.core.device;
+        barrier2(dev, cb, &[acquire]);
         let mut attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(target.view)
+            .image_view(view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::LOAD)
             .store_op(vk::AttachmentStoreOp::STORE);
@@ -263,10 +748,7 @@ impl Renderer {
         let attachments = [attachment];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D {
-                width: target.width,
-                height: target.height,
-            },
+            extent: vk::Extent2D { width, height },
         };
         let rendering = vk::RenderingInfo::default()
             .render_area(area)
@@ -280,15 +762,21 @@ impl Renderer {
                 &[vk::Viewport {
                     x: 0.0,
                     y: 0.0,
-                    width: target.width as f32,
-                    height: target.height as f32,
+                    width: width as f32,
+                    height: height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
             );
             dev.cmd_set_scissor(cb, 0, &[area]);
         }
+        self.record_ops(cb, ops);
+        unsafe { dev.cmd_end_rendering(cb) };
+        barrier2(dev, cb, &[release]);
+    }
 
+    fn record_ops(&self, cb: vk::CommandBuffer, ops: &[RenderOp]) {
+        let dev = &self.core.device;
         let mut bound = vk::Pipeline::null();
         for op in ops {
             let (pipe, layout) = match (op, op.blends()) {
@@ -296,6 +784,17 @@ impl Renderer {
                 (RenderOp::Fill { .. }, true) => (self.pipes.fill_blend, self.fill_layout),
                 (RenderOp::Tex { .. }, false) => (self.pipes.tex_opaque, self.tex_layout),
                 (RenderOp::Tex { .. }, true) => (self.pipes.tex_blend, self.tex_layout),
+                (RenderOp::TexR { .. }, _) => (self.pipes.texr_blend, self.texr_layout),
+                (RenderOp::Border { .. }, _) => (self.pipes.border_blend, self.border_layout),
+                (RenderOp::Shadow { .. }, _) => (self.pipes.shadow_blend, self.shadow_layout),
+                (RenderOp::Xfade { .. }, _) => (self.pipes.xfade_blend, self.xfade_layout),
+                (RenderOp::Blur { up, .. }, _) => (
+                    if *up { self.pipes.blur_up } else { self.pipes.blur_down },
+                    self.blur_layout,
+                ),
+                (RenderOp::BlurMask { .. }, _) => {
+                    (self.pipes.blur_mask_blend, self.blur_mask_layout)
+                }
             };
             unsafe {
                 if pipe != bound {
@@ -304,10 +803,13 @@ impl Renderer {
                 }
                 match op {
                     RenderOp::Fill { pos, size, color } => {
+                        // the blend is premultiplied-over; straight alpha
+                        // would glow additively during fades
+                        let a = color[3];
                         let pc = FillPush {
                             pos: *pos,
                             size: *size,
-                            color: *color,
+                            color: [color[0] * a, color[1] * a, color[2] * a, a],
                         };
                         dev.cmd_push_constants(
                             cb,
@@ -357,56 +859,224 @@ impl Renderer {
                             push_bytes(&pc),
                         );
                     }
+                    RenderOp::Blur { view, halfpixel, extra_a, extra_b, .. } => {
+                        let image_info = vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                        let infos = [image_info];
+                        let write = vk::WriteDescriptorSet::default()
+                            .dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&infos);
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &[write],
+                        );
+                        let pc = BlurPush {
+                            pos: [-1.0, -1.0],
+                            size: [2.0, 2.0],
+                            halfpixel: *halfpixel,
+                            extra_a: *extra_a,
+                            extra_b: *extra_b,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::BlurMask {
+                        cache_view,
+                        surface_view,
+                        pos,
+                        size,
+                        buv_pos,
+                        buv_size,
+                        threshold,
+                        mul,
+                    } => {
+                        let infos0 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*cache_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let infos1 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*surface_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let writes = [
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(0)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos0),
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(1)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos1),
+                        ];
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &writes,
+                        );
+                        let pc = BlurMaskPush {
+                            pos: *pos,
+                            size: *size,
+                            buv_pos: *buv_pos,
+                            buv_size: *buv_size,
+                            threshold: *threshold,
+                            mul: *mul,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::Xfade { from_view, to_view, pos, size, progress, geo_px, radius } => {
+                        let infos0 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*from_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let infos1 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*to_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let writes = [
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(0)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos0),
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(1)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos1),
+                        ];
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &writes,
+                        );
+                        let pc = XfadePush {
+                            pos: *pos,
+                            size: *size,
+                            progress: *progress,
+                            radius: radius.max(1.0),
+                            aa: 0.7,
+                            _pad: 0.0,
+                            geo_pos: [geo_px[0], geo_px[1]],
+                            geo_size: [geo_px[2], geo_px[3]],
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::Border { pos, size, rect_px, radius, width, color } => {
+                        let a = color[3];
+                        let pc = BorderPush {
+                            pos: *pos,
+                            size: *size,
+                            rect_px: *rect_px,
+                            // below one pixel the aa band eats the whole
+                            // interior and coverage collapses to ~0.5
+                            radius: radius.max(1.0),
+                            width: *width,
+                            aa: 0.7,
+                            _pad: 0.0,
+                            color: [color[0] * a, color[1] * a, color[2] * a, a],
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::Shadow { pos, size, win_px, radius, range, power, color } => {
+                        let pc = ShadowPush {
+                            pos: *pos,
+                            size: *size,
+                            win_px: *win_px,
+                            radius: radius.max(1.0),
+                            range: range.max(1.0),
+                            power: *power,
+                            aa: 0.7,
+                            color: *color,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::TexR {
+                        view,
+                        pos,
+                        size,
+                        uv_pos,
+                        uv_size,
+                        mul,
+                        geo_px,
+                        radius,
+                    } => {
+                        let image_info = vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                        let infos = [image_info];
+                        let write = vk::WriteDescriptorSet::default()
+                            .dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&infos);
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &[write],
+                        );
+                        let pc = TexRPush {
+                            pos: *pos,
+                            size: *size,
+                            uv_pos: *uv_pos,
+                            uv_size: *uv_size,
+                            mul: *mul,
+                            _pad: 0.0,
+                            geo_pos: [geo_px[0], geo_px[1]],
+                            geo_size: [geo_px[2], geo_px[3]],
+                            radius: radius.max(1.0),
+                            aa: 0.7,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
                 }
                 dev.cmd_draw(cb, 4, 1, 0, 0);
             }
         }
-
-        unsafe { dev.cmd_end_rendering(cb) };
-
-        // hand it back for scanout
-        let release = image_barrier(target.image)
-            .src_queue_family_index(self.core.queue_family)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
-            );
-        barrier2(dev, cb, &[release]);
-        unsafe { dev.end_command_buffer(cb) }?;
-
-        // exportable fence so the commit path can take a sync_file
-        let mut export = vk::ExportFenceCreateInfo::default()
-            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-        let fence_info = vk::FenceCreateInfo::default().push_next(&mut export);
-        let fence = unsafe { dev.create_fence(&fence_info, None) }?;
-
-        let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let wait_infos: Vec<_> = waits
-            .iter()
-            .map(|&s| {
-                vk::SemaphoreSubmitInfo::default()
-                    .semaphore(s)
-                    .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            })
-            .collect();
-        let submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(&cbs)
-            .wait_semaphore_infos(&wait_infos);
-        let res = unsafe { dev.queue_submit2(self.core.queue, &[submit], fence) };
-        if let Err(e) = res {
-            unsafe {
-                dev.destroy_fence(fence, None);
-                for s in &waits {
-                    dev.destroy_semaphore(*s, None);
-                }
-            }
-            self.free_cbs.borrow_mut().push(cb);
-            return Err(e.into());
-        }
-        Ok(Frame { cb, fence, waits })
     }
 
     /// diagnostic: pull the target's pixels to the cpu. blocking, allocates
@@ -534,6 +1204,10 @@ impl Renderer {
             for s in &frame.waits {
                 self.core.device.destroy_semaphore(*s, None);
             }
+            for u in &frame.staging {
+                self.core.device.destroy_buffer(u.buffer, None);
+                self.core.device.free_memory(u.memory, None);
+            }
         }
         self.free_cbs.borrow_mut().push(frame.cb);
     }
@@ -601,6 +1275,57 @@ impl Renderer {
             width: w,
             height: h,
             undefined: std::cell::Cell::new(true),
+            uid: self.next_tex_uid(),
+        })
+    }
+
+    /// a texture the renderer can draw into and later sample
+    pub fn create_render_texture(&self, w: u32, h: u32) -> Result<Texture, RenderError> {
+        let dev = &self.core.device;
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(self.format)
+            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { dev.create_image(&info, None) }?;
+        let image_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image(image, None) });
+        let reqs = unsafe { dev.get_image_memory_requirements(image) };
+        let mem_type = self
+            .core
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe { dev.allocate_memory(&alloc, None) }?;
+        let mem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(memory, None) });
+        unsafe { dev.bind_image_memory(image, memory, 0) }?;
+        // attachment views take no swizzle; identity serves sampling too
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(self.format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let view = unsafe { dev.create_image_view(&view_info, None) }?;
+        std::mem::forget(mem_guard);
+        std::mem::forget(image_guard);
+        Ok(Texture {
+            image,
+            memory,
+            view,
+            width: w,
+            height: h,
+            undefined: std::cell::Cell::new(true),
+            uid: self.next_tex_uid(),
         })
     }
 
@@ -737,18 +1462,24 @@ impl Renderer {
             width: w,
             height: h,
             undefined: std::cell::Cell::new(false),
+            uid: self.next_tex_uid(),
         })
     }
 
-    /// render ops into an offscreen image and read the pixels back as
-    /// tightly packed rows. screenshot-grade: fully synchronous.
-    pub fn read_frame(
-        &self,
-        w: u32,
-        h: u32,
-        ops: &[RenderOp],
-        waits: Vec<vk::Semaphore>,
-    ) -> Result<Vec<u8>, RenderError> {
+    /// the persistent capture target + readback buffer; rebuilt on a size
+    /// change, gpu-idle by construction (read_frame waits before returning)
+    fn ensure_capture(&self, w: u32, h: u32) -> Result<(), RenderError> {
+        if self
+            .capture
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.width == w && c.height == h)
+        {
+            return Ok(());
+        }
+        if let Some(old) = self.capture.borrow_mut().take() {
+            self.destroy_capture(&old);
+        }
         let dev = &self.core.device;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -775,17 +1506,6 @@ impl Renderer {
         let view = self.create_target_view(image)?;
         let view_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image_view(view, None) });
 
-        let target = FrameTarget {
-            image,
-            view,
-            width: w,
-            height: h,
-            undefined: true,
-        };
-        let frame = self.render(&target, Some([0.0, 0.0, 0.0, 1.0]), ops, waits)?;
-        frame.wait(self)?;
-
-        // staging buffer, host visible
         let size = (w as u64) * (h as u64) * 4;
         let binfo = vk::BufferCreateInfo::default()
             .size(size)
@@ -802,51 +1522,100 @@ impl Renderer {
             .allocation_size(breqs.size)
             .memory_type_index(btype);
         let bmem = unsafe { dev.allocate_memory(&balloc, None) }?;
-        let bmem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(bmem, None) });
         unsafe { dev.bind_buffer_memory(buffer, bmem, 0) }?;
+        std::mem::forget(buf_guard);
+        std::mem::forget(view_guard);
+        std::mem::forget(mem_guard);
+        std::mem::forget(img_guard);
+        *self.capture.borrow_mut() = Some(CaptureTarget {
+            image,
+            memory,
+            view,
+            buffer,
+            bmem,
+            width: w,
+            height: h,
+        });
+        Ok(())
+    }
 
-        // one-shot copy; render released the target to GENERAL
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(self.core.queue_family);
-        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
-        let pool_guard = crate::util::OnDrop(|| unsafe { dev.destroy_command_pool(pool, None) });
-        let cba = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cb = unsafe { dev.allocate_command_buffers(&cba) }?[0];
+    fn destroy_capture(&self, c: &CaptureTarget) {
+        let dev = &self.core.device;
+        unsafe {
+            dev.destroy_image_view(c.view, None);
+            dev.destroy_image(c.image, None);
+            dev.free_memory(c.memory, None);
+            dev.destroy_buffer(c.buffer, None);
+            dev.free_memory(c.bmem, None);
+        }
+    }
+
+    /// render pending uploads/pre-passes + ops offscreen and read the
+    /// pixels back as tightly packed rows. one submit, one fence wait;
+    /// the target and readback buffer persist across calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_frame(
+        &self,
+        w: u32,
+        h: u32,
+        uploads: Vec<PreUpload>,
+        passes: Vec<PrePass>,
+        ops: &[RenderOp],
+        waits: Vec<vk::Semaphore>,
+    ) -> Result<Vec<u8>, RenderError> {
+        let dev = &self.core.device;
+        self.ensure_capture(w, h)?;
+        let slot = self.capture.borrow();
+        let cap = slot.as_ref().unwrap();
+        let cb = self.take_cb()?;
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        self.record_pre(cb, &uploads, &passes);
+        // every capture clears, so the old contents can be discarded; the
+        // previous read finished before the last call returned
+        let acquire = image_barrier(cap.image)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+            );
+        let release = image_barrier(cap.image)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ);
+        self.record_pass(cb, cap.view, w, h, Some([0.0, 0.0, 0.0, 1.0]), ops, acquire, release);
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
         unsafe {
-            dev.begin_command_buffer(cb, &begin)?;
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
-            dev.cmd_copy_image_to_buffer(cb, image, vk::ImageLayout::GENERAL, buffer, &[region]);
+            dev.cmd_copy_image_to_buffer(
+                cb,
+                cap.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                cap.buffer,
+                &[region],
+            );
             dev.end_command_buffer(cb)?;
-            let cbs = [cb];
-            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-            dev.queue_submit(self.core.queue, &[submit], vk::Fence::null())?;
-            dev.queue_wait_idle(self.core.queue)?;
         }
+        let frame = self.submit_frame(cb, waits, uploads)?;
+        frame.wait(self)?;
 
+        let size = (w as u64) * (h as u64) * 4;
         let mut out = vec![0u8; size as usize];
         unsafe {
-            let ptr = dev.map_memory(bmem, 0, size, vk::MemoryMapFlags::empty())?;
+            let ptr = dev.map_memory(cap.bmem, 0, size, vk::MemoryMapFlags::empty())?;
             std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), size as usize);
-            dev.unmap_memory(bmem);
+            dev.unmap_memory(cap.bmem);
         }
-        drop(pool_guard);
-        drop(bmem_guard);
-        drop(buf_guard);
-        drop(view_guard);
-        drop(mem_guard);
-        drop(img_guard);
         Ok(out)
     }
 
@@ -885,13 +1654,14 @@ impl Renderer {
         Ok(())
     }
 
-    /// blocking staging upload; `fill` writes tightly packed rows into the
-    /// staging slice. bring-up grade.
-    pub fn upload_texture(
+    /// fill a staging buffer for the next submit; `fill` writes tightly
+    /// packed rows. the copy itself records with the frame - nothing here
+    /// touches the queue
+    pub fn stage_upload(
         &self,
         tex: &Texture,
         fill: impl FnOnce(&mut [u8]),
-    ) -> Result<(), RenderError> {
+    ) -> Result<PreUpload, RenderError> {
         let dev = &self.core.device;
         let size = (tex.width * tex.height * 4) as u64;
         let buf_info = vk::BufferCreateInfo::default()
@@ -915,67 +1685,18 @@ impl Renderer {
             fill(std::slice::from_raw_parts_mut(ptr, size as usize));
             dev.unmap_memory(mem);
         }
-
-        let cb = self.take_cb()?;
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { dev.begin_command_buffer(cb, &begin) }?;
-        let to_dst = image_barrier(tex.image)
-            .old_layout(if tex.undefined.get() {
-                vk::ImageLayout::UNDEFINED
-            } else {
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-            })
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
-        barrier2(dev, cb, &[to_dst]);
-        let region = vk::BufferImageCopy::default()
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .image_extent(vk::Extent3D {
-                width: tex.width,
-                height: tex.height,
-                depth: 1,
-            });
-        unsafe {
-            dev.cmd_copy_buffer_to_image(
-                cb,
-                buf,
-                tex.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-        }
-        let to_sample = image_barrier(tex.image)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
-        barrier2(dev, cb, &[to_sample]);
-        unsafe { dev.end_command_buffer(cb) }?;
-
-        let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
-        let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let submit = vk::SubmitInfo2::default().command_buffer_infos(&cbs);
-        let res = unsafe {
-            dev.queue_submit2(self.core.queue, &[submit], fence)
-                .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX))
+        std::mem::forget(mem_guard);
+        std::mem::forget(buf_guard);
+        let up = PreUpload {
+            buffer: buf,
+            memory: mem,
+            image: tex.image,
+            width: tex.width,
+            height: tex.height,
+            undefined: tex.undefined.get(),
         };
-        unsafe { dev.destroy_fence(fence, None) };
-        self.free_cbs.borrow_mut().push(cb);
-        drop(buf_guard);
-        drop(mem_guard);
-        res?;
         tex.undefined.set(false);
-        Ok(())
+        Ok(up)
     }
 }
 
@@ -986,11 +1707,19 @@ pub struct Texture {
     pub width: u32,
     pub height: u32,
     undefined: std::cell::Cell<bool>,
+    /// never reused; view handles can be, so identity checks go through this
+    pub uid: u64,
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
         let dev = &self.core.device;
+        if let Some(c) = self.capture.borrow_mut().take() {
+            unsafe {
+                let _ = dev.device_wait_idle();
+            }
+            self.destroy_capture(&c);
+        }
         unsafe {
             let _ = dev.device_wait_idle();
             dev.destroy_pipeline(self.pipes.fill_opaque, None);
@@ -1012,10 +1741,6 @@ impl Drop for Renderer {
 /// quads -> readback -> pixel check. proves shaders, blend, barriers and the
 /// tier-2 scanout write path.
 pub fn probe() -> i32 {
-    use crate::drm::sys;
-    use rustix::fs::{Mode, OFlags, open};
-    use std::os::fd::AsFd;
-
     let mut cards: Vec<_> = match std::fs::read_dir("/dev/dri") {
         Ok(rd) => rd
             .filter_map(|e| e.ok())

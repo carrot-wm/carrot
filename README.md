@@ -12,7 +12,12 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 
 ### Tiling
 - **Dwindle layout** with directional focus, window swapping, and split ratio control
+- **Drag anywhere** - mod-drag (or a key-started grab) moves floats freely and drag-swaps tiled windows; drag-resize works on both (split ratios and column widths follow the pointer)
 - **Scrolling layout** - an endless horizontal strip of columns per workspace, scrolled by focus
+  - Per-workspace mode, switchable live with `set-layout` (windows re-tile with animation)
+  - Columns stack windows vertically; consume/expel moves windows between columns
+  - Width presets (cyclable), full-width toggle, fixed widths from mouse resize, center-focus modes
+  - Any scrolling workspace stacks workspaces vertically - workspace switches slide up/down
 - **Window groups** (tabbed) with a styled groupbar
 - **Floating layer** with mouse drag move/resize, centering, and PiP mode
 - Fullscreen (real, bordered, and borderless), pin (visible on all workspaces)
@@ -24,9 +29,11 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 - **Special workspaces** (named scratchpads) with toggle-and-launch behavior
 
 ### Eye Candy
-- Multi-pass **Kawase blur** with per-window and per-layer control
-- **Drop shadows** with configurable falloff
-- **Rounded corners**, per-window opacity, active/inactive borders
+- Multi-pass **Kawase blur** with per-window and per-layer control (cached blurred backdrop; noise, contrast, brightness)
+- **Drop shadows** with configurable size, color, offset and falloff power
+- **Rounded corners** with matching ring borders, per-window opacity, active/inactive borders
+- **Dim-inactive** with animated focus transitions; rounding/shadow/dim all overridable per window rule
+- **Resize crossfade** - old and new content mix while the geometry animates
 - **Animations** - spring physics or easing per animation kind, named custom bezier curves, hot-reloadable
   - Animated: window open/close/move, workspace switch, layer surfaces, border color (blended in OkLab)
   - Window styles: popin, fade, slide; workspace styles: slide, slidevert, fade, slidefade, slidefadevert
@@ -121,7 +128,7 @@ binds {
 
 ```nix
 # flake.nix inputs
-inputs.carrot.url = "github:flammablebunny/carrot";
+inputs.carrot.url = "github:carrot-wm/carrot";
 
 # NixOS module
 programs.carrot.enable = true;
@@ -194,19 +201,59 @@ never grabs the seat, so shell-drawn menus receive their clicks normally.
 
 ## Building
 
+Carrot's libc is [taproot](https://github.com/carrot-wm/taproot), a
+maintained pure-Rust fork of c-ward, pulled from crates.io as the
+`taproot-eyra`/`taproot-c-gull`/`taproot-c-scape`/`taproot-origin` crates
+pinned by version - a plain clone builds against the exact libc revision
+carrot was tested with. The dlopen-able `libc.so.6` itself ships as the
+[`taproot`](https://crates.io/crates/taproot) crate.
+
 ### With Nix
 
 ```sh
 nix build github:carrot-wm/carrot
 ```
 
+### From crates.io
+
+```sh
+cargo install carrot
+sudo ~/.cargo/bin/carrot install
+```
+
+One step per line: the manifest carries the static-PIE flags itself, so no
+RUSTFLAGS - just a nightly toolchain active. The second line registers the
+display-manager session.
+
 ### With Cargo
 
 ```sh
+git clone https://github.com/carrot-wm/carrot
+cd carrot
+nix develop   # pins the toolchain; or rustup with the pinned nightly
 cargo build --release
+sudo ./target/x86_64-unknown-linux-gnu/release/carrot install
 ```
 
-System dependencies: just `vulkan-loader` (dlopened at runtime, never linked) and a Vulkan driver (ICD) for your GPU. Carrot links **zero C** - no `libdrm`, `libinput`, `libseat`, `libxkbcommon`, or `libwayland`; the DRM, input, and session stacks are all hand-rolled over raw syscalls. `kbvm` parses an embedded default US keymap, so carrot boots with no XKB data on disk; it only reads `xkeyboard-config` when you configure a non-default layout, wired up automatically by the Nix build.
+`carrot install` stages the binary, the `burrow` IPC client, taproot's
+`libc.so.6`/`libm.so.6` (the GPU driver binds these at runtime), a
+`wayland-sessions` entry, and the screencast portal registration under
+`/usr/local` - log out and pick "Carrot" at any display manager. Packagers
+stage it elsewhere: `carrot install --prefix /usr --root "$pkgdir"` writes
+under the root while the session entry points at the prefix.
+
+To hack on the libc itself, clone taproot next to carrot and add
+`taproot-eyra = { path = "../taproot/eyra" }` under `[patch.crates-io]`
+in `Cargo.toml` - its internal path deps pull the rest of the fork,
+`taproot-origin` included, with it.
+
+System dependencies: a Vulkan driver (ICD) for your GPU - carrot never
+links the Khronos loader; it finds and loads the driver itself. Carrot
+links **zero C** - no `libdrm`, `libinput`, `libseat`, `libxkbcommon`, or
+`libwayland`; the DRM, input, and session stacks are all hand-rolled over
+raw syscalls. `kbvm` parses an embedded default US keymap, so carrot boots
+with no XKB data on disk; it only reads `xkeyboard-config` when you
+configure a non-default layout.
 
 ## Acknowledgments
 

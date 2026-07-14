@@ -191,6 +191,55 @@ fn action(node: &KdlNode, cx: &mut Cx) -> Option<Action> {
                 }
             }
         }
+        "consume-or-expel-left" => {
+            none(cx, name);
+            Action::ConsumeOrExpelLeft
+        }
+        "consume-or-expel-right" => {
+            none(cx, name);
+            Action::ConsumeOrExpelRight
+        }
+        "move-column-left" => {
+            none(cx, name);
+            Action::MoveColumnLeft
+        }
+        "move-column-right" => {
+            none(cx, name);
+            Action::MoveColumnRight
+        }
+        "cycle-column-width" => {
+            none(cx, name);
+            Action::CycleColumnWidth
+        }
+        "cycle-column-width-back" => {
+            none(cx, name);
+            Action::CycleColumnWidthBack
+        }
+        "toggle-full-width" => {
+            none(cx, name);
+            Action::ToggleFullWidth
+        }
+        "center-column" => {
+            none(cx, name);
+            Action::CenterColumn
+        }
+        "pointer-move" => {
+            none(cx, name);
+            Action::PointerMove
+        }
+        "pointer-resize" => {
+            none(cx, name);
+            Action::PointerResize
+        }
+        "set-layout" => match strs.first().map(String::as_str) {
+            Some("dwindle") => Action::SetLayout(SetLayoutArg::Dwindle),
+            Some("scrolling") => Action::SetLayout(SetLayoutArg::Scrolling),
+            Some("toggle") => Action::SetLayout(SetLayoutArg::Toggle),
+            _ => {
+                cx.at(node, "set-layout is dwindle, scrolling or toggle");
+                return None;
+            }
+        },
         "quit" => {
             none(cx, name);
             Action::Quit
@@ -200,4 +249,54 @@ fn action(node: &KdlNode, cx: &mut Cx) -> Option<Action> {
             return None;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::*;
+
+    fn parse_ok(src: &str) -> Config {
+        match crate::config::kdl::parse_bare(src) {
+            Ok(c) => c,
+            Err(e) => panic!("expected clean parse: {e:?}"),
+        }
+    }
+
+    fn parse_errs(src: &str) -> Vec<String> {
+        crate::config::kdl::parse_bare(src).err().unwrap_or_default()
+    }
+
+    #[test]
+    fn scrolling_actions_parse() {
+        let c = parse_ok(
+            "binds {\n\
+             Mod+BracketLeft { consume-or-expel-left; }\n\
+             Mod+Ctrl+Left { move-column-left; }\n\
+             Mod+Ctrl+Right { move-column-right; }\n\
+             Mod+R { cycle-column-width; }\n\
+             Mod+Shift+R { cycle-column-width-back; }\n\
+             Mod+W { toggle-full-width; }\n\
+             Mod+C { center-column; }\n\
+             Mod+T { set-layout \"toggle\"; }\n\
+             Mod+X { pointer-move; }\n\
+             Mod+MouseRight { pointer-resize; }\n\
+             }",
+        );
+        let acts: Vec<_> = c.binds.iter().map(|b| b.action.clone()).collect();
+        assert!(acts.contains(&Action::ConsumeOrExpelLeft));
+        assert!(acts.contains(&Action::MoveColumnLeft));
+        assert!(acts.contains(&Action::MoveColumnRight));
+        assert!(acts.contains(&Action::CycleColumnWidth));
+        assert!(acts.contains(&Action::CycleColumnWidthBack));
+        assert!(acts.contains(&Action::ToggleFullWidth));
+        assert!(acts.contains(&Action::CenterColumn));
+        assert!(acts.contains(&Action::SetLayout(SetLayoutArg::Toggle)));
+        assert!(acts.contains(&Action::PointerMove));
+        assert!(acts.contains(&Action::PointerResize));
+        // the mouse chord landed on the right code space
+        let pr = c.binds.iter().find(|b| b.action == Action::PointerResize).unwrap();
+        assert_eq!(pr.key, 273, "MouseRight is BTN_RIGHT");
+        let errs = parse_errs("binds { Mod+T { set-layout \"spiral\"; } }");
+        assert!(errs.iter().any(|e| e.contains("set-layout")), "{errs:?}");
+    }
 }

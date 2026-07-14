@@ -7,7 +7,7 @@ mod commit;
 mod role;
 mod subsurface;
 
-pub use commit::{PendingState, PendingSub};
+pub use commit::PendingState;
 pub use role::{NoneExt, SurfaceExt, SurfaceRole};
 pub use subsurface::{WlSubcompositorGlobal, WlSubsurface};
 
@@ -114,6 +114,9 @@ pub struct WlSurface {
     pub(crate) latched_feedbacks: RefCell<Vec<crate::protocol::presentation::Feedback>>,
     pub(crate) children: RefCell<Option<Box<ParentData>>>,
     pub(crate) mapped: Cell<bool>,
+    /// some compose drew this surface since the last present; frame
+    /// callbacks fire only then, so occluded clients stop rendering
+    pub(crate) shown: Cell<bool>,
     pub(crate) destroyed: Cell<bool>,
     /// bumps when a commit attaches or damages; shm re-uploads key off it
     pub(crate) content_gen: Cell<u64>,
@@ -152,6 +155,7 @@ impl WlSurface {
             tearing_control: Cell::new(false),
             children: RefCell::new(None),
             mapped: Cell::new(false),
+            shown: Cell::new(false),
             destroyed: Cell::new(false),
             content_gen: Cell::new(0),
             shm_shadow: RefCell::new(None),

@@ -28,6 +28,8 @@ pub struct State {
     /// active output dimensions; pointer clamping reads this
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
+    /// minted activation tokens by string, with mint time; single use
+    pub activation_tokens: RefCell<std::collections::HashMap<String, u64>>,
     pub active_ws: std::cell::Cell<usize>,
     /// which output has focus; follows the pointer and workspace switches
     pub focused_output: std::cell::Cell<usize>,
@@ -68,6 +70,11 @@ pub struct State {
     pub dpms_off: std::cell::Cell<bool>,
     /// replaced dmabuf attachments; released after the next present's fence
     pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
+    /// attachments whose buffer sits on a plane (direct scanout); they
+    /// release when the buffer leaves it, not when render frames drain
+    pub scanout_hold: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
+    /// buffer uids currently on (or queued to) a plane, one entry per output
+    pub scanout_uids: RefCell<Vec<u64>>,
     /// frames between render submit and fence; gates the retired drain
     pub frames_in_flight: std::cell::Cell<u32>,
     /// the render device + (fourcc, modifier) set the dmabuf global speaks
@@ -76,6 +83,12 @@ pub struct State {
     /// frozen at each output's predicted present; all sampling agrees on
     /// when the frame will glass
     pub anim_clock: crate::anim::AnimClock,
+    /// gpu textures dropped by animations; compose drains these into the
+    /// per-output retire queue so nothing dies mid-sample
+    pub retire_tex: RefCell<Vec<crate::render::renderer::Texture>>,
+    /// an interactive move/resize grab is live; targets track 1:1 and no
+    /// animation may spawn or retarget from its relayouts
+    pub grab_active: std::cell::Cell<bool>,
     serial: NumCell<u64>,
     /// identity for cache keys: wire ids get reused, uids never do
     obj_uid: NumCell<u64>,
@@ -89,6 +102,7 @@ impl State {
             wheel,
             clients: Clients::default(),
             globals: Globals::default(),
+            activation_tokens: RefCell::new(std::collections::HashMap::new()),
             run_toplevel: RunToplevel::install(eng),
             slow_clients: AsyncQueue::default(),
             damage: AsyncEvent::default(),
@@ -119,9 +133,13 @@ impl State {
             lock: RefCell::new(None),
             dpms_off: std::cell::Cell::new(false),
             retired: RefCell::new(Vec::new()),
+            scanout_hold: RefCell::new(Vec::new()),
+            scanout_uids: RefCell::new(Vec::new()),
             frames_in_flight: std::cell::Cell::new(0),
             dmabuf_info: RefCell::new(None),
             anim_clock: crate::anim::AnimClock::new(),
+            retire_tex: RefCell::new(Vec::new()),
+            grab_active: std::cell::Cell::new(false),
             serial: NumCell::new(0),
             obj_uid: NumCell::new(0),
         })

@@ -19,37 +19,112 @@ type IcdGipa = unsafe extern "system" fn(vk::Instance, *const c_char) -> vk::PFN
 
 // -- taproot preload --
 
-/// locate one of taproot's libs: explicit env override, else next to the
-/// binary (the flake stages them there)
-fn taproot_lib(name: &str, env: &str) -> Result<PathBuf, String> {
+/// locate one of taproot's libs: explicit env override, a staging dir
+/// override, next to the binary (the flake stages them there), or
+/// ../lib/carrot relative to it (where `carrot install` stages them)
+pub(crate) fn taproot_lib(name: &str, env: &str) -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os(env) {
         return Ok(p.into());
     }
+    if let Some(dir) = std::env::var_os("CARROT_TAPROOT_DIR") {
+        let p = PathBuf::from(dir).join(name);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join(name);
-            if p.exists() {
-                return Ok(p);
+            for p in [dir.join(name), dir.join("../lib/carrot").join(name)] {
+                if p.exists() {
+                    return Ok(p);
+                }
             }
         }
     }
     Err(format!(
-        "{name} not found next to the binary (set {env} to a copy of libtaproot.so \
-         named {name}; dlopen matches by filename)"
+        "{name} not found next to the binary or in ../lib/carrot (set {env} \
+         to a copy of libtaproot.so named {name}; dlopen matches by filename)"
     ))
 }
 
-/// preload libc.so.6 + libm.so.6 GLOBAL by absolute path, once. every NEEDED
-/// libc.so.6/libm.so.6 in the icd's closure then reuses these by filename
-/// instead of searching RUNPATH and finding glibc. the handles are leaked on
+// -- static tls surplus --
+
+/// drivers built with DF_STATIC_TLS (nvidia's tls shim) need their block
+/// at a fixed tp-relative offset in every thread. this surplus lives in
+/// carrot's own tls segment, so it already exists everywhere, zeroed by
+/// the runtime - which is why only zero-image (tbss) blocks are served.
+const SURPLUS_SIZE: usize = 1024;
+const SURPLUS_ALIGN: usize = 64;
+
+#[repr(align(64))]
+struct TlsSurplus([u8; SURPLUS_SIZE]);
+
+#[thread_local]
+static TLS_SURPLUS: TlsSurplus = TlsSurplus([0; SURPLUS_SIZE]);
+
+static SURPLUS_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn alloc_static_tls(size: usize, align: usize) -> Option<isize> {
+    use std::sync::atomic::Ordering;
+    if align > SURPLUS_ALIGN {
+        return None;
+    }
+    let start = loop {
+        let cur = SURPLUS_NEXT.load(Ordering::SeqCst);
+        let start = (cur + align - 1) & !(align - 1);
+        if start + size > SURPLUS_SIZE {
+            return None;
+        }
+        if SURPLUS_NEXT
+            .compare_exchange(cur, start + size, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break start;
+        }
+    };
+    // this thread's copy locates the block; the tp-relative offset is
+    // the same in every thread, static tls being exactly that
+    let tp: usize;
+    unsafe { std::arch::asm!("mov {}, fs:0", out(reg) tp) };
+    let base = std::ptr::addr_of!(TLS_SURPLUS) as usize;
+    Some((base + start) as isize - tp as isize)
+}
+
+/// the legacy sonames an icd closure may name; each staged file is an
+/// empty taproot stub whose symbols all live in the preloaded libc.so.6.
+/// without these, RUNPATH hands the closure real glibc pieces, and mixed
+/// lock implementations deadlock the driver's initializers
+pub(crate) const STUB_SONAMES: [&str; 6] = [
+    "libpthread.so.0",
+    "libdl.so.2",
+    "librt.so.1",
+    "libutil.so.1",
+    "libresolv.so.2",
+    "ld-linux-x86-64.so.2",
+];
+
+/// preload the taproot family GLOBAL by absolute path, once. every NEEDED
+/// entry in the icd's closure then reuses these by filename instead of
+/// searching RUNPATH and finding glibc. the handles are leaked on
 /// purpose: a libc must never unmap.
-fn preload() -> Result<(), String> {
+pub(crate) fn preload() -> Result<(), String> {
     static DONE: OnceLock<Result<(), String>> = OnceLock::new();
     DONE.get_or_init(|| {
+        elf_loader::tls::set_static_tls_allocator(alloc_static_tls);
         let libc_path = taproot_lib("libc.so.6", "CARROT_LIBC")?;
         let libm_path = taproot_lib("libm.so.6", "CARROT_LIBM")?;
         for p in [&libc_path, &libm_path] {
             let lib = ElfLibrary::dlopen(p, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
+                .map_err(|e| format!("preload {}: {e}", p.display()))?;
+            std::mem::forget(lib);
+        }
+        for name in STUB_SONAMES {
+            let Ok(p) = taproot_lib(name, "CARROT_STUB_UNSET") else {
+                // an older staging: glibc may leak into heavy closures
+                eprintln!("carrot: vulkan: {name} stub not staged; run carrot install");
+                continue;
+            };
+            let lib = ElfLibrary::dlopen(&p, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
                 .map_err(|e| format!("preload {}: {e}", p.display()))?;
             std::mem::forget(lib);
         }
@@ -61,7 +136,7 @@ fn preload() -> Result<(), String> {
 // -- icd discovery --
 
 /// the card's kernel driver name, from the device node's sysfs entry
-fn kernel_driver(card: BorrowedFd<'_>) -> Result<String, String> {
+pub(crate) fn kernel_driver(card: BorrowedFd<'_>) -> Result<String, String> {
     let rdev = fstat(card).map_err(|e| format!("fstat card: {e}"))?.st_rdev;
     let path = format!(
         "/sys/dev/char/{}:{}/device/driver",
@@ -88,7 +163,7 @@ fn icd_matches(driver: &str, icd_file: &str) -> bool {
 /// every icd driver .so discoverable on this system, in discovery order.
 /// VK_ICD_FILENAMES entries may be files or directories; then the standard
 /// dirs (nixos puts the running system's drivers under /run/opengl-driver)
-fn all_icd_libraries() -> Vec<PathBuf> {
+pub(crate) fn all_icd_libraries() -> Vec<PathBuf> {
     let mut manifests: Vec<PathBuf> = Vec::new();
 
     if let Ok(spec) = std::env::var("VK_ICD_FILENAMES") {
@@ -131,17 +206,55 @@ fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// "library_path" out of an icd manifest, relative paths anchored at the
-/// manifest
+/// "library_path" out of an icd manifest. absolute paths stand, paths
+/// with directories anchor at the manifest, and a bare soname means the
+/// system search path (nvidia ships "libGLX_nvidia.so.0"); without a
+/// glibc loader we walk the usual lib dirs ourselves
 fn resolve_manifest(manifest: &Path) -> Option<PathBuf> {
     let txt = std::fs::read_to_string(manifest).ok()?;
     let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
     let lp = PathBuf::from(v.get("ICD")?.get("library_path")?.as_str()?);
-    Some(if lp.is_absolute() {
-        lp
-    } else {
-        manifest.parent().unwrap_or(Path::new(".")).join(lp)
-    })
+    manifest_library(manifest, lp, &lib_search_dirs())
+}
+
+fn manifest_library(manifest: &Path, lp: PathBuf, search: &[PathBuf]) -> Option<PathBuf> {
+    if lp.is_absolute() {
+        return Some(lp);
+    }
+    if lp.components().count() > 1 {
+        return Some(manifest.parent().unwrap_or(Path::new(".")).join(lp));
+    }
+    for dir in search {
+        let p = dir.join(&lp);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    eprintln!(
+        "carrot: vulkan: {}: {} not found in the library dirs",
+        manifest.display(),
+        lp.display()
+    );
+    None
+}
+
+fn lib_search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
+        dirs.extend(std::env::split_paths(&paths));
+    }
+    for d in [
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+        "/lib",
+        "/lib64",
+        "/run/opengl-driver/lib",
+    ] {
+        dirs.push(PathBuf::from(d));
+    }
+    dirs
 }
 
 // -- entry --
@@ -157,9 +270,12 @@ fn entry_for_icd(path: &Path) -> Result<ash::Entry, String> {
     }
 
     // RTLD_NOW forces every relocation immediately: a libc symbol taproot
-    // can't satisfy fails here, loudly, naming itself
+    // can't satisfy fails here, loudly, naming itself. the bracket logs
+    // turn a wedged driver initializer into a pointed report
+    eprintln!("carrot: vulkan: loading the driver closure");
     let lib = ElfLibrary::dlopen(path, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
         .map_err(|e| format!("dlopen {}: {e}", path.display()))?;
+    eprintln!("carrot: vulkan: driver closure loaded");
 
     // the khronos loader negotiates the icd interface version before anything
     // else; we stand in for it, and without this the icd won't enumerate
@@ -169,7 +285,7 @@ fn entry_for_icd(path: &Path) -> Result<ash::Entry, String> {
         )
     } {
         let mut ver: u32 = 5; // the newest loader<->icd interface we speak
-        unsafe { neg(&mut ver) };
+        let _ = unsafe { neg(&mut ver) };
     }
 
     let gipa = unsafe { lib.get::<IcdGipa>("vk_icdGetInstanceProcAddr") }
@@ -204,4 +320,110 @@ pub fn entry_for(card: BorrowedFd<'_>) -> Result<ash::Entry, RenderError> {
         })?;
     eprintln!("carrot: vulkan: {} for {driver}", icd.display());
     entry_for_icd(icd).map_err(RenderError::Load)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_paths_resolve_by_shape() {
+        let m = Path::new("/usr/share/vulkan/icd.d/x.json");
+        let dir = std::env::temp_dir().join(format!("carrot-libdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libGLX_test.so.0"), b"x").unwrap();
+        let search = [dir.clone()];
+        assert_eq!(
+            manifest_library(m, PathBuf::from("/abs/libvk.so"), &search),
+            Some(PathBuf::from("/abs/libvk.so"))
+        );
+        assert_eq!(
+            manifest_library(m, PathBuf::from("../lib/libvk.so"), &search),
+            Some(PathBuf::from("/usr/share/vulkan/icd.d/../lib/libvk.so"))
+        );
+        // a bare soname walks the search dirs, never the manifest dir
+        assert_eq!(
+            manifest_library(m, PathBuf::from("libGLX_test.so.0"), &search),
+            Some(dir.join("libGLX_test.so.0"))
+        );
+        assert_eq!(manifest_library(m, PathBuf::from("libGLX_absent.so.0"), &search), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// drivers spawn workers with the preloaded libc's pthread_create; those
+    /// threads must carry the executable's tls image, or every thread-local
+    /// access from loader code called back on them goes wild
+    #[test]
+    #[ignore = "wants the taproot lib paths"]
+    fn cdylib_threads_carry_exe_tls() {
+        use std::ffi::c_void;
+
+        preload().unwrap();
+        let libc_path = taproot_lib("libc.so.6", "CARROT_LIBC").unwrap();
+        let lib = ElfLibrary::dlopen(&libc_path, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
+            .unwrap();
+
+        std::thread_local! {
+            static PROBE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+
+        extern "C" fn worker(out: *mut c_void) -> *mut c_void {
+            // what loader code does when a driver thread calls back in:
+            // thread-local writes and heap traffic
+            PROBE.with(|p| p.set(0x5eed));
+            let mut v = Vec::new();
+            for i in 0..4096usize {
+                v.push(i.to_string());
+            }
+            drop(v);
+            let got = PROBE.with(|p| p.get());
+            unsafe { *(out as *mut usize) = got };
+            std::ptr::null_mut()
+        }
+
+        type PthreadCreate = unsafe extern "C" fn(
+            *mut u64,
+            *const c_void,
+            extern "C" fn(*mut c_void) -> *mut c_void,
+            *mut c_void,
+        ) -> i32;
+        type PthreadJoin = unsafe extern "C" fn(u64, *mut *mut c_void) -> i32;
+
+        let create = unsafe { lib.get::<PthreadCreate>("pthread_create") }.unwrap();
+        let join = unsafe { lib.get::<PthreadJoin>("pthread_join") }.unwrap();
+
+        let mut seen: usize = 0;
+        let mut tid: u64 = 0;
+        let rc = unsafe {
+            create(&mut tid, std::ptr::null(), worker, &mut seen as *mut usize as *mut c_void)
+        };
+        assert_eq!(rc, 0, "pthread_create through the preloaded libc");
+        let rc = unsafe { join(tid, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "pthread_join through the preloaded libc");
+        assert_eq!(seen, 0x5eed, "worker's thread-local round trip");
+        eprintln!("cdylib thread ok");
+        std::mem::forget(lib);
+    }
+
+    /// gpu-free by construction: an icd only opens the device node at
+    /// vkCreateInstance, so loading its closure is pure elf work. run by
+    /// hand when a driver's dlopen wedges:
+    ///   CARROT_LIBC=... CARROT_LIBM=... cargo test dlopen_the_cards_icd -- --ignored --nocapture
+    #[test]
+    #[ignore = "wants the system's icd and taproot lib paths"]
+    fn dlopen_the_cards_icd() {
+        preload().unwrap();
+        let all = all_icd_libraries();
+        let icd = all
+            .iter()
+            .find(|p| {
+                let f = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                std::env::var("CARROT_ICD_MATCH").map(|m| f.contains(&m)).unwrap_or(true)
+            })
+            .expect("an icd manifest resolves");
+        eprintln!("dlopen {}", icd.display());
+        let lib = ElfLibrary::dlopen(icd, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL).unwrap();
+        eprintln!("dlopen done");
+        std::mem::forget(lib);
+    }
 }

@@ -339,6 +339,26 @@ impl Strip {
         }
     }
 
+    /// exchange two tiles wherever they sit; slots keep their weights
+    pub fn swap_tiles(&self, a: &Window, b: &Window) -> bool {
+        let (Some((ca, ta)), Some((cb, tb))) = (self.locate(a), self.locate(b)) else {
+            return false;
+        };
+        if ca == cb {
+            if ta == tb {
+                return false;
+            }
+            self.cols.borrow_mut()[ca].tiles.swap(ta, tb);
+            return true;
+        }
+        let mut cols = self.cols.borrow_mut();
+        let wa = cols[ca].tiles[ta].clone();
+        let wb = cols[cb].tiles[tb].clone();
+        cols[ca].tiles[ta] = wb;
+        cols[cb].tiles[tb] = wa;
+        true
+    }
+
     pub fn swap_dir(&self, win: &Window, dir: Dir) -> bool {
         let Some((ci, ti)) = self.locate(win) else {
             return false;
@@ -356,11 +376,18 @@ impl Strip {
                 } else {
                     return false;
                 };
-                cols.swap(ci, other);
+                // trade the tile against the neighbor column's active one;
+                // slots keep their width and weight, the windows cross.
+                // move-column is the verb that carries a column wholesale
+                let oti = cols[other].active_tile.min(cols[other].tiles.len() - 1);
+                let a = cols[ci].tiles[ti].clone();
+                cols[ci].tiles[ti] = cols[other].tiles[oti].clone();
+                cols[other].tiles[oti] = a;
+                cols[other].active_tile = oti;
                 if self.active.get() == ci {
+                    self.prev_active.set(ci);
+                    self.restore.set(None);
                     self.active.set(other);
-                } else if self.active.get() == other {
-                    self.active.set(ci);
                 }
                 true
             }
@@ -389,6 +416,32 @@ impl Strip {
     }
 
     // -- column verbs --
+
+    /// the window's whole column leapfrogs one slot along the strip
+    pub fn move_column(&self, win: &Window, left: bool) -> bool {
+        let Some((ci, _)) = self.locate(win) else {
+            return false;
+        };
+        let mut cols = self.cols.borrow_mut();
+        let other = if left {
+            match ci.checked_sub(1) {
+                Some(o) => o,
+                None => return false,
+            }
+        } else if ci + 1 < cols.len() {
+            ci + 1
+        } else {
+            return false;
+        };
+        cols.swap(ci, other);
+        if self.active.get() == ci {
+            self.active.set(other);
+        } else if self.active.get() == other {
+            self.active.set(ci);
+        }
+        self.restore.set(None);
+        true
+    }
 
     /// a lone tile joins the neighbor column; a stacked tile breaks out
     /// into its own column on that side
@@ -714,6 +767,58 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!((r2.x1, r2.x2), (250, 750));
+    }
+
+    #[test]
+    fn swap_tiles_exchanges_arbitrary_pairs() {
+        let (_st, w) = setup(3);
+        let s = Strip::default();
+        s.insert(&w[0], &cfg());
+        s.insert(&w[1], &cfg());
+        assert!(s.consume_or_expel(&w[1], true)); // column 0: [w0, w1]
+        s.insert(&w[2], &cfg()); // column 1: [w2]
+        assert!(s.swap_tiles(&w[0], &w[2]), "across columns");
+        let rects = s.layout(area(), &cfg());
+        let r0 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[0])).unwrap().1;
+        let r2 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[2])).unwrap().1;
+        assert!(r0.x1 > r2.x1, "w0 moved into the right column");
+        assert!(s.swap_tiles(&w[2], &w[1]), "within a column");
+        assert!(!s.swap_tiles(&w[0], &w[0]));
+    }
+
+    #[test]
+    fn move_column_leapfrogs_the_strip() {
+        let (_st, w) = setup(3);
+        let s = Strip::default();
+        for win in &w {
+            s.insert(win, &cfg());
+        }
+        assert!(s.move_column(&w[2], true)); // [w0, w2, w1]
+        assert!(s.move_column(&w[2], true)); // [w2, w0, w1]
+        assert!(!s.move_column(&w[2], true), "saturates at the edge");
+        let rects = s.layout(area(), &cfg());
+        let r2 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[2])).unwrap().1;
+        assert_eq!(r2.x1, 0, "walked to the strip's head");
+        assert!(Rc::ptr_eq(&s.first().unwrap(), &w[2]), "focus rode along");
+    }
+
+    #[test]
+    fn swap_lr_trades_tiles_not_columns() {
+        let (_st, w) = setup(3);
+        let s = Strip::default();
+        s.insert(&w[0], &cfg());
+        s.insert(&w[1], &cfg());
+        assert!(s.consume_or_expel(&w[1], true)); // column 0: [w0, w1]
+        s.insert(&w[2], &cfg()); // column 1: [w2]
+        s.note_focus(&w[1]);
+        assert!(s.swap_dir(&w[1], Dir::Right));
+        let rects = s.layout(area(), &cfg());
+        let r0 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[0])).unwrap().1;
+        let r1 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[1])).unwrap().1;
+        let r2 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[2])).unwrap().1;
+        assert_eq!(r0.x1, r2.x1, "the neighbor took the stacked slot");
+        assert!(r1.x1 > r0.x1, "the mover stands alone on the right");
+        assert!(Rc::ptr_eq(&s.first().unwrap(), &w[1]), "active follows the mover");
     }
 
     #[test]

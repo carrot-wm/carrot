@@ -14,16 +14,58 @@
 // }
 
 use super::{
-    Action, Bind, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
-    LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch, SpawnCfg,
-    Vrr, WindowRule,
+    Action, Bind, BlurCfg, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
+    LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch,
+    SetLayoutArg, ShadowCfg, SpawnCfg, Vrr, WindowRule, WsAxis,
 };
-use piccolo::{Closure, Executor, Lua, Table, Value};
+use piccolo::{Callback, CallbackReturn, Closure, Executor, IntoValue, Lua, Table, Value};
 
+/// the anchorless test entry; live paths use `parse_at` so include()
+/// resolves against the real file
+#[cfg(test)]
 pub fn parse(src: &str) -> Result<Config, Vec<String>> {
+    parse_inner(src, None)
+}
+
+/// same, anchored at the file's real path so `include("other.lua")`
+/// resolves relative to it
+pub fn parse_at(src: &str, path: &std::path::Path) -> Result<Config, Vec<String>> {
+    parse_inner(src, path.parent().map(std::path::Path::to_path_buf))
+}
+
+fn parse_inner(src: &str, dir: Option<std::path::PathBuf>) -> Result<Config, Vec<String>> {
     let mut lua = Lua::core();
     let ex = lua
         .try_enter(|ctx| {
+            // `include("file.lua")` runs the file in the same globals; the
+            // core sandbox has no io, so the loader is ours to provide
+            if let Some(dir) = dir {
+                let budget = std::rc::Rc::new(std::cell::Cell::new(0usize));
+                let include = Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                    let name: piccolo::String = stack.consume(ctx)?;
+                    let rel = std::str::from_utf8(name.as_bytes())
+                        .unwrap_or_default()
+                        .to_string();
+                    if budget.replace(budget.get() + 1) >= 64 {
+                        return Err("include: too many included files"
+                            .into_value(ctx)
+                            .into());
+                    }
+                    let q = std::path::Path::new(&rel);
+                    let p = if q.is_absolute() { q.to_path_buf() } else { dir.join(q) };
+                    let text = match std::fs::read_to_string(&p) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return Err(format!("include {}: {e}", p.display())
+                                .into_value(ctx)
+                                .into());
+                        }
+                    };
+                    let closure = Closure::load(ctx, Some(rel.as_str()), text.as_bytes())?;
+                    Ok(CallbackReturn::Call { function: closure.into(), then: None })
+                });
+                ctx.set_global("include", include)?;
+            }
             let closure = Closure::load(ctx, Some("carrot.lua"), src.as_bytes())?;
             Ok(ctx.stash(Executor::start(ctx, closure.into(), ())))
         })
@@ -158,6 +200,7 @@ fn build(root: Table) -> Result<Config, Vec<String>> {
         };
         let r = match key.as_str() {
             "animations" => animations(&v, &mut cfg),
+            "decoration" => decoration(&v, &mut cfg),
             "input" => input(&v, &mut cfg),
             "outputs" => outputs(&v, &mut cfg),
             "layout" => layout(&v, &mut cfg),
@@ -423,6 +466,13 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                 }
             }
             "float_above_fullscreen" => l.float_above_fullscreen = need_bool(&v, &key)?,
+            "workspace_axis" => {
+                l.ws_axis = match need_str(&v, &key)?.as_str() {
+                    "horizontal" => WsAxis::Horizontal,
+                    "vertical" => WsAxis::Vertical,
+                    _ => return Err("workspace_axis is horizontal or vertical".into()),
+                };
+            }
             "focus_ring" | "shadow" | "struts" => {
                 return Err(format!("{key}: not implemented yet"));
             }
@@ -507,6 +557,85 @@ fn animations(v: &Value, cfg: &mut Config) -> Result<(), String> {
     Ok(())
 }
 
+fn decoration(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    let d = &mut cfg.decoration;
+    for (k, v) in table(v, "decoration")?.iter() {
+        let key = vstr(&k).ok_or("decoration keys must be strings")?;
+        match key.as_str() {
+            "rounding" => {
+                d.rounding =
+                    super::int_in(need_int(&v, &key)?, "rounding", 0, 200)? as i32;
+            }
+            "rounding_power" => {
+                d.rounding_power =
+                    super::f64_in(need_num(&v, &key)?, "rounding_power", 1.0, 8.0)?;
+            }
+            "dim_inactive" => {
+                d.dim_inactive =
+                    super::f64_in(need_num(&v, &key)?, "dim_inactive", 0.0, 1.0)?;
+            }
+            "shadow" => {
+                let mut s = ShadowCfg::default();
+                for (k, v) in table(&v, "shadow")?.iter() {
+                    let key = vstr(&k).ok_or("shadow keys must be strings")?;
+                    match key.as_str() {
+                        "size" => {
+                            s.size = super::int_in(need_int(&v, &key)?, "size", 1, 200)? as i32;
+                        }
+                        "color" => s.color = super::color(&need_str(&v, &key)?)?,
+                        "offset" => {
+                            let xy: Vec<i64> =
+                                indexed_entries(&v, &key)?.iter().filter_map(vint).collect();
+                            let [x, y] = xy.as_slice() else {
+                                return Err("offset is { x, y }".to_string());
+                            };
+                            if x.abs() > 500 || y.abs() > 500 {
+                                return Err("offset is within -500..500".to_string());
+                            }
+                            s.offset = (*x as i32, *y as i32);
+                        }
+                        "power" => {
+                            s.power = super::f64_in(need_num(&v, &key)?, "power", 0.5, 8.0)?;
+                        }
+                        other => return Err(format!("unknown shadow key `{other}`")),
+                    }
+                }
+                d.shadow = Some(s);
+            }
+            "blur" => {
+                let mut b = BlurCfg::default();
+                for (k, v) in table(&v, "blur")?.iter() {
+                    let key = vstr(&k).ok_or("blur keys must be strings")?;
+                    match key.as_str() {
+                        "passes" => {
+                            b.passes =
+                                super::int_in(need_int(&v, &key)?, "passes", 1, 4)? as i32;
+                        }
+                        "size" => b.size = super::f64_in(need_num(&v, &key)?, "size", 0.5, 6.0)?,
+                        "noise" => b.noise = super::f64_in(need_num(&v, &key)?, "noise", 0.0, 1.0)?,
+                        "contrast" => {
+                            b.contrast = super::f64_in(need_num(&v, &key)?, "contrast", 0.0, 2.0)?;
+                        }
+                        "brightness" => {
+                            b.brightness =
+                                super::f64_in(need_num(&v, &key)?, "brightness", 0.0, 2.0)?;
+                        }
+                        "xray" => {
+                            if !need_bool(&v, &key)? {
+                                return Err("xray false: not implemented yet".to_string());
+                            }
+                        }
+                        other => return Err(format!("unknown blur key `{other}`")),
+                    }
+                }
+                d.blur = Some(b);
+            }
+            other => return Err(format!("unknown decoration key `{other}`")),
+        }
+    }
+    Ok(())
+}
+
 fn lua_spring(v: &Value) -> Result<Motion, String> {
     let (mut d, mut s, mut e) = (None, None, None);
     for (k, v) in table(v, "spring")?.iter() {
@@ -574,10 +703,17 @@ fn anim_kind(
 /// { "name", perc = n, dir = ".." } through the shared style validator
 fn lua_style(v: &Value, family: super::StyleFamily) -> Result<super::Style, String> {
     let t = table(v, "style")?;
+    // name is the first positional entry ({ "popin", ... }); also accept a
+    // `name =` key so a config that can only emit named tables (the home-manager
+    // module goes through generators.toLua) still parses.
     let name = t
         .iter()
         .find_map(|(k, v)| if vint(&k) == Some(1) { vstr(&v) } else { None })
-        .ok_or("style wants { \"name\", ... }")?;
+        .or_else(|| {
+            t.iter()
+                .find_map(|(k, v)| if vstr(&k).as_deref() == Some("name") { vstr(&v) } else { None })
+        })
+        .ok_or("style wants { \"name\", ... } or name = \"...\"")?;
     let mut perc = None;
     let mut dir = None;
     for (k, v) in t.iter() {
@@ -787,6 +923,25 @@ fn action_from(name: &str, args: &[LuaArg]) -> Result<Action, String> {
             },
             _ => return Err("adjust-split-ratio wants a signed delta".to_string()),
         },
+        "consume-or-expel-left" => Action::ConsumeOrExpelLeft,
+        "consume-or-expel-right" => Action::ConsumeOrExpelRight,
+        "move-column-left" => Action::MoveColumnLeft,
+        "move-column-right" => Action::MoveColumnRight,
+        "cycle-column-width" => Action::CycleColumnWidth,
+        "cycle-column-width-back" => Action::CycleColumnWidthBack,
+        "toggle-full-width" => Action::ToggleFullWidth,
+        "center-column" => Action::CenterColumn,
+        "pointer-move" => Action::PointerMove,
+        "pointer-resize" => Action::PointerResize,
+        "set-layout" => match args.first() {
+            Some(LuaArg::S(s)) => match s.as_str() {
+                "dwindle" => Action::SetLayout(SetLayoutArg::Dwindle),
+                "scrolling" => Action::SetLayout(SetLayoutArg::Scrolling),
+                "toggle" => Action::SetLayout(SetLayoutArg::Toggle),
+                _ => return Err("set-layout is dwindle, scrolling or toggle".to_string()),
+            },
+            _ => return Err("set-layout is dwindle, scrolling or toggle".to_string()),
+        },
         "quit" => Action::Quit,
         other => return Err(format!("unknown action \"{other}\"")),
     })
@@ -861,6 +1016,16 @@ fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                     rule.allow_tearing = need_bool(&v, &key).map_err(whine)?;
                 }
                 "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
+                "no_capture" => rule.no_capture = need_bool(&v, &key).map_err(whine)?,
+                "rounding" => {
+                    rule.rounding = Some(
+                        super::int_in(need_int(&v, &key).map_err(whine)?, "rounding", 0, 200)
+                            .map_err(whine)? as i32,
+                    );
+                }
+                "shadow" => rule.shadow = Some(need_bool(&v, &key).map_err(whine)?),
+                "dim" => rule.dim = Some(need_bool(&v, &key).map_err(whine)?),
+                "blur" => rule.blur = Some(need_bool(&v, &key).map_err(whine)?),
                 "animation" => {
                     rule.animation =
                         Some(lua_style(&v, super::StyleFamily::Win).map_err(whine)?);
@@ -885,9 +1050,17 @@ fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
             match key.as_str() {
                 "match" => {
                     for m in str_array(&v, "match").map_err(whine)? {
-                        rule.matches.push(super::regex(&m).map_err(whine)?);
+                        rule.matches.push(super::Pattern::new(&m).map_err(whine)?);
                     }
                 }
+                "blur" => rule.blur = need_bool(&v, &key).map_err(whine)?,
+                "ignore_alpha" => {
+                    rule.ignore_alpha = Some(
+                        super::f64_in(need_num(&v, &key).map_err(whine)?, "ignore_alpha", 0.0, 1.0)
+                            .map_err(whine)?,
+                    )
+                }
+                "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
                 other => return Err(whine(format!("unknown key `{other}`"))),
             }
         }
@@ -958,6 +1131,16 @@ fn debug(v: &Value, cfg: &mut Config) -> Result<(), String> {
             "ignore_drm_devices" => {
                 cfg.debug.ignore_drm_devices = str_array(&v, &key)?;
             }
+            "latency_policy" => {
+                cfg.debug.latency_policy = match need_str(&v, &key)?.as_str() {
+                    "late-latch" => crate::config::LatencyPolicy::LateLatch,
+                    "vblank" => crate::config::LatencyPolicy::Vblank,
+                    other => return Err(format!("unknown latency_policy `{other}`")),
+                }
+            }
+            "latch_margin_us" => {
+                cfg.debug.latch_margin_us = Some(need_int(&v, &key)?.max(0) as u32);
+            }
             other => return Err(format!("unknown debug key `{other}`")),
         }
     }
@@ -970,7 +1153,7 @@ mod tests {
 
     #[test]
     fn lua_and_kdl_parse_to_the_same_config() {
-        let kdl = crate::config::parse(
+        let kdl = crate::config::kdl::parse(
             r##"
             input {
                 keyboard { repeat-rate 35; repeat-delay 250 }
@@ -980,6 +1163,7 @@ mod tests {
             layout {
                 gaps-in 4
                 gaps-out 8
+                workspace-axis "vertical"
                 border { width 2; active-color "#89b4fa"; inactive-color "#585b70" }
             }
             animations {
@@ -1020,6 +1204,7 @@ mod tests {
                 layout = {
                     gaps_in = 4,
                     gaps_out = 8,
+                    workspace_axis = "vertical",
                     border = { width = 2, active_color = "#89b4fa", inactive_color = "#585b70" },
                 },
                 animations = {

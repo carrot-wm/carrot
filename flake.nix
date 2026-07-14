@@ -31,11 +31,36 @@
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
-        "aarch64-linux"
       ];
 
-      flake = {
-        homeManagerModules =
+      flake.nixosModules.default =
+        { config, lib, pkgs, ... }:
+        let
+          cfg = config.programs.carrot;
+          package = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot;
+        in
+        {
+          options.programs.carrot.enable = lib.mkEnableOption "the carrot compositor";
+          config = lib.mkIf cfg.enable {
+            # xdg-utils rides along: xdg-open is what apps exec for links
+            # and file managers, and nothing else guarantees it on PATH
+            environment.systemPackages = [ package pkgs.xdg-utils ];
+            # the package carries the session entry; this lists it at the DM
+            services.displayManager.sessionPackages = [ package ];
+            # carrot is its own screencast backend; the package ships the
+            # portal registration and the preference file
+            xdg.portal = {
+              enable = true;
+              extraPortals = [ package ];
+              configPackages = [ package ];
+            };
+            # clients draw text through fontconfig; a bare system renders
+            # tofu for emoji and symbols without the default set
+            fonts.enableDefaultPackages = lib.mkDefault true;
+          };
+        };
+
+      flake.homeManagerModules.default =
           { config, lib, pkgs, ... }:
           let
             inherit (lib)
@@ -43,7 +68,7 @@
               mkOption
               types
               ;
-            cfg = config.carrot;
+            cfg = config.wayland.windowManager.carrot;
             actions = [
               "spawn-sh" "spawn"
               "focus-workspace" "move-to-workspace" "send-to-workspace"
@@ -107,7 +132,7 @@
                   type = types.nullOr (types.submodule {
                     options = {
                       name = mkOption {
-                        type = types.nullOr types.str;
+                        type = types.nullOr (types.enum [ "popin" "fade" "slide" "slidevert" "slidefade" "slidefadevert" ]);
                         default = null;
                       };
                       perc = mkOption {
@@ -115,7 +140,7 @@
                         default = null;
                       };
                       dir = mkOption {
-                        type = types.nullOr types.str;
+                        type = types.nullOr (types.enum [ "top" "bottom" "left" "right" ]);
                         default = null;
                       };
                     };
@@ -191,6 +216,10 @@
                             type = types.nullOr (types.numbers.between 1 60000);
                             default = null;
                           };
+                          title = mkOption {
+                            type = types.nullOr types.str;
+                            default = null;
+                          };
                         };
                       }));
                       default = null;
@@ -240,7 +269,7 @@
                             type = types.nullOr (types.submodule {
                               options = {
                                 accel_profile = mkOption {
-                                  type = types.nullOr types.str;
+                                  type = types.nullOr (types.enum [ "flat" "adaptive" ]);
                                   default = null;
                                 };
                                 accel_speed = mkOption {
@@ -259,7 +288,7 @@
                             type = types.nullOr (types.submodule {
                               options = {
                                 accel_profile = mkOption {
-                                  type = types.nullOr types.str;
+                                  type = types.nullOr (types.enum [ "flat" "adaptive" ]);
                                   default = null;
                                 };
                                 accel_speed = mkOption {
@@ -282,7 +311,7 @@
                                   default = null;
                                 };
                                 accel_profile = mkOption {
-                                  type = types.nullOr types.str;
+                                  type = types.nullOr (types.enum [ "flat" "adaptive" ]);
                                   default = null;
                                 };
                                 natural_scroll = mkOption {
@@ -298,7 +327,7 @@
                             default = null;
                           };
                           mod_key = mkOption {
-                            type = types.nullOr types.str;
+                            type = types.nullOr (types.enum [ "super" "alt" ]);
                             default = null;
                           };
                         };
@@ -353,6 +382,41 @@
                             default = null;
                           };
                           dim = mkOption {
+                            type = types.nullOr types.bool;
+                            default = null;
+                          };
+                          no_capture = mkOption {
+                            type = types.nullOr types.bool;
+                            default = null;
+                          };
+                          animation = mkOption {
+                            type = types.nullOr types.str;
+                            default = null;
+                          };
+                          blur = mkOption {
+                            type = types.nullOr types.bool;
+                            default = null;
+                          };
+                        };
+                      }));
+                      default = null;
+                    };
+                    layer_rules = mkOption {
+                      type = types.nullOr (types.listOf (types.submodule {
+                        options = {
+                          match = mkOption {
+                            type = types.nullOr (types.listOf types.str);
+                            default = null;
+                          };
+                          blur = mkOption {
+                            type = types.nullOr types.bool;
+                            default = null;
+                          };
+                          ignore_alpha = mkOption {
+                            type = types.nullOr (types.numbers.between 0.0 1.0);
+                            default = null;
+                          };
+                          no_anim = mkOption {
                             type = types.nullOr types.bool;
                             default = null;
                           };
@@ -450,7 +514,7 @@
                                   default = null;
                                 };
                                 color = mkOption {
-                                  type = types.nullOr types.str;
+                                  type = types.nullOr (types.strMatching "#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})");
                                   default = null;
                                 };
                                 offset = mkOption {
@@ -459,6 +523,37 @@
                                 };
                                 power = mkOption {
                                   type = types.nullOr (types.numbers.between 0.5 8.0);
+                                  default = null;
+                                };
+                              };
+                            });
+                            default = null;
+                          };
+                          blur = mkOption {
+                            type = types.nullOr (types.submodule {
+                              options = {
+                                passes = mkOption {
+                                  type = types.nullOr (types.ints.between 1 4);
+                                  default = null;
+                                };
+                                size = mkOption {
+                                  type = types.nullOr (types.numbers.between 0.5 6.0);
+                                  default = null;
+                                };
+                                noise = mkOption {
+                                  type = types.nullOr (types.numbers.between 0.0 1.0);
+                                  default = null;
+                                };
+                                contrast = mkOption {
+                                  type = types.nullOr (types.numbers.between 0.0 2.0);
+                                  default = null;
+                                };
+                                brightness = mkOption {
+                                  type = types.nullOr (types.numbers.between 0.0 2.0);
+                                  default = null;
+                                };
+                                xray = mkOption {
+                                  type = types.nullOr types.bool;
                                   default = null;
                                 };
                               };
@@ -519,11 +614,11 @@
                                   default = null;
                                 };
                                 active_color = mkOption {
-                                  type = types.nullOr types.str;
+                                  type = types.nullOr (types.strMatching "#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})");
                                   default = null;
                                 };
                                 inactive_color = mkOption {
-                                  type = types.nullOr types.str;
+                                  type = types.nullOr (types.strMatching "#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})");
                                   default = null;
                                 };
                               };
@@ -542,7 +637,7 @@
                       type = types.nullOr (types.attrsOf (types.submodule {
                         options = {
                           mode = mkOption {
-                            type = types.nullOr types.str;
+                            type = types.nullOr (types.strMatching "[0-9]+x[0-9]+(@[0-9]+)?");
                             default = null;
                           };
                           scale = mkOption {
@@ -626,7 +721,15 @@
                             default = null;
                           };
                           ignore_drm_devices = mkOption {
-                            type = types.nullOr types.str;
+                            type = types.nullOr (types.listOf types.str);
+                            default = null;
+                          };
+                          latency_policy = mkOption {
+                            type = types.nullOr (types.enum [ "late-latch" "vblank" ]);
+                            default = null;
+                          };
+                          latch_margin_us = mkOption {
+                            type = types.nullOr types.ints.unsigned;
                             default = null;
                           };
                         };
@@ -683,7 +786,7 @@
             config = mkIf cfg.enable {
               home.packages = [ cfg.package ];
 
-              xdg.configFile."carrot/carrot.lua" = mkIf (cfg.settings != {}) {
+              xdg.configFile."carrot/carrot.lua" = mkIf (cfg.settings != null) {
                 text = let
                   luaConfig = lib.generators.toLua { } cfg.settings;
                 in
@@ -693,7 +796,6 @@
               };
             };
           };
-      };
 
       perSystem =
         {
@@ -706,6 +808,9 @@
         let
           craneLib = crane.mkLib pkgs;
 
+          # nightly is mandatory: -Z build-std + eyra. rust-src for build-std.
+          # pinned to rust-toolchain.toml (same date as taproot's) so every
+          # build path and the libc share one compiler.
           toolchain =
             (inputs'.fenix.packages.toolchainOf {
               channel = "nightly";
@@ -720,10 +825,13 @@
                 "rustfmt"
               ];
 
+          # Only include source files that are actually relevant to the build
           src = lib.cleanSourceWith {
             src = ./.;
             filter = craneLib.filterCargoSources;
           };
+
+          # Pure Rust, zero linked C - no dependencies to build against.
 
           commonArgs = {
             inherit src;
@@ -733,6 +841,7 @@
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
 
+            # the keymap tests build real xkb state in the check phase
             XKB_CONFIG_ROOT = "${pkgs.xkeyboard-config}/share/X11/xkb";
           };
 
@@ -744,6 +853,9 @@
                 --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.vulkan-loader ]} \
                 --set-default XKB_CONFIG_ROOT ${pkgs.xkeyboard-config}/share/X11/xkb
 
+              # Wayland session desktop entry; DesktopNames makes the session
+              # manager set XDG_CURRENT_DESKTOP=carrot, which the portal
+              # frontend matches against carrot-portals.conf
               mkdir -p $out/share/wayland-sessions
               cat > $out/share/wayland-sessions/carrot.desktop << EOF
               [Desktop Entry]
@@ -754,6 +866,8 @@
               DesktopNames=carrot
               EOF
 
+              # the portal backend is the compositor itself - register the
+              # bus name it serves and prefer it for screencasts
               mkdir -p $out/share/xdg-desktop-portal/portals
               cat > $out/share/xdg-desktop-portal/portals/carrot.portal << EOF
               [portal]
@@ -768,10 +882,12 @@
               EOF
             '';
 
+            passthru.providedSessions = [ "carrot" ];
+
             meta = {
               description = "A pure Rust tiling Wayland compositor with zero linked C, all the way down to the kernel";
               license = lib.licenses.gpl3;
-              platforms = [ "x86_64-linux" "aarch64-linux" ];
+              platforms = [ "x86_64-linux" ];
               mainProgram = "carrot";
             };
           });
@@ -786,19 +902,22 @@
             packages = with pkgs; [
               toolchain
               rust-analyzer
-              binutils
+              binutils # readelf / nm for the zero-C gate
 
-              vulkan-tools
+              # Vulkan debugging
+              vulkan-tools          # vulkaninfo
               vulkan-validation-layers
               renderdoc
 
-              wev
-              wayland-utils
+              # Wayland debugging
+              wev                   # input event viewer
+              wayland-utils         # wayland-info
             ];
 
             env = {
               LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.vulkan-loader ];
               VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
+              # kbvm needs the xkb data root; nothing ships it system-wide on NixOS
               XKB_CONFIG_ROOT = "${pkgs.xkeyboard-config}/share/X11/xkb";
             };
 

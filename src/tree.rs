@@ -155,12 +155,21 @@ pub struct Window {
     pub rule_immediate: Cell<bool>,
     /// window-rule `opacity`, multiplied into every sampled quad
     pub rule_opacity: Cell<Option<f32>>,
+    pub rule_rounding: Cell<Option<i32>>,
+    pub rule_shadow: Cell<Option<bool>>,
+    pub rule_dim: Cell<Option<bool>>,
+    pub rule_blur: Cell<bool>,
+    /// captures and casts get a black stand-in instead of this window
+    pub rule_no_capture: Cell<bool>,
     pub anims: RefCell<WinAnims>,
-    /// the ops + texture keys this window produced at its last compose;
-    /// the close animation seizes them when the surface goes away
+    /// the ops + texture keys/uids this window produced at its last compose,
+    /// plus the subrange holding only the surface-tree ops; the close
+    /// animation seizes the whole batch, the resize snapshot bakes just
+    /// the surface slice
     pub last_batch: RefCell<(
         Vec<crate::render::renderer::RenderOp>,
-        Vec<(crate::client::ClientId, u64)>,
+        Vec<((crate::client::ClientId, u64), u64)>,
+        std::ops::Range<usize>,
     )>,
 }
 
@@ -171,6 +180,19 @@ pub struct WinAnims {
     pub move_: Option<MoveAnim>,
     pub open: Option<(crate::anim::Anim, crate::config::Style)>,
     pub border: Option<BorderAnim>,
+    /// settled dim rides here too; never pruned
+    pub dim: Option<crate::anim::Anim>,
+    pub resize: Option<ResizeAnim>,
+}
+
+/// old content crossfades into new across the animated geometry; the
+/// textures are baked/rendered at compose time and retired through state
+pub struct ResizeAnim {
+    pub anim: crate::anim::Anim, // 0 -> 1
+    pub from: (i32, i32),
+    pub from_rect: Rect,
+    pub snapshot: Option<crate::render::renderer::Texture>,
+    pub live: Option<crate::render::renderer::Texture>,
 }
 
 /// draw offset = (dx, dy) * anim.value(); the anim runs 1 -> 0
@@ -197,8 +219,13 @@ impl Window {
             fullscreen: Cell::new(false),
             rule_immediate: Cell::new(false),
             rule_opacity: Cell::new(None),
+            rule_rounding: Cell::new(None),
+            rule_shadow: Cell::new(None),
+            rule_dim: Cell::new(None),
+            rule_blur: Cell::new(false),
+            rule_no_capture: Cell::new(false),
             anims: RefCell::new(WinAnims::default()),
-            last_batch: RefCell::new((Vec::new(), Vec::new())),
+            last_batch: RefCell::new((Vec::new(), Vec::new(), 0..0)),
         }
     }
 
@@ -273,16 +300,81 @@ impl Window {
 
     /// target rect write + move-anim bookkeeping; every layout path uses this
     pub fn set_rect_animated(&self, state: &State, r: Rect) {
+        self.set_rect_animated_bias(state, r, 0.0);
+    }
+
+    /// view_dx: apparent horizontal movement owed to a strip scroll; the
+    /// view animation carries that share, move anims only the remainder
+    pub fn set_rect_animated_bias(&self, state: &State, r: Rect, view_dx: f64) {
         let old = self.rect.replace(r);
         if old == r {
             return;
         }
+        // a live grab tracks 1:1: no anims spawn, in-flight ones drop so
+        // nothing chases the pointer
+        if state.grab_active.get() {
+            let mut m = self.anims.borrow_mut();
+            m.move_ = None;
+            if let Some(rz) = &mut m.resize {
+                let mut q = state.retire_tex.borrow_mut();
+                q.extend(rz.snapshot.take());
+                q.extend(rz.live.take());
+            }
+            m.resize = None;
+            return;
+        }
         let first = old == Rect::default();
-        let (dx, dy) = ((old.x1 - r.x1) as f64, (old.y1 - r.y1) as f64);
+        let cfg = state.config.borrow().clone();
+        // size change beyond the threshold starts (or retargets) the
+        // crossfade; the textures get built at compose time
+        let (dw, dh) = (old.width() - r.width(), old.height() - r.height());
+        if !first
+            && !self.fullscreen.get()
+            && (dw.abs() > 10 || dh.abs() > 10)
+            && self.surface().mapped.get()
+        {
+            if let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowResize) {
+                state.anim_clock.touch();
+                let now = state.anim_clock.now();
+                let mut m = self.anims.borrow_mut();
+                match &mut m.resize {
+                    Some(rz) => {
+                        let p = rz.anim.clamped_value(now);
+                        let cw = rz.from.0 as f64 + (old.width() - rz.from.0) as f64 * p;
+                        let ch = rz.from.1 as f64 + (old.height() - rz.from.1) as f64 * p;
+                        rz.from = (cw.round() as i32, ch.round() as i32);
+                        rz.anim = crate::config::build_anim(
+                            &state.anim_clock,
+                            motion,
+                            &cfg.animations,
+                            0.0,
+                            1.0,
+                            rz.anim.velocity(now),
+                        );
+                    }
+                    None => {
+                        m.resize = Some(ResizeAnim {
+                            anim: crate::config::build_anim(
+                                &state.anim_clock,
+                                motion,
+                                &cfg.animations,
+                                0.0,
+                                1.0,
+                                0.0,
+                            ),
+                            from: (old.width(), old.height()),
+                            from_rect: old,
+                            snapshot: None,
+                            live: None,
+                        });
+                    }
+                }
+            }
+        }
+        let (dx, dy) = ((old.x1 - r.x1) as f64 - view_dx, (old.y1 - r.y1) as f64);
         if first || (dx == 0.0 && dy == 0.0) || self.fullscreen.get() {
             return;
         }
-        let cfg = state.config.borrow().clone();
         let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowMove) else {
             self.anims.borrow_mut().move_ = None;
             return;
@@ -290,11 +382,17 @@ impl Window {
         state.anim_clock.touch();
         let now = state.anim_clock.now();
         let mut anims = self.anims.borrow_mut();
-        // retarget folds the current visual offset into the new from-delta
+        // retarget folds the current visual offset into the new from-delta;
+        // the scalar velocity is per-span, so rescale it to the new span or
+        // the handoff speed jumps with the delta magnitude
         let (cdx, cdy, vel) = match &anims.move_ {
             Some(m) => {
                 let v = m.anim.value(now);
-                (m.dx * v + dx, m.dy * v + dy, m.anim.velocity(now))
+                let (cdx, cdy) = (m.dx * v + dx, m.dy * v + dy);
+                let old = (m.dx * m.dx + m.dy * m.dy).sqrt();
+                let new = (cdx * cdx + cdy * cdy).sqrt();
+                let vel = if new > 1e-6 { m.anim.velocity(now) * old / new } else { 0.0 };
+                (cdx, cdy, vel)
             }
             None => (dx, dy, 0.0),
         };
@@ -318,29 +416,90 @@ impl Window {
         }
     }
 
-    /// prune finished animations, report whether any remain
+    /// prune finished animations, report whether any remain. move draws
+    /// the raw overshooting value, so it lives until the envelope rests;
+    /// everything else draws clamped and is static once settled
     pub fn anims_live(&self, now: u64) -> bool {
         let mut m = self.anims.borrow_mut();
         if m.move_.as_ref().is_some_and(|mv| mv.anim.is_done(now)) {
             m.move_ = None;
         }
-        if m.open.as_ref().is_some_and(|(a, _)| a.is_done(now)) {
+        // resize is pruned by the draw path, which can retire its textures
+        if m.open.as_ref().is_some_and(|(a, _)| a.settled(now)) {
             m.open = None;
         }
-        if m.border.as_ref().is_some_and(|b| b.anim.is_done(now)) {
+        if m.border.as_ref().is_some_and(|b| b.anim.settled(now)) {
             m.border = None;
         }
-        m.move_.is_some() || m.open.is_some() || m.border.is_some()
+        m.move_.is_some()
+            || m.open.is_some()
+            || m.border.is_some()
+            || m.dim.as_ref().is_some_and(|a| !a.settled(now))
+            || m.resize.as_ref().is_some_and(|r| !r.anim.settled(now))
     }
 
     /// drop every animation; grabs and no-anim paths stay 1:1
-    pub fn anims_snap(&self) {
+    pub fn anims_snap(&self, state: &State) {
+        self.retire_gpu(state);
         *self.anims.borrow_mut() = WinAnims::default();
+    }
+
+    /// hand any held gpu textures to the deferred retire queue
+    pub fn retire_gpu(&self, state: &State) {
+        let mut m = self.anims.borrow_mut();
+        if let Some(rz) = &mut m.resize {
+            let mut q = state.retire_tex.borrow_mut();
+            q.extend(rz.snapshot.take());
+            q.extend(rz.live.take());
+        }
     }
 
     /// drop only the move animation; a grab must not chase its own pointer
     pub fn move_snap(&self) {
         self.anims.borrow_mut().move_ = None;
+    }
+
+    /// this frame's dim strength, easing toward `want` on focus flips
+    pub fn dim_now(&self, state: &State, want: f64) -> f64 {
+        let now = state.anim_clock.now();
+        let cfg = state.config.borrow().clone();
+        let mut m = self.anims.borrow_mut();
+        let Some(a) = &mut m.dim else {
+            m.dim = Some(crate::anim::Anim::ease(
+                &state.anim_clock,
+                want,
+                want,
+                0,
+                crate::anim::Curve::Linear,
+            ));
+            return want;
+        };
+        if (a.to() - want).abs() > 1e-3 {
+            match cfg.animations.motion(crate::config::AnimKind::BorderColor) {
+                Some(motion) => {
+                    let cur = a.clamped_value(now);
+                    state.anim_clock.touch();
+                    *a = crate::config::build_anim(
+                        &state.anim_clock,
+                        motion,
+                        &cfg.animations,
+                        cur,
+                        want,
+                        0.0,
+                    );
+                }
+                None => {
+                    *a = crate::anim::Anim::ease(
+                        &state.anim_clock,
+                        want,
+                        want,
+                        0,
+                        crate::anim::Curve::Linear,
+                    );
+                }
+            }
+        }
+        a.clamped_value(now).clamp(0.0, 1.0)
     }
 
     /// the border color this frame, easing in oklab toward `want`
@@ -444,6 +603,11 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
             warp_to_workspace(state, &ws);
         }
     }
+    // the whole scene changed under a stationary cursor: pointer focus
+    // re-resolves, and a constraint pinned to a hidden window breaks
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.repick(state);
+    }
     // focus lands on whatever is under the cursor, else the first tile
     let target = {
         let (cx, cy) = cursor_pos(state);
@@ -458,13 +622,15 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
 }
 
 /// scrolling workspaces own the horizontal axis; any of them forces the
-/// workspace stack vertical. an all-dwindle session slides horizontally
+/// workspace stack vertical. dwindle sessions follow workspace-axis,
+/// horizontal unless the config asks otherwise
 pub fn ws_axis_vertical(state: &Rc<State>) -> bool {
-    state
-        .workspaces
-        .borrow()
-        .iter()
-        .any(|w| w.tiling.mode() == crate::config::LayoutMode::Scrolling)
+    state.config.borrow().layout.ws_axis == crate::config::WsAxis::Vertical
+        || state
+            .workspaces
+            .borrow()
+            .iter()
+            .any(|w| w.tiling.mode() == crate::config::LayoutMode::Scrolling)
 }
 
 /// switch a workspace's tiling mode, re-tiling its windows in order; the
@@ -615,14 +781,58 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
     if wins.is_empty() {
         return;
     }
+    // everything under a fullscreen window is buried; cycling either
+    // stays or snaps a stranded focus back to the visible one
+    let fs = ws.fullscreen.borrow().clone();
+    if let Some(fs) = fs {
+        if focused_window(state).is_none_or(|c| !Rc::ptr_eq(&c, &fs)) {
+            focus_window(state, Some(&fs));
+            state.damage.trigger();
+        }
+        return;
+    }
     let cur = focused_window(state);
+    let from = cur.as_ref().map(|c| c.rect.get()).unwrap_or_default();
     let idx = cur.and_then(|c| wins.iter().position(|w| Rc::ptr_eq(w, &c)));
     let next = match idx {
         Some(i) => (i as i32 + dir).rem_euclid(wins.len() as i32) as usize,
         None => 0,
     };
     focus_window(state, Some(&wins[next]));
+    warp_pointer_into(state, from, &wins[next]);
     state.damage.trigger();
+}
+
+/// keyboard focus moved windows: carry the pointer along, holding its
+/// relative position from the old rect; a pointer that was elsewhere
+/// lands centered
+fn warp_pointer_into(state: &Rc<State>, from: Rect, win: &Rc<Window>) {
+    let Some(seat) = state.seat.borrow().clone() else { return };
+    // a locked pointer is frozen by contract; the drawn cursor must not
+    // teleport away from it either
+    if seat.lock_active() {
+        return;
+    }
+    let to = win.rect.get();
+    if to.is_empty() {
+        return;
+    }
+    let (px, py) = (seat.ptr_x.get(), seat.ptr_y.get());
+    let inside = from.width() > 0 && from.height() > 0 && from.contains(px as i32, py as i32);
+    let (fx, fy) = if inside {
+        (
+            (px - from.x1 as f64) / from.width() as f64,
+            (py - from.y1 as f64) / from.height() as f64,
+        )
+    } else {
+        (0.5, 0.5)
+    };
+    let nx = to.x1 as f64 + fx * to.width() as f64;
+    let ny = to.y1 as f64 + fy * to.height() as f64;
+    seat.warp(state, nx, ny);
+    if let Some(d) = state.display.borrow().as_ref() {
+        d.move_cursor(state, nx as i32, ny as i32);
+    }
 }
 
 // -- directional navigation --
@@ -666,15 +876,25 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
         return;
     };
     let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
-    if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
-        && !cur.floating.get()
-        && !cur.fullscreen.get()
-    {
+    // a fullscreen window is the only visible thing on its workspace;
+    // focus verbs never wander under it, and focus stranded on a buried
+    // window snaps back out
+    let fs = ws.fullscreen.borrow().clone();
+    if let Some(fs) = fs {
+        if !Rc::ptr_eq(&fs, &cur) {
+            focus_window(state, Some(&fs));
+            state.damage.trigger();
+        }
+        return;
+    }
+    if ws.tiling.mode() == crate::config::LayoutMode::Scrolling && !cur.floating.get() {
         ws.tiling.strip.note_focus(&cur);
         if let Some(next) = ws.tiling.strip.focus_dir(dir) {
+            let from = cur.rect.get();
             // keep-in-view follows the newly active column
             relayout(state, &ws);
             focus_window(state, Some(&next));
+            warp_pointer_into(state, from, &next);
             state.damage.trigger();
         }
         return;
@@ -688,6 +908,7 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
     let rects: Vec<Rect> = cands.iter().map(|w| w.rect.get()).collect();
     if let Some(i) = dir_pick(cur.rect.get(), &rects, dir) {
         focus_window(state, Some(&cands[i]));
+        warp_pointer_into(state, cur.rect.get(), &cands[i]);
         state.damage.trigger();
     }
 }
@@ -776,6 +997,36 @@ pub fn window_for_surface_any(state: &Rc<State>, s: &Rc<WlSurface>) -> Option<Rc
 
 // -- map / unmap --
 
+/// re-resolve the dynamic rule effects for every mapped window; a reload
+/// must land on running apps, a privacy rule especially. open-time
+/// effects (floating, workspace, size) stay as mapped
+pub fn reapply_rules(state: &Rc<State>) {
+    let cfg = state.config.borrow().clone();
+    let apply = |win: &Rc<Window>| {
+        let fx = crate::config::rule_effects(
+            &cfg,
+            &win.app_id(),
+            &win.title(),
+            win.x11_opt().is_some(),
+            win.fullscreen.get(),
+        );
+        win.rule_immediate.set(fx.immediate);
+        win.rule_opacity
+            .set(fx.opacity.map(|o| o.clamp(0.0, 1.0) as f32));
+        win.rule_rounding.set(fx.rounding);
+        win.rule_shadow.set(fx.shadow);
+        win.rule_dim.set(fx.dim);
+        win.rule_blur.set(fx.blur.unwrap_or(false));
+        win.rule_no_capture.set(fx.no_capture);
+    };
+    for ws in state.workspaces.borrow().iter() {
+        ws.for_each(&apply);
+        if let Some(fs) = ws.fullscreen.borrow().as_ref() {
+            apply(fs);
+        }
+    }
+}
+
 pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     let cfg = state.config.borrow().clone();
     let fx = crate::config::rule_effects(
@@ -788,6 +1039,11 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     win.rule_immediate.set(fx.immediate);
     win.rule_opacity
         .set(fx.opacity.map(|o| o.clamp(0.0, 1.0) as f32));
+    win.rule_rounding.set(fx.rounding);
+    win.rule_shadow.set(fx.shadow);
+    win.rule_dim.set(fx.dim);
+    win.rule_blur.set(fx.blur.unwrap_or(false));
+    win.rule_no_capture.set(fx.no_capture);
     // a rule can pin the window to a workspace (already 0-based) without switching to it
     let ws = fx
         .workspace
@@ -814,7 +1070,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
         set_fullscreen(state, win, true);
     }
     if fx.no_anim {
-        win.anims_snap();
+        win.anims_snap(state);
     } else if let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowOpen) {
         let style = match fx.animation.clone().unwrap_or_else(|| cfg.animations.window_open.style.clone()) {
             crate::config::Style::Default => crate::config::Style::Popin { perc: 0.8 },
@@ -931,6 +1187,7 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
             }
         }
     }
+    win.retire_gpu(state);
     if win.floating.get() {
         ws.remove_float(win);
     } else {
@@ -1074,8 +1331,14 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
         }
         crate::config::LayoutMode::Scrolling => {
             let old_view = ws.tiling.strip.view_px();
-            for (win, raw) in ws.tiling.strip.layout(area, &cfg.layout.scrolling) {
-                win.set_rect_animated(state, apply_gaps(raw, area, &cfg));
+            let rects = ws.tiling.strip.layout(area, &cfg.layout.scrolling);
+            // the scroll itself draws as one strip translate; feeding it
+            // into per-window move anims would animate the delta twice.
+            // a view step of +V moves targets by -V, so the scroll share
+            // inside (old.x1 - new.x1) is +V = new_view - old_view
+            let view_dx = ws.tiling.strip.view_px() - old_view;
+            for (win, raw) in rects {
+                win.set_rect_animated_bias(state, apply_gaps(raw, area, &cfg), view_dx);
                 if !win.fullscreen.get() {
                     win.configure_rect();
                 }
@@ -1318,6 +1581,34 @@ mod tests {
         ws.tiling.for_each(|_| n += 1);
         assert_eq!(n, 3);
         assert!(!ws_axis_vertical(&state));
+    }
+
+    #[test]
+    fn workspace_axis_config_forces_vertical_on_dwindle() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        assert!(!ws_axis_vertical(&state));
+        let mut cfg = (**state.config.borrow()).clone();
+        cfg.layout.ws_axis = crate::config::WsAxis::Vertical;
+        *state.config.borrow_mut() = Rc::new(cfg);
+        assert!(ws_axis_vertical(&state), "dwindle honors the configured axis");
+    }
+
+    #[test]
+    fn dim_eases_between_targets() {
+        let (state, client) = crate::client::test_utils::test_client();
+        let base = crate::shell::xdg::tests::mk_base(&client, 70);
+        let (_s, _xdg, tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 71, 72, 73);
+        let win = Rc::new(Window::new(&state, WindowKind::Xdg(tl)));
+        // first paint settles instantly
+        assert_eq!(win.dim_now(&state, 0.0), 0.0);
+        // focus loss eases toward the configured strength
+        win.dim_now(&state, 0.2);
+        let t0 = state.anim_clock.now();
+        state.anim_clock.freeze(t0 + 50_000_000);
+        let mid = win.dim_now(&state, 0.2);
+        assert!(mid > 0.0 && mid < 0.2, "got {mid}");
+        state.anim_clock.freeze(t0 + 10_000_000_000);
+        assert!((win.dim_now(&state, 0.2) - 0.2).abs() < 1e-9);
     }
 
     #[test]

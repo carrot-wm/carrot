@@ -254,7 +254,13 @@ impl WlSurface {
             if let Some(old) = old {
                 let st = &self.client.state;
                 if old.buf.dmabuf().is_some() && st.display.borrow().is_some() {
-                    st.retired.borrow_mut().push(old);
+                    // a buffer on a plane outlives render frames: it holds
+                    // until the flip that replaces it completes
+                    if st.scanout_uids.borrow().contains(&old.buf.uid) {
+                        st.scanout_hold.borrow_mut().push(old);
+                    } else {
+                        st.retired.borrow_mut().push(old);
+                    }
                 }
             }
             match buf {
@@ -319,6 +325,14 @@ impl WlSurface {
         // a newer commit supersedes content that never reached glass
         for fb in self.latched_feedbacks.borrow_mut().drain(..) {
             fb.discarded();
+        }
+        if !pending.presentation_feedbacks.is_empty() {
+            crate::trace!(
+                "fb-latch: surface {} n={} t={}",
+                self.id,
+                pending.presentation_feedbacks.len(),
+                crate::util::Time::now().nsec()
+            );
         }
         self.latched_feedbacks
             .borrow_mut()

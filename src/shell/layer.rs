@@ -127,6 +127,7 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             version: self.version,
             me: me.clone(),
             surface: surface.clone(),
+            namespace: req.namespace.clone(),
             pending: Cell::new(LayerState::new(req.layer)),
             current: Cell::new(LayerState::new(req.layer)),
             created_layer: req.layer,
@@ -142,7 +143,7 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             closed: Cell::new(false),
             popups: RefCell::new(Vec::new()),
             anim: RefCell::new(None),
-            last_batch: RefCell::new((Vec::new(), Vec::new())),
+            last_batch: RefCell::new((Vec::new(), Vec::new(), 0..0)),
         });
         c.add_client_obj(ls.clone())?;
         *surface.ext.borrow_mut() = Rc::new(LayerExt { ls });
@@ -255,6 +256,8 @@ pub struct LayerSurface {
     pub version: u32,
     me: Weak<LayerSurface>,
     pub surface: Rc<WlSurface>,
+    /// the get_layer_surface namespace; rules match against it
+    pub namespace: String,
     pending: Cell<LayerState>,
     pub current: Cell<LayerState>,
     /// the get_layer_surface layer argument; unmap resets back to it
@@ -274,10 +277,11 @@ pub struct LayerSurface {
     popups: RefCell<Vec<Rc<super::xdg::XdgPopup>>>,
     /// the open animation; unmap capture reuses the closing-window path
     pub anim: RefCell<Option<(crate::anim::Anim, crate::config::Style)>>,
-    /// ops + texture keys from the last compose, for the close capture
+    /// ops + texture keys/uids from the last compose, for the close capture
     pub last_batch: RefCell<(
         Vec<crate::render::renderer::RenderOp>,
-        Vec<(crate::client::ClientId, u64)>,
+        Vec<((crate::client::ClientId, u64), u64)>,
+        std::ops::Range<usize>,
     )>,
 }
 
@@ -609,6 +613,14 @@ impl SurfaceExt for LayerExt {
         if ls.closed.get() {
             return;
         }
+        // backdrop content feeds the blur cache; its commits invalidate it
+        if ls.current.get().layer <= BOTTOM {
+            if let Some(d) = state.display.borrow().as_ref() {
+                if let Some(out) = d.outputs.borrow().get(ls.output.get()) {
+                    out.blur_dirty.set(true);
+                }
+            }
+        }
         if !ls.configured.get() {
             // the initial commit is answered with a configure and maps
             // nothing; the buffer gate in commit_requested enforces order
@@ -654,8 +666,19 @@ impl SurfaceExt for LayerExt {
     }
 }
 
+/// a namespace hit on a no-anim layer rule pins maps and unmaps
+fn layer_no_anim(cfg: &crate::config::Config, ns: &str) -> bool {
+    cfg.layer_rules
+        .iter()
+        .any(|r| r.no_anim && r.matches.iter().any(|m| m.matches(ns)))
+}
+
 fn start_layer_open(state: &Rc<State>, ls: &Rc<LayerSurface>) {
     let cfg = state.config.borrow().clone();
+    if layer_no_anim(&cfg, &ls.namespace) {
+        *ls.anim.borrow_mut() = None;
+        return;
+    }
     let Some(motion) = cfg.animations.motion(crate::config::AnimKind::LayerOpen) else {
         *ls.anim.borrow_mut() = None;
         return;
@@ -673,6 +696,9 @@ fn start_layer_open(state: &Rc<State>, ls: &Rc<LayerSurface>) {
 
 fn capture_layer_close(state: &Rc<State>, ls: &Rc<LayerSurface>) {
     let cfg = state.config.borrow().clone();
+    if layer_no_anim(&cfg, &ls.namespace) {
+        return;
+    }
     let Some(motion) = cfg.animations.motion(crate::config::AnimKind::LayerClose) else {
         return;
     };
@@ -693,7 +719,7 @@ fn capture_layer_close(state: &Rc<State>, ls: &Rc<LayerSurface>) {
     let anim =
         crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 1.0, 0.0, 0.0);
     let batch = std::mem::take(&mut *ls.last_batch.borrow_mut());
-    if let Some(cw) = crate::output::seize_batch(&out, batch, ls.rect.get(), anim, style) {
+    if let Some(cw) = crate::output::seize_batch(&out, batch, ls.rect.get(), anim, style, false) {
         crate::output::push_closing_layer(&out, cw);
         state.damage.trigger();
     }

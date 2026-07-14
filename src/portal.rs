@@ -34,7 +34,9 @@ const R_ENDED: u32 = 2;
 struct Session {
     cursor_mode: Cell<u32>,
     types: Cell<u32>,
-    /// requested persistence; we grant at most 1 (compositor lifetime)
+    /// requested persist_mode, granted as asked (clamped to the spec's
+    /// max of 2): tokens carry durable identity, so until-revoked
+    /// persistence holds across compositor restarts
     persist: Cell<u32>,
     /// what presented restore_data decoded to
     restore: RefCell<Option<cast::RestoreData>>,

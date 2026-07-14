@@ -42,7 +42,7 @@ pub(super) fn parse(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
     }
     // named curves must exist by the end of the section
     let known: Vec<String> = a.curves.iter().map(|(n, _)| n.clone()).collect();
-    let mut check = |m: &Option<Motion>, cx: &mut Cx| {
+    let check = |m: &Option<Motion>, cx: &mut Cx| {
         if let Some(Motion::Ease { curve: CurveRef::Named(n), .. }) = m {
             if !known.contains(n) {
                 cx.at(node, &format!("unknown curve \"{n}\""));

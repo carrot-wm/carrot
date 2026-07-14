@@ -1,19 +1,28 @@
+# profile-rustflags ships the static-pie flag inside the crate, so a
+# registry install needs no RUSTFLAGS - the toolchain is nightly either way
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "carrot"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/carrot-wm/carrot"
 
 [dependencies]
 # origin startup + c-gull libc linked in: zero linked C. experimental-relocate
 # self-relocates the static-PIE, so no ld.so while .dynsym survives for
 # --export-dynamic (a dlopened lib's libc imports resolve against us).
-eyra = { version = "0.22", features = ["experimental-relocate"] }
+# the taproot fork of eyra's libc stack, straight from crates.io; flip to
+# path = "../taproot/eyra" while hacking on the fork itself
+eyra = { package = "taproot-eyra", version = "0.22.3", features = ["experimental-relocate"] }
 
 # no default features: no `loaded`/libloading (pulls dl* nothing defines);
 # the entry comes from the icd via dlopen-rs + Entry::from_static_fn
 ash = { version = "0.38", default-features = false }
 # pure-rust dynamic linker: loads the mesa icd + its closure against taproot
 dlopen-rs = "0.8"
+elf_loader = "0.14.0"
 rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "pipe", "time", "process"] }
 kbvm = "0.1.6"
 
@@ -39,15 +48,24 @@ panic = "abort"
 # origin self-relocates the static-PIE before relocations exist; any call left
 # un-inlined in that window goes through a still-zero GOT slot and _start
 # faults on entry. o3 flattens the window like the release build.
-[profile.dev.package.origin]
+[profile.dev.package.taproot-origin]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
 
 [profile.release]
 panic = "abort"
+rustflags = ["-C", "target-feature=+crt-static"]
 
-# eyra's libc routed to taproot - the same libc the dlopened mesa closure gets
+# host units (build scripts, proc macros) stay dynamic
+[profile.release.build-override]
+rustflags = []
+
+# vendored with one fix: the tlsdesc dynamic resolver called its rust
+# half on a misaligned stack (entry rsp is 8 mod 16, and its saves kept
+# it there), faulting release builds of any dlopened closure with
+# dynamic tls - libLLVM in radv's. drop the vendor once upstream ships
+# the alignment fix.
 [patch.crates-io]
-c-scape = { path = "../taproot/c-scape" }
-c-gull = { path = "../taproot/c-gull" }
+elf_loader = { path = "vendor/elf_loader" }
+dlopen-rs = { path = "vendor/dlopen-rs" }

@@ -2,3 +2,4 @@
 .direnv/
 tools/gen-keymap/target/
 tools/gen-xwire/target/
+tools/gen-shaders/target/

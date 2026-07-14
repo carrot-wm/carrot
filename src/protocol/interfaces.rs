@@ -488,6 +488,23 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface xdg_activation_v1, version = 1;
+    request destroy();
+    request get_activation_token(id: new_id);
+    request activate(token: string, surface: object);
+}
+
+crate::wl_protocol! {
+    interface xdg_activation_token_v1, version = 1;
+    request set_serial(serial: uint, seat: object);
+    request set_app_id(app_id: string);
+    request set_surface(surface: object);
+    request commit();
+    request destroy();
+    event done(token: string);
+}
+
+crate::wl_protocol! {
     interface wp_tearing_control_manager_v1, version = 1;
     request destroy();
     request get_tearing_control(id: new_id, surface: object);
@@ -856,6 +873,11 @@ mod tests {
         assert_eq!(zwp_confined_pointer_v1::set_region::OPCODE, 1);
         assert_eq!(zwp_confined_pointer_v1::confined::OPCODE, 0);
         assert_eq!(zwp_confined_pointer_v1::unconfined::OPCODE, 1);
+        assert_eq!(xdg_activation_v1::get_activation_token::OPCODE, 1);
+        assert_eq!(xdg_activation_v1::activate::OPCODE, 2);
+        assert_eq!(xdg_activation_token_v1::commit::OPCODE, 3);
+        assert_eq!(xdg_activation_token_v1::destroy::OPCODE, 4);
+        assert_eq!(xdg_activation_token_v1::done::OPCODE, 0);
         assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
         assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
         assert_eq!(wp_tearing_control_v1::destroy::OPCODE, 1);

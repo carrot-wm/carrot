@@ -57,6 +57,8 @@ pub struct SeatGlobal {
     remap_held: RefCell<HashMap<u32, u32>>,
     /// a matched release-kind bind waits here; any other press disarms
     armed_release: RefCell<Option<(u32, crate::config::Action)>>,
+    /// the key that started a pointer grab; its release ends the grab
+    grab_key: Cell<Option<u32>>,
     /// last fire per chord, for cooldown-ms binds
     bind_cooldowns: RefCell<std::collections::HashMap<(u32, u32), u64>>,
     // clipboard state rides on the seat: devices, sources, selection
@@ -127,6 +129,7 @@ impl SeatGlobal {
             last_press_serial: Cell::new(0),
             remap_held: RefCell::new(HashMap::new()),
             armed_release: RefCell::new(None),
+            grab_key: Cell::new(None),
             bind_cooldowns: RefCell::new(std::collections::HashMap::new()),
             data: Default::default(),
             primary: Default::default(),
@@ -144,9 +147,11 @@ impl SeatGlobal {
 
     /// a session lock takes the seat: grabs and armed binds must not
     /// survive into the locked state
-    pub fn prepare_for_lock(&self) {
+    pub fn prepare_for_lock(&self, state: &State) {
         *self.grab.borrow_mut() = None;
+        state.grab_active.set(false);
         *self.armed_release.borrow_mut() = None;
+        self.grab_key.set(None);
         self.cancel_repeat();
     }
 
@@ -642,6 +647,10 @@ impl SeatGlobal {
         }
     }
 
+    pub fn lock_active(&self) -> bool {
+        self.active_lock().is_some()
+    }
+
     fn active_lock(&self) -> Option<Rc<Constraint>> {
         self.constraints
             .borrow()
@@ -990,6 +999,13 @@ impl SeatGlobal {
                     if !self.cooldown_clear(b) {
                         continue;
                     }
+                    // a grab lives while its key is held
+                    if matches!(
+                        b.action,
+                        crate::config::Action::PointerMove | crate::config::Action::PointerResize
+                    ) {
+                        self.grab_key.set(Some(key));
+                    }
                     if b.repeat {
                         // re-fires from the repeat loop while held
                         self.arm_repeat(key);
@@ -1001,6 +1017,17 @@ impl SeatGlobal {
             }
             *self.armed_release.borrow_mut() = armed;
         } else {
+            // the grab's key came back up: the move/resize session ends;
+            // the seat rc lives in state, the &self path can't call end_grab
+            if self.grab_key.get() == Some(key) {
+                self.grab_key.set(None);
+                if self.grab.borrow().is_some() {
+                    if let Some(seat) = state.seat.borrow().clone() {
+                        seat.end_grab(state);
+                    }
+                }
+                return KeyAction::Handled;
+            }
             // the armed key came back up: fire, once
             let hit = {
                 let mut slot = self.armed_release.borrow_mut();
@@ -1156,11 +1183,16 @@ impl SeatGlobal {
     /// the scene changed under a stationary cursor (map/unmap/arrange):
     /// re-resolve pointer focus without waiting for the next motion
     pub fn repick(self: &Rc<Self>, state: &Rc<State>) {
-        // an implicit grab pins focus; dnd re-targets on its own motion
-        if !self.ptr_buttons.borrow().is_empty()
-            || self.data.drag().is_some()
-            || self.active_lock().is_some()
-        {
+        // an implicit grab pins focus; dnd re-targets on its own motion.
+        // a lock pins too - but only while its window is still on the
+        // visible scene, else a workspace switch leaves relative motion
+        // flowing to a window nobody can see
+        let lock_pins = self.active_lock().is_some_and(|con| {
+            let root = con.surface.get_root();
+            crate::tree::window_for_surface_any(state, &root).is_none()
+                || crate::tree::window_for_surface(state, &root).is_some()
+        });
+        if !self.ptr_buttons.borrow().is_empty() || self.data.drag().is_some() || lock_pins {
             return;
         }
         self.pick_focus(state, self.ptr_x.get(), self.ptr_y.get());
@@ -1441,23 +1473,25 @@ impl SeatGlobal {
             .is_some_and(|f| Rc::ptr_eq(&f.get_root(), &origin.get_root()))
     }
 
-    pub fn start_move_grab(&self, win: Rc<crate::tree::Window>) {
-        // tiled windows have no free position; moving them wants a tree
-        // swap that does not exist yet
-        if !win.floating.get() || win.fullscreen.get() {
-            return;
-        }
-        let start = (self.ptr_x.get(), self.ptr_y.get());
-        let rect = win.rect.get();
-        *self.grab.borrow_mut() = Some(PointerGrab::Move { win, start, rect });
-    }
-
-    pub fn start_resize_grab(&self, win: Rc<crate::tree::Window>, edges: u32) {
+    pub fn start_move_grab(&self, state: &Rc<State>, win: Rc<crate::tree::Window>) {
+        // floating windows follow the pointer; tiled ones trade places
+        // with whatever it crosses
         if win.fullscreen.get() {
             return;
         }
         let start = (self.ptr_x.get(), self.ptr_y.get());
         let rect = win.rect.get();
+        state.grab_active.set(true);
+        *self.grab.borrow_mut() = Some(PointerGrab::Move { win, start, rect });
+    }
+
+    pub fn start_resize_grab(&self, state: &Rc<State>, win: Rc<crate::tree::Window>, edges: u32) {
+        if win.fullscreen.get() {
+            return;
+        }
+        let start = (self.ptr_x.get(), self.ptr_y.get());
+        let rect = win.rect.get();
+        state.grab_active.set(true);
         *self.grab.borrow_mut() = Some(PointerGrab::Resize {
             win,
             edges,
@@ -1471,19 +1505,26 @@ impl SeatGlobal {
         enum Op {
             SetRect(Rc<crate::tree::Window>, crate::rect::Rect),
             Ratio(Rc<crate::tree::Window>, u32, f64, f64),
+            /// dragging a tiled window: trade places with whatever the
+            /// pointer crosses; the move animations carry the exchange
+            Swap(Rc<crate::tree::Window>),
         }
         let op = {
             let mut slot = self.grab.borrow_mut();
             match slot.as_mut() {
                 Some(PointerGrab::Move { win, start, rect }) => {
-                    let (sw, sh) = crate::tree::output_extent(state);
-                    let nx = ((rect.x1 as f64 + x - start.0) as i32)
-                        .min(sw - rect.width())
-                        .max(0);
-                    let ny = ((rect.y1 as f64 + y - start.1) as i32)
-                        .min(sh - rect.height())
-                        .max(0);
-                    Op::SetRect(win.clone(), rect.move_(nx - rect.x1, ny - rect.y1))
+                    if win.floating.get() {
+                        let (sw, sh) = crate::tree::output_extent(state);
+                        let nx = ((rect.x1 as f64 + x - start.0) as i32)
+                            .min(sw - rect.width())
+                            .max(0);
+                        let ny = ((rect.y1 as f64 + y - start.1) as i32)
+                            .min(sh - rect.height())
+                            .max(0);
+                        Op::SetRect(win.clone(), rect.move_(nx - rect.x1, ny - rect.y1))
+                    } else {
+                        Op::Swap(win.clone())
+                    }
                 }
                 Some(PointerGrab::Resize { win, edges, start, rect, last }) => {
                     if win.floating.get() {
@@ -1499,11 +1540,12 @@ impl SeatGlobal {
             }
         };
         let win = match &op {
-            Op::SetRect(w, _) | Op::Ratio(w, ..) => w.clone(),
+            Op::SetRect(w, _) | Op::Ratio(w, ..) | Op::Swap(w) => w.clone(),
         };
         // the window left the tree mid-grab (unmap, workspace move)
         let Some(ws) = crate::tree::workspace_of(state, &win) else {
             self.grab.borrow_mut().take();
+            state.grab_active.set(false);
             return;
         };
         match op {
@@ -1525,16 +1567,48 @@ impl SeatGlobal {
                     return;
                 }
             }
+            Op::Swap(_) => {
+                let Some((other, ..)) = crate::tree::window_at(state, x as i32, y as i32) else {
+                    return;
+                };
+                if Rc::ptr_eq(&other, &win) || other.floating.get() || other.fullscreen.get() {
+                    return;
+                }
+                let ows = crate::tree::workspace_of(state, &other)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                let swapped = if Rc::ptr_eq(&ws, &ows) {
+                    match ws.tiling.mode() {
+                        crate::config::LayoutMode::Dwindle => {
+                            crate::tree::dwindle::swap_windows(&win, &other)
+                        }
+                        crate::config::LayoutMode::Scrolling => {
+                            ws.tiling.strip.swap_tiles(&win, &other)
+                        }
+                    }
+                } else if ws.tiling.mode() == crate::config::LayoutMode::Dwindle
+                    && ows.tiling.mode() == crate::config::LayoutMode::Dwindle
+                {
+                    // across outputs: leaves trade occupants tree-to-tree
+                    crate::tree::dwindle::swap_windows(&win, &other)
+                } else {
+                    false
+                };
+                if !swapped {
+                    return;
+                }
+                ws.tiling.note_focus_win(&win);
+                if !Rc::ptr_eq(&ws, &ows) {
+                    crate::tree::relayout(state, &ows);
+                }
+            }
         }
         crate::tree::relayout(state, &ws);
-        // a live drag relayouts per motion event; chasing that target would
-        // rubber-band the whole workspace behind the pointer
-        ws.tiling.for_each(|w| w.move_snap());
         state.damage.trigger();
     }
 
     fn end_grab(self: &Rc<Self>, state: &Rc<State>) {
         self.grab.borrow_mut().take();
+        state.grab_active.set(false);
         // the pointer re-enters whatever it is over
         let usec = crate::util::Time::now().nsec() / 1_000;
         self.pointer_motion(state, usec, 0.0, 0.0, 0.0, 0.0);
@@ -1716,6 +1790,103 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_pins_directional_and_cycle_focus() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        let (sb, xb, _tb) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 11, 12, 13);
+        crate::shell::xdg::tests::map(&state, &client, &sb, &xb, 21);
+        for i in 0..2u32 {
+            let (s, x, _t) = crate::shell::xdg::tests::mk_toplevel(
+                &client,
+                &base,
+                14 + i * 3,
+                15 + i * 3,
+                16 + i * 3,
+            );
+            crate::shell::xdg::tests::map(&state, &client, &s, &x, 22 + i);
+        }
+        // the scrolling strip keeps laying out off-view columns; with the
+        // view scrolled to the strip's tail the head column sits fully
+        // past the left edge - not a focus candidate while a fullscreen
+        // surface buries everything
+        let ws = crate::tree::active(&state);
+        crate::tree::set_layout(&state, &ws, crate::config::LayoutMode::Scrolling);
+        let win = crate::tree::window_for_surface(&state, &sa).unwrap();
+        crate::tree::focus_window(&state, Some(&win));
+        while ws.tiling.strip.move_column(&win, false) {}
+        crate::tree::relayout(&state, &ws);
+        crate::tree::set_fullscreen(&state, &win, true);
+        crate::tree::focus_dir(&state, crate::config::Dir::Left);
+        let cur = crate::tree::focused_window(&state).unwrap();
+        assert!(Rc::ptr_eq(&cur, &win), "directional focus stays put");
+        crate::tree::focus_cycle(&state, 1);
+        let cur = crate::tree::focused_window(&state).unwrap();
+        assert!(Rc::ptr_eq(&cur, &win), "cycle focus stays put");
+        // focus stranded on a buried window is a softlock: any focus verb
+        // snaps back to the one visible window instead of wandering
+        let buried = crate::tree::window_for_surface(&state, &sb).unwrap();
+        crate::tree::focus_window(&state, Some(&buried));
+        crate::tree::focus_dir(&state, crate::config::Dir::Left);
+        let cur = crate::tree::focused_window(&state).unwrap();
+        assert!(Rc::ptr_eq(&cur, &win), "stranded focus snaps to the fullscreen window");
+    }
+
+    #[test]
+    fn focus_moves_never_warp_a_locked_pointer() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        let (sb, xb, _tb) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 11, 41, 51);
+        crate::shell::xdg::tests::map(&state, &client, &sb, &xb, 21);
+        seat.warp(&state, 600.0, 300.0);
+        assert!(seat.pointer_focus().is_some_and(|f| Rc::ptr_eq(&f, &sa)));
+        lock(&client, sa.id, 71, 2).unwrap();
+        let con = seat.constraint_for(&sa).unwrap();
+        assert!(con.active.get());
+        // keyboard focus may move on; the locked cursor must not budge
+        crate::tree::focus_cycle(&state, 1);
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (600.0, 300.0), "pointer frozen");
+        assert!(con.active.get(), "the lock survives a keyboard-only focus move");
+    }
+
+    #[test]
+    fn a_workspace_switch_breaks_a_hidden_lock() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        seat.warp(&state, 400.0, 300.0);
+        assert!(seat.pointer_focus().is_some_and(|f| Rc::ptr_eq(&f, &sa)));
+        lock(&client, sa.id, 71, 2).unwrap();
+        let con = seat.constraint_for(&sa).unwrap();
+        assert!(con.active.get(), "locked while visible");
+        // the game's workspace goes hidden: the lock must break, pointer
+        // focus must leave, and deltas stop flowing to the crosshair
+        crate::tree::switch_workspace(&state, 1);
+        assert!(!con.active.get(), "hidden window cannot hold the lock");
+        assert!(
+            seat.pointer_focus().is_none_or(|f| !Rc::ptr_eq(&f, &sa)),
+            "pointer focus left the hidden surface"
+        );
+        assert!(crate::tree::focused_window(&state).is_none(), "empty workspace, no focus");
+        // coming back re-arms the persistent constraint
+        crate::tree::switch_workspace(&state, 0);
+        assert!(con.active.get(), "persistent lock re-locks on return");
+    }
+
+    #[test]
     fn a_lock_freezes_the_pointer_and_deltas_keep_flowing() {
         let (state, client, seat, s) = setup();
         let rp = Rc::new(crate::protocol::relative_pointer::RelativePointer {
@@ -1734,7 +1905,7 @@ mod tests {
 
     #[test]
     fn unlock_lands_on_the_position_hint() {
-        let (state, client, seat, s) = setup();
+        let (_state, client, seat, s) = setup();
         lock(&client, s.id, 71, 1).unwrap();
         let con = seat.constraint_for(&s).unwrap();
         let lp = LockedPointer { id: ObjectId(71), con };
@@ -1781,6 +1952,33 @@ mod tests {
         lock(&client, s.id, 73, 2).unwrap();
         assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 1);
         let _ = seat;
+    }
+
+    #[test]
+    fn a_pointer_grab_key_consumes_its_release() {
+        use crate::config::{Action, Bind};
+        let (state, _client, seat, _s) = setup();
+        let mut cfg = crate::config::empty();
+        cfg.binds.push(Bind {
+            mods: 0,
+            key: 45,
+            action: Action::PointerMove,
+            on_release: false,
+            repeat: false,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
+        });
+        *state.config.borrow_mut() = Rc::new(cfg);
+        // the press fires the bind and remembers the key
+        assert!(matches!(
+            seat.key(&state, 1_000, 45, true),
+            KeyAction::Act(Action::PointerMove)
+        ));
+        assert_eq!(seat.grab_key.get(), Some(45));
+        // the release ends the session instead of reaching the client
+        assert!(matches!(seat.key(&state, 2_000, 45, false), KeyAction::Handled));
+        assert_eq!(seat.grab_key.get(), None);
     }
 
     #[test]
