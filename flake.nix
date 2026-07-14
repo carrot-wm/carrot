@@ -658,7 +658,7 @@
             config = mkIf cfg.enable {
               home.packages = [ cfg.package ];
 
-              xdg.configFile."carrot/config.lua" = mkIf (cfg.settings != null) {
+              xdg.configFile."carrot/carrot.lua" = mkIf (cfg.settings != null) {
                 text = let
                   finalSettings = {
                     carrot = cfg.settings; 
