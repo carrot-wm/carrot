@@ -19,23 +19,25 @@ type IcdGipa = unsafe extern "system" fn(vk::Instance, *const c_char) -> vk::PFN
 
 // -- taproot preload --
 
-/// locate one of taproot's libs: explicit env override, else next to the
-/// binary (the flake stages them there)
+/// locate one of taproot's libs: explicit env override, next to the
+/// binary (the flake stages them there), or ../lib/carrot relative to it
+/// (where `carrot install` stages them)
 fn taproot_lib(name: &str, env: &str) -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os(env) {
         return Ok(p.into());
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join(name);
-            if p.exists() {
-                return Ok(p);
+            for p in [dir.join(name), dir.join("../lib/carrot").join(name)] {
+                if p.exists() {
+                    return Ok(p);
+                }
             }
         }
     }
     Err(format!(
-        "{name} not found next to the binary (set {env} to a copy of libtaproot.so \
-         named {name}; dlopen matches by filename)"
+        "{name} not found next to the binary or in ../lib/carrot (set {env} \
+         to a copy of libtaproot.so named {name}; dlopen matches by filename)"
     ))
 }
 

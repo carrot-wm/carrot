@@ -50,15 +50,36 @@ pub fn run(args: &[String]) -> i32 {
 
     let res = (|| -> Result<(), String> {
         put_bin(Path::new("/proc/self/exe"), &stage(&bin))?;
-        // the ipc client builds alongside; a missing one is not fatal
-        match std::fs::read_link("/proc/self/exe")
+        let exe_dir = std::fs::read_link("/proc/self/exe")
             .ok()
-            .and_then(|p| p.parent().map(|d| d.join("burrow")))
-        {
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        // the ipc client builds alongside; a missing one is not fatal
+        match exe_dir.as_ref().map(|d| d.join("burrow")) {
             Some(src) if src.exists() => {
                 put_bin(&src, &stage(&prefix.join("bin/burrow")))?;
             }
             _ => eprintln!("carrot: install: no burrow next to the binary, skipped"),
+        }
+        // the gpu driver's libc: without libc.so.6/libm.so.6 the session
+        // dies at icd preload. staged where the loader looks (../lib/carrot
+        // from the binary); copies of taproot's libc.so.6
+        let mut libs = 0;
+        for name in ["libc.so.6", "libm.so.6"] {
+            match exe_dir.as_ref().map(|d| d.join(name)) {
+                Some(src) if src.exists() => {
+                    put_bin(&src, &stage(&prefix.join("lib/carrot").join(name)))?;
+                    libs += 1;
+                }
+                _ => {}
+            }
+        }
+        if libs < 2 {
+            eprintln!(
+                "carrot: install: libc.so.6/libm.so.6 not found next to the \
+                 binary - the session will fail at gpu preload. build the \
+                 taproot cdylib and place copies next to the carrot binary, \
+                 then rerun install (see README: Building)"
+            );
         }
         put(
             &stage(&share.join("wayland-sessions/carrot.desktop")),
