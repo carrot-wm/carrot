@@ -69,3 +69,7 @@ rustflags = []
 [patch.crates-io]
 elf_loader = { path = "vendor/elf_loader" }
 dlopen-rs = { path = "vendor/dlopen-rs" }
+# the taproot origin fork: thread metadata carries an instance tag, so a
+# dtor registered on a thread the other in-process runtime created is
+# leaked instead of pushed through a mismatched struct layout
+origin = { path = "../taproot/origin" }
