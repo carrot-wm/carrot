@@ -69,7 +69,7 @@
                     };
                   };
 
-              cfg_anim_kind = lib.types.submodule {
+              cfg_anim_kind = lib.types.submodule ({ config, ... }:{
                 options = {
                   off = lib.mkOption {
                     type = lib.types.bool;
@@ -96,7 +96,10 @@
                     };
                   };
                 };
-              };
+                config = lib.mkIf (config.spring != null && config.ease != null) {
+                  warnings = [ "You cant have both 'spring' and 'ease'" ];
+                };
+              });
           in
           {
             options.carrot = {
