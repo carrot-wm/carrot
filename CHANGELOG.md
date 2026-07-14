@@ -85,3 +85,4 @@
 - Guided Default Config (Per-Section Walkthrough, Decoration & No-CSD On, Screenshot/Media/Brightness Binds, Vim Keys, include Examples)
 - Numbered Crash Reports (Panic + Backtrace + stderr Tail in ~/.cache/carrot/carrotCrashLogN.log, Nothing Overwritten; the /tmp Log Retired)
 - Pinned Nightly Toolchain (rust-toolchain.toml Matches the Flake and taproot)
+- AMD/radv Sessions (taproot Recursive-Mutex ABI Fix Unwedges libLLVM Init; Stub Sonames Keep glibc Out of Driver Closures)

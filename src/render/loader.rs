@@ -19,12 +19,18 @@ type IcdGipa = unsafe extern "system" fn(vk::Instance, *const c_char) -> vk::PFN
 
 // -- taproot preload --
 
-/// locate one of taproot's libs: explicit env override, next to the
-/// binary (the flake stages them there), or ../lib/carrot relative to it
-/// (where `carrot install` stages them)
+/// locate one of taproot's libs: explicit env override, a staging dir
+/// override, next to the binary (the flake stages them there), or
+/// ../lib/carrot relative to it (where `carrot install` stages them)
 fn taproot_lib(name: &str, env: &str) -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os(env) {
         return Ok(p.into());
+    }
+    if let Some(dir) = std::env::var_os("CARROT_TAPROOT_DIR") {
+        let p = PathBuf::from(dir).join(name);
+        if p.exists() {
+            return Ok(p);
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -41,9 +47,20 @@ fn taproot_lib(name: &str, env: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// preload libc.so.6 + libm.so.6 GLOBAL by absolute path, once. every NEEDED
-/// libc.so.6/libm.so.6 in the icd's closure then reuses these by filename
-/// instead of searching RUNPATH and finding glibc. the handles are leaked on
+/// the legacy sonames an icd closure may name; each staged file is an
+/// empty taproot stub whose symbols all live in the preloaded libc.so.6.
+/// without these, RUNPATH hands the closure real glibc pieces, and mixed
+/// lock implementations deadlock the driver's initializers
+const STUB_SONAMES: [&str; 4] = [
+    "libpthread.so.0",
+    "libdl.so.2",
+    "librt.so.1",
+    "ld-linux-x86-64.so.2",
+];
+
+/// preload the taproot family GLOBAL by absolute path, once. every NEEDED
+/// entry in the icd's closure then reuses these by filename instead of
+/// searching RUNPATH and finding glibc. the handles are leaked on
 /// purpose: a libc must never unmap.
 fn preload() -> Result<(), String> {
     static DONE: OnceLock<Result<(), String>> = OnceLock::new();
@@ -52,6 +69,16 @@ fn preload() -> Result<(), String> {
         let libm_path = taproot_lib("libm.so.6", "CARROT_LIBM")?;
         for p in [&libc_path, &libm_path] {
             let lib = ElfLibrary::dlopen(p, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
+                .map_err(|e| format!("preload {}: {e}", p.display()))?;
+            std::mem::forget(lib);
+        }
+        for name in STUB_SONAMES {
+            let Ok(p) = taproot_lib(name, "CARROT_STUB_UNSET") else {
+                // an older staging: glibc may leak into heavy closures
+                eprintln!("carrot: vulkan: {name} stub not staged; run carrot install");
+                continue;
+            };
+            let lib = ElfLibrary::dlopen(&p, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
                 .map_err(|e| format!("preload {}: {e}", p.display()))?;
             std::mem::forget(lib);
         }
@@ -159,9 +186,12 @@ fn entry_for_icd(path: &Path) -> Result<ash::Entry, String> {
     }
 
     // RTLD_NOW forces every relocation immediately: a libc symbol taproot
-    // can't satisfy fails here, loudly, naming itself
+    // can't satisfy fails here, loudly, naming itself. the bracket logs
+    // turn a wedged driver initializer into a pointed report
+    eprintln!("carrot: vulkan: loading the driver closure");
     let lib = ElfLibrary::dlopen(path, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
         .map_err(|e| format!("dlopen {}: {e}", path.display()))?;
+    eprintln!("carrot: vulkan: driver closure loaded");
 
     // the khronos loader negotiates the icd interface version before anything
     // else; we stand in for it, and without this the icd won't enumerate
@@ -206,4 +236,31 @@ pub fn entry_for(card: BorrowedFd<'_>) -> Result<ash::Entry, RenderError> {
         })?;
     eprintln!("carrot: vulkan: {} for {driver}", icd.display());
     entry_for_icd(icd).map_err(RenderError::Load)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// gpu-free by construction: an icd only opens the device node at
+    /// vkCreateInstance, so loading its closure is pure elf work. run by
+    /// hand when a driver's dlopen wedges:
+    ///   CARROT_LIBC=... CARROT_LIBM=... cargo test dlopen_the_cards_icd -- --ignored --nocapture
+    #[test]
+    #[ignore = "wants the system's icd and taproot lib paths"]
+    fn dlopen_the_cards_icd() {
+        preload().unwrap();
+        let all = all_icd_libraries();
+        let icd = all
+            .iter()
+            .find(|p| {
+                let f = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                std::env::var("CARROT_ICD_MATCH").map(|m| f.contains(&m)).unwrap_or(true)
+            })
+            .expect("an icd manifest resolves");
+        eprintln!("dlopen {}", icd.display());
+        let lib = ElfLibrary::dlopen(icd, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL).unwrap();
+        eprintln!("dlopen done");
+        std::mem::forget(lib);
+    }
 }

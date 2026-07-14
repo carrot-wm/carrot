@@ -62,9 +62,17 @@ pub fn run(args: &[String]) -> i32 {
         }
         // the gpu driver's libc: without libc.so.6/libm.so.6 the session
         // dies at icd preload. staged where the loader looks (../lib/carrot
-        // from the binary); copies of taproot's libc.so.6
+        // from the binary); copies of taproot's libc.so.6. the stub names
+        // keep a driver closure from reaching RUNPATH for real glibc
         let mut libs = 0;
-        for name in ["libc.so.6", "libm.so.6"] {
+        for name in [
+            "libc.so.6",
+            "libm.so.6",
+            "libpthread.so.0",
+            "libdl.so.2",
+            "librt.so.1",
+            "ld-linux-x86-64.so.2",
+        ] {
             match exe_dir.as_ref().map(|d| d.join(name)) {
                 Some(src) if src.exists() => {
                     put_bin(&src, &stage(&prefix.join("lib/carrot").join(name)))?;
