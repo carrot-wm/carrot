@@ -660,16 +660,13 @@
 
               xdg.configFile."carrot/carrot.lua" = mkIf (cfg.settings != null) {
                 text = let
-                  finalSettings = {
-                    carrot = cfg.settings; 
-                  };
-                  luaConfig = lib.generators.toLua { } finalSettings;
+                  luaConfig = lib.generators.toLua { } cfg.settings;
                 in
                   ''
                     -- This file was automatically generated using Home Manager
                     -- Changes to this file are not permanent and are wiped on an another rebuild
 
-                    ${luaConfig}
+                    carrot = ${luaConfig}
                   '';
               };
             };
