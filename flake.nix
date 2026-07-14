@@ -34,6 +34,33 @@
         "aarch64-linux"
       ];
 
+      flake.nixosModules.default =
+        { config, lib, pkgs, ... }:
+        let
+          cfg = config.programs.carrot;
+          package = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot;
+        in
+        {
+          options.programs.carrot.enable = lib.mkEnableOption "the carrot compositor";
+          config = lib.mkIf cfg.enable {
+            # xdg-utils rides along: xdg-open is what apps exec for links
+            # and file managers, and nothing else guarantees it on PATH
+            environment.systemPackages = [ package pkgs.xdg-utils ];
+            # the package carries the session entry; this lists it at the DM
+            services.displayManager.sessionPackages = [ package ];
+            # carrot is its own screencast backend; the package ships the
+            # portal registration and the preference file
+            xdg.portal = {
+              enable = true;
+              extraPortals = [ package ];
+              configPackages = [ package ];
+            };
+            # clients draw text through fontconfig; a bare system renders
+            # tofu for emoji and symbols without the default set
+            fonts.enableDefaultPackages = lib.mkDefault true;
+          };
+        };
+
       perSystem =
         {
           pkgs,
@@ -118,6 +145,8 @@
               org.freedesktop.impl.portal.ScreenCast=carrot
               EOF
             '';
+
+            passthru.providedSessions = [ "carrot" ];
 
             meta = {
               description = "A pure Rust tiling Wayland compositor with zero linked C, all the way down to the kernel";
