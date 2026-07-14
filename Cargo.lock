@@ -77,49 +77,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "c-gull"
-version = "0.22.3"
-source = "git+https://github.com/carrot-wm/taproot?rev=723e387d072a19df11c9d0c58ae26e6b5ebf963c#723e387d072a19df11c9d0c58ae26e6b5ebf963c"
-dependencies = [
- "c-scape",
- "errno",
- "libc",
- "rustix",
- "tz-rs",
-]
-
-[[package]]
-name = "c-scape"
-version = "0.22.3"
-source = "git+https://github.com/carrot-wm/taproot?rev=723e387d072a19df11c9d0c58ae26e6b5ebf963c#723e387d072a19df11c9d0c58ae26e6b5ebf963c"
-dependencies = [
- "bitflags 2.13.0",
- "errno",
- "libc",
- "libm",
- "memoffset",
- "num-complex",
- "origin",
- "posix-regex",
- "printf-compat",
- "rand 0.9.4",
- "rand_core 0.9.5",
- "rand_pcg",
- "realpath-ext",
- "rustix",
- "rustix-dlmalloc",
- "rustix-futex-sync",
- "rustix-openpty",
- "unwinding",
-]
-
-[[package]]
 name = "carrot"
 version = "0.1.0"
 dependencies = [
  "ash",
  "dlopen-rs",
- "eyra",
  "kbvm",
  "kdl",
  "piccolo",
@@ -128,6 +90,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "taproot-eyra",
 ]
 
 [[package]]
@@ -279,15 +242,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "eyra"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d078978c2928c2fe452abedd1f1d73c42e8eb2006ca803d997b3ce31c81ba97"
-dependencies = [
- "c-gull",
 ]
 
 [[package]]
@@ -929,6 +883,54 @@ checksum = "81c645a4de0d803ced6ef0388a2646aa1ef8467173b5d59a2c33c88de4ab76e7"
 dependencies = [
  "serde",
  "serde_repr",
+]
+
+[[package]]
+name = "taproot-c-gull"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "081e9d3440e663d92965ea25b946f4bb9332260ad00c9e94a2aefe7c7f620ad5"
+dependencies = [
+ "errno",
+ "libc",
+ "rustix",
+ "taproot-c-scape",
+ "tz-rs",
+]
+
+[[package]]
+name = "taproot-c-scape"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65f987b80c9d72a3d9eef7ee48aa81b4b48d40970679ca42ab9fb4da775eebc7"
+dependencies = [
+ "bitflags 2.13.0",
+ "errno",
+ "libc",
+ "libm",
+ "memoffset",
+ "num-complex",
+ "origin",
+ "posix-regex",
+ "printf-compat",
+ "rand 0.9.4",
+ "rand_core 0.9.5",
+ "rand_pcg",
+ "realpath-ext",
+ "rustix",
+ "rustix-dlmalloc",
+ "rustix-futex-sync",
+ "rustix-openpty",
+ "unwinding",
+]
+
+[[package]]
+name = "taproot-eyra"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65a831d6cb392cbfe7d63c6bb8b74271e657ea57f23238db70aa56ff361ec777"
+dependencies = [
+ "taproot-c-gull",
 ]
 
 [[package]]

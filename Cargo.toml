@@ -9,7 +9,9 @@ repository = "https://github.com/carrot-wm/carrot"
 # origin startup + c-gull libc linked in: zero linked C. experimental-relocate
 # self-relocates the static-PIE, so no ld.so while .dynsym survives for
 # --export-dynamic (a dlopened lib's libc imports resolve against us).
-eyra = { version = "0.22", features = ["experimental-relocate"] }
+# the taproot fork of eyra's libc stack, straight from crates.io; flip to
+# path = "../taproot/eyra" while hacking on the fork itself
+eyra = { package = "taproot-eyra", version = "0.22.3", features = ["experimental-relocate"] }
 
 # no default features: no `loaded`/libloading (pulls dl* nothing defines);
 # the entry comes from the icd via dlopen-rs + Entry::from_static_fn
@@ -48,10 +50,3 @@ overflow-checks = false
 
 [profile.release]
 panic = "abort"
-
-# eyra's libc routed to taproot - the same libc the dlopened mesa closure
-# gets. pinned by rev so every build links the exact libc that was tested;
-# flip these to path = "../taproot/..." while hacking on the fork itself
-[patch.crates-io]
-c-scape = { git = "https://github.com/carrot-wm/taproot", rev = "723e387d072a19df11c9d0c58ae26e6b5ebf963c" }
-c-gull = { git = "https://github.com/carrot-wm/taproot", rev = "723e387d072a19df11c9d0c58ae26e6b5ebf963c" }
