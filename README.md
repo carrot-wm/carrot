@@ -128,7 +128,7 @@ binds {
 
 ```nix
 # flake.nix inputs
-inputs.carrot.url = "github:flammablebunny/carrot";
+inputs.carrot.url = "github:carrot-wm/carrot";
 
 # NixOS module
 programs.carrot.enable = true;
@@ -160,7 +160,7 @@ plain clone builds out of the box and links the exact libc revision carrot
 was tested against:
 
 ```sh
-git clone https://github.com/flammablebunny/carrot
+git clone https://github.com/carrot-wm/carrot
 cd carrot
 nix develop   # pins the toolchain; or use rustup with the pinned toolchain
 cargo build --release
