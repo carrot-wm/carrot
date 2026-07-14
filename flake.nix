@@ -513,6 +513,24 @@
                 };
               };
             };
+            config = mkIf cfg.enable {
+              home.packages = [ cfg.package ];
+
+              xdg.configFile."carrot/config.lua" = mkIf (cfg.settings != {}) {
+                text = let
+                  finalSettings = {
+                    carrot = cfg.settings; 
+                  };
+                  luaConfig = lib.generators.toLua { } finalSettings;
+                in
+                  ''
+                    -- This file was automatically generated using Home Manager
+                    -- Changes to this file are not permanent and are wiped on an another rebuild
+
+                    ${luaConfig}
+                  '';
+              };
+            };
           };
       };
 
