@@ -48,7 +48,7 @@ panic = "abort"
 # origin self-relocates the static-PIE before relocations exist; any call left
 # un-inlined in that window goes through a still-zero GOT slot and _start
 # faults on entry. o3 flattens the window like the release build.
-[profile.dev.package.origin]
+[profile.dev.package.taproot-origin]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
