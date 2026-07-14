@@ -112,8 +112,147 @@ fn card_stages(r: &mut Report, path: &std::path::Path) {
     }
 }
 
+// -- crash reporting --
+// a segfault inside the driver says nothing by itself; this handler gets
+// the fault address, the ip, and the maps snapshot into the report before
+// the default action takes the core dump. everything in the handler is
+// raw syscalls - no alloc, no std io.
+
+static CRASH_FD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
+unsafe fn syscall4(nr: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr => ret,
+            in("rdi") a,
+            in("rsi") b,
+            in("rdx") c,
+            in("r10") d,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// the kernel calls this to return from the handler frame
+#[unsafe(naked)]
+unsafe extern "C" fn crash_restorer() {
+    core::arch::naked_asm!("mov rax, 15", "syscall") // rt_sigreturn
+}
+
+fn put_hex(buf: &mut [u8], mut at: usize, v: u64) -> usize {
+    buf[at] = b'0';
+    buf[at + 1] = b'x';
+    at += 2;
+    let digits = b"0123456789abcdef";
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let nib = ((v >> (shift * 4)) & 0xf) as usize;
+        if nib != 0 || started || shift == 0 {
+            buf[at] = digits[nib];
+            at += 1;
+            started = true;
+        }
+    }
+    at
+}
+
+unsafe extern "C" fn on_crash(sig: i32, info: *mut u8, ctx: *mut u8) {
+    // x86_64: si_addr at siginfo+0x10, rip in ucontext.uc_mcontext.gregs[16]
+    let addr = unsafe { info.add(0x10).cast::<u64>().read() };
+    let ip = unsafe { ctx.add(40 + 16 * 8).cast::<u64>().read() };
+
+    let mut buf = [0u8; 96];
+    let msg = b"doctor: CRASH signal ";
+    buf[..msg.len()].copy_from_slice(msg);
+    let mut at = msg.len();
+    buf[at] = b'0' + (sig % 10) as u8;
+    if sig >= 10 {
+        buf[at] = b'0' + (sig / 10) as u8;
+        buf[at + 1] = b'0' + (sig % 10) as u8;
+        at += 1;
+    }
+    at += 1;
+    let s = b" addr ";
+    buf[at..at + s.len()].copy_from_slice(s);
+    at += s.len();
+    at = put_hex(&mut buf, at, addr);
+    let s = b" ip ";
+    buf[at..at + s.len()].copy_from_slice(s);
+    at += s.len();
+    at = put_hex(&mut buf, at, ip);
+    buf[at] = b'\n';
+    at += 1;
+
+    let report = CRASH_FD.load(core::sync::atomic::Ordering::Relaxed);
+    const SYS_OPEN: i64 = 2;
+    const SYS_READ: i64 = 0;
+    const SYS_WRITE: i64 = 1;
+    unsafe {
+        for fd in [2, report] {
+            if fd >= 0 {
+                syscall4(SYS_WRITE, fd as i64, buf.as_ptr() as i64, at as i64, 0);
+            }
+        }
+        // the maps snapshot names the module the ip fell in
+        let path = b"/proc/self/maps\0";
+        let maps = syscall4(SYS_OPEN, path.as_ptr() as i64, 0, 0, 0);
+        if maps >= 0 {
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = syscall4(SYS_READ, maps, chunk.as_mut_ptr() as i64, chunk.len() as i64, 0);
+                if n <= 0 {
+                    break;
+                }
+                for fd in [2, report] {
+                    if fd >= 0 {
+                        syscall4(SYS_WRITE, fd as i64, chunk.as_ptr() as i64, n, 0);
+                    }
+                }
+            }
+        }
+    }
+    // SA_RESETHAND already re-armed the default action: returning re-runs
+    // the faulting instruction and the second hit takes the core dump
+}
+
+fn install_crash_handler(report_fd: i32) {
+    CRASH_FD.store(report_fd, core::sync::atomic::Ordering::Relaxed);
+    const SYS_RT_SIGACTION: i64 = 13;
+    const SA_SIGINFO: u64 = 4;
+    const SA_RESTORER: u64 = 0x0400_0000;
+    const SA_RESETHAND: u64 = 0x8000_0000;
+    #[repr(C)]
+    struct KernelSigaction {
+        handler: u64,
+        flags: u64,
+        restorer: u64,
+        mask: u64,
+    }
+    let act = KernelSigaction {
+        handler: on_crash as usize as u64,
+        flags: SA_SIGINFO | SA_RESTORER | SA_RESETHAND,
+        restorer: crash_restorer as usize as u64,
+        mask: 0,
+    };
+    for sig in [4i64, 6, 7, 8, 11] {
+        // ill, abrt, bus, fpe, segv
+        unsafe {
+            syscall4(SYS_RT_SIGACTION, sig, &act as *const _ as i64, 0, 8);
+        }
+    }
+}
+
 pub fn run() -> i32 {
     let mut r = Report::open();
+    {
+        use std::os::fd::AsRawFd;
+        install_crash_handler(r.home.as_ref().map_or(-1, |f| f.as_raw_fd()));
+    }
     r.say(&format!(
         "carrot doctor {} (pid {})",
         env!("CARGO_PKG_VERSION"),
