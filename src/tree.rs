@@ -781,11 +781,17 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
     if wins.is_empty() {
         return;
     }
-    let cur = focused_window(state);
-    // everything else is buried; cycling would land on the invisible
-    if cur.as_ref().is_some_and(|c| c.fullscreen.get()) {
+    // everything under a fullscreen window is buried; cycling either
+    // stays or snaps a stranded focus back to the visible one
+    let fs = ws.fullscreen.borrow().clone();
+    if let Some(fs) = fs {
+        if focused_window(state).is_none_or(|c| !Rc::ptr_eq(&c, &fs)) {
+            focus_window(state, Some(&fs));
+            state.damage.trigger();
+        }
         return;
     }
+    let cur = focused_window(state);
     let from = cur.as_ref().map(|c| c.rect.get()).unwrap_or_default();
     let idx = cur.and_then(|c| wins.iter().position(|w| Rc::ptr_eq(w, &c)));
     let next = match idx {
@@ -802,6 +808,11 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
 /// lands centered
 fn warp_pointer_into(state: &Rc<State>, from: Rect, win: &Rc<Window>) {
     let Some(seat) = state.seat.borrow().clone() else { return };
+    // a locked pointer is frozen by contract; the drawn cursor must not
+    // teleport away from it either
+    if seat.lock_active() {
+        return;
+    }
     let to = win.rect.get();
     if to.is_empty() {
         return;
@@ -864,12 +875,18 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
     let Some(cur) = focused_window(state) else {
         return;
     };
-    // a fullscreen window buries its neighbors; focus stays put rather
-    // than wandering onto something invisible
-    if cur.fullscreen.get() {
+    let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
+    // a fullscreen window is the only visible thing on its workspace;
+    // focus verbs never wander under it, and focus stranded on a buried
+    // window snaps back out
+    let fs = ws.fullscreen.borrow().clone();
+    if let Some(fs) = fs {
+        if !Rc::ptr_eq(&fs, &cur) {
+            focus_window(state, Some(&fs));
+            state.damage.trigger();
+        }
         return;
     }
-    let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
     if ws.tiling.mode() == crate::config::LayoutMode::Scrolling && !cur.floating.get() {
         ws.tiling.strip.note_focus(&cur);
         if let Some(next) = ws.tiling.strip.focus_dir(dir) {

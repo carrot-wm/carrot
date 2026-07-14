@@ -647,6 +647,10 @@ impl SeatGlobal {
         }
     }
 
+    pub fn lock_active(&self) -> bool {
+        self.active_lock().is_some()
+    }
+
     fn active_lock(&self) -> Option<Rc<Constraint>> {
         self.constraints
             .borrow()
@@ -1794,15 +1798,17 @@ mod tests {
         let base = crate::shell::xdg::tests::mk_base(&client, 30);
         let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
         crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
-        for i in 0..3u32 {
+        let (sb, xb, _tb) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 11, 12, 13);
+        crate::shell::xdg::tests::map(&state, &client, &sb, &xb, 21);
+        for i in 0..2u32 {
             let (s, x, _t) = crate::shell::xdg::tests::mk_toplevel(
                 &client,
                 &base,
-                11 + i * 3,
-                12 + i * 3,
-                13 + i * 3,
+                14 + i * 3,
+                15 + i * 3,
+                16 + i * 3,
             );
-            crate::shell::xdg::tests::map(&state, &client, &s, &x, 21 + i);
+            crate::shell::xdg::tests::map(&state, &client, &s, &x, 22 + i);
         }
         // the scrolling strip keeps laying out off-view columns; with the
         // view scrolled to the strip's tail the head column sits fully
@@ -1821,6 +1827,35 @@ mod tests {
         crate::tree::focus_cycle(&state, 1);
         let cur = crate::tree::focused_window(&state).unwrap();
         assert!(Rc::ptr_eq(&cur, &win), "cycle focus stays put");
+        // focus stranded on a buried window is a softlock: any focus verb
+        // snaps back to the one visible window instead of wandering
+        let buried = crate::tree::window_for_surface(&state, &sb).unwrap();
+        crate::tree::focus_window(&state, Some(&buried));
+        crate::tree::focus_dir(&state, crate::config::Dir::Left);
+        let cur = crate::tree::focused_window(&state).unwrap();
+        assert!(Rc::ptr_eq(&cur, &win), "stranded focus snaps to the fullscreen window");
+    }
+
+    #[test]
+    fn focus_moves_never_warp_a_locked_pointer() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        let (sb, xb, _tb) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 11, 41, 51);
+        crate::shell::xdg::tests::map(&state, &client, &sb, &xb, 21);
+        seat.warp(&state, 600.0, 300.0);
+        assert!(seat.pointer_focus().is_some_and(|f| Rc::ptr_eq(&f, &sa)));
+        lock(&client, sa.id, 71, 2).unwrap();
+        let con = seat.constraint_for(&sa).unwrap();
+        assert!(con.active.get());
+        // keyboard focus may move on; the locked cursor must not budge
+        crate::tree::focus_cycle(&state, 1);
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (600.0, 300.0), "pointer frozen");
+        assert!(con.active.get(), "the lock survives a keyboard-only focus move");
     }
 
     #[test]
