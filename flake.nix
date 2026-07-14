@@ -36,7 +36,7 @@
 
       flake = {
         homeModule = 
-          { config, lib, pkgs, ... }:
+          { config, lib, pkgs, self, ... }:
           let
             inherit (lib)
               mkIf
@@ -104,6 +104,7 @@
           {
             options.carrot = {
               enable = lib.mkEnableOption "Carrot, a pure Rust wayland compositor";
+              package = lib.mkPackageOption self.packages.${pkgs.system}.carrot { };
               settings = mkOption {
                 type = types.suboption {
                   options = {
