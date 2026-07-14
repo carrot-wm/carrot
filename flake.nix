@@ -376,6 +376,9 @@
                           mode = mkOption {
                             type = types.enum [ "scrolling" "dwindle" ];
                           };
+                          workspace-axis = mkOption {
+                            type = types.enum [ "vertical" "horizontal" ];
+                          };
                           scrolling = mkOption {
                             type = types.submodule {
                               options = {
