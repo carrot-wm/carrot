@@ -935,6 +935,36 @@ pub fn window_for_surface_any(state: &Rc<State>, s: &Rc<WlSurface>) -> Option<Rc
 
 // -- map / unmap --
 
+/// re-resolve the dynamic rule effects for every mapped window; a reload
+/// must land on running apps, a privacy rule especially. open-time
+/// effects (floating, workspace, size) stay as mapped
+pub fn reapply_rules(state: &Rc<State>) {
+    let cfg = state.config.borrow().clone();
+    let apply = |win: &Rc<Window>| {
+        let fx = crate::config::rule_effects(
+            &cfg,
+            &win.app_id(),
+            &win.title(),
+            win.x11_opt().is_some(),
+            win.fullscreen.get(),
+        );
+        win.rule_immediate.set(fx.immediate);
+        win.rule_opacity
+            .set(fx.opacity.map(|o| o.clamp(0.0, 1.0) as f32));
+        win.rule_rounding.set(fx.rounding);
+        win.rule_shadow.set(fx.shadow);
+        win.rule_dim.set(fx.dim);
+        win.rule_blur.set(fx.blur.unwrap_or(false));
+        win.rule_no_capture.set(fx.no_capture);
+    };
+    for ws in state.workspaces.borrow().iter() {
+        ws.for_each(&apply);
+        if let Some(fs) = ws.fullscreen.borrow().as_ref() {
+            apply(fs);
+        }
+    }
+}
+
 pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     let cfg = state.config.borrow().clone();
     let fx = crate::config::rule_effects(

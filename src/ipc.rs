@@ -417,6 +417,7 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
             out.blur_dirty.set(true);
         }
     }
+    crate::tree::reapply_rules(state);
     let ws = crate::tree::active(state);
     crate::tree::relayout(state, &ws);
     crate::shell::layer::arrange(state);
