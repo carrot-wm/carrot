@@ -69,15 +69,15 @@ fn scrolling(node: &KdlNode, out: &mut ScrollCfg, cx: &mut Cx) {
                         e.value().as_float().or_else(|| e.value().as_integer().map(|i| i as f64))
                     })
                     .collect();
-                if ws.is_empty() || ws.iter().any(|w| !(0.05..=1.0).contains(w)) {
-                    cx.at(c, "preset-widths is one or more proportions in 0.05..1");
+                if ws.is_empty() || ws.iter().any(|w| !(0.05..=10.0).contains(w)) {
+                    cx.at(c, "preset-widths is one or more proportions in 0.05..10");
                 } else {
                     out.preset_widths = ws;
                 }
             }
             "default-width" => {
                 if let Some(v) = cx.float(c) {
-                    match f64_in(v, "default-width", 0.05, 1.0) {
+                    match f64_in(v, "default-width", 0.05, 10.0) {
                         Ok(v) => out.default_width = ColWidthCfg::Prop(v),
                         Err(e) => cx.leaf(c, e),
                     }

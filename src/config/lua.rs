@@ -405,9 +405,9 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                                 .iter()
                                 .filter_map(vnum)
                                 .collect();
-                            if ws.is_empty() || ws.iter().any(|w| !(0.05..=1.0).contains(w)) {
+                            if ws.is_empty() || ws.iter().any(|w| !(0.05..=10.0).contains(w)) {
                                 return Err(
-                                    "preset_widths is one or more proportions in 0.05..1".into()
+                                    "preset_widths is one or more proportions in 0.05..10".into()
                                 );
                             }
                             l.scrolling.preset_widths = ws;
@@ -417,7 +417,7 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                                 need_num(&v, &key)?,
                                 "default_width",
                                 0.05,
-                                1.0,
+                                10.0,
                             )?);
                         }
                         "default_width_px" => {

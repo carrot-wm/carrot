@@ -172,7 +172,7 @@ pub struct ScrollCfg {
 impl Default for ScrollCfg {
     fn default() -> ScrollCfg {
         ScrollCfg {
-            preset_widths: vec![1.0 / 3.0, 0.5, 2.0 / 3.0],
+            preset_widths: vec![1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0],
             default_width: ColWidthCfg::Prop(0.5),
             center_focus: CenterFocus::Never,
         }
