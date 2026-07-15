@@ -143,6 +143,7 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
         Ok("windows") => Ok(windows_json(state)),
         Ok("clients") => Ok(clients_json(state)),
         Ok("reload") => reload(state).map(|_| json!(true)),
+        Ok("errors") => Ok(errors_json(state)),
         Ok("binds") => Ok(binds_json(state)),
         Ok("dump-shadow") => dump_shadow(state),
         Ok("dpms-off") => {
@@ -370,6 +371,19 @@ pub fn run_spawn(state: &Rc<State>, s: &crate::config::SpawnCfg) {
         crate::config::SpawnCfg::Argv(argv) => spawn_argv(state, argv),
         crate::config::SpawnCfg::Sh(cmd) => spawn_sh(state, cmd),
     }
+}
+
+/// the last config load's diagnostics, startup or reload
+fn errors_json(state: &Rc<State>) -> Value {
+    let stored = state.last_config_event.borrow();
+    let Some(v) = stored.as_deref().and_then(|ev| serde_json::from_str::<Value>(ev).ok()) else {
+        return json!({ "failed": false, "errors": [], "cold-keys-pending": [] });
+    };
+    json!({
+        "failed": v.get("failed").cloned().unwrap_or(json!(false)),
+        "errors": v.get("errors").cloned().unwrap_or(json!([])),
+        "cold-keys-pending": v.get("cold-keys-pending").cloned().unwrap_or(json!([])),
+    })
 }
 
 /// emit the config status and keep it for late subscribers
