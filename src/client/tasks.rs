@@ -88,11 +88,10 @@ async fn send(data: Rc<Client>) {
     let mut bufs = VecDeque::new();
     let err = loop {
         data.flush_request.triggered().await;
-        {
-            let mut sw = data.swapchain.borrow_mut();
-            sw.commit();
-            sw.take_pending(&mut bufs);
-        }
+        // the flag makes the eager path yield while awaits below hold
+        // partially-written buffers
+        data.set_flushing(true);
+        data.gather_send(&mut bufs);
         // flush unlocked so handlers keep queueing meanwhile
         let deadline = Time::now() + Duration::from_millis(5000);
         let mut failed = None;
@@ -104,6 +103,7 @@ async fn send(data: Rc<Client>) {
                 break;
             }
         }
+        data.set_flushing(false);
         if let Some(e) = failed {
             while let Some(b) = bufs.pop_front() {
                 data.swapchain.borrow_mut().recycle(b);

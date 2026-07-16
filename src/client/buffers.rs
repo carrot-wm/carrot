@@ -157,6 +157,11 @@ impl OutBuffer {
         self.read_pos = 0;
         self.fd_groups.clear();
     }
+
+    #[cfg(test)]
+    pub(crate) fn unsent_bytes(&self) -> &[u8] {
+        &self.out.bytes[self.read_pos..]
+    }
 }
 
 #[derive(Default)]
@@ -209,6 +214,66 @@ impl OutSwapchain {
 
 /// drains one buffer through sendmsg, resuming partial writes and keeping each
 /// fd group attached to its own message
+/// synchronous, non-blocking flush attempt: push as much of the buffer as
+/// the socket takes right now. Ok(true) = drained; Ok(false) = the socket
+/// is full and the remainder stays queued (fd groups intact - a group is
+/// only popped once the send that carries it succeeds). the async path
+/// owns retries and errors beyond a closed peer.
+pub fn try_flush_buffer(fd: &Rc<OwnedFd>, b: &mut OutBuffer) -> Result<bool, ClientError> {
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+    use std::io::IoSlice;
+    use std::os::fd::AsFd;
+    while b.read_pos < b.out.bytes.len() {
+        let mut end = b.out.bytes.len();
+        let mut with_fds = false;
+        if let Some(front) = b.fd_groups.front() {
+            if front.pos == b.read_pos {
+                with_fds = true;
+                if let Some(next) = b.fd_groups.get(1) {
+                    end = next.pos;
+                }
+            } else {
+                end = front.pos;
+            }
+        }
+        let iov = [IoSlice::new(&b.out.bytes[b.read_pos..end])];
+        let mut space =
+            [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_RX_FDS))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        let borrowed: Vec<std::os::fd::BorrowedFd> = if with_fds {
+            b.fd_groups.front().unwrap().fds.iter().map(|f| f.as_fd()).collect()
+        } else {
+            Vec::new()
+        };
+        if with_fds && !control.push(SendAncillaryMessage::ScmRights(&borrowed)) {
+            // more fds than one message carries: the async path handles it
+            return Ok(false);
+        }
+        match sendmsg(
+            fd,
+            &iov,
+            &mut control,
+            SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+        ) {
+            Ok(n) if n > 0 => {
+                drop(control);
+                drop(borrowed);
+                if with_fds {
+                    // the kernel took the ancillary payload with the first byte
+                    b.fd_groups.pop_front();
+                }
+                b.read_pos += n;
+            }
+            Ok(_) => return Ok(false),
+            Err(e) if e == Errno::CONNRESET || e == Errno::PIPE => {
+                return Err(ClientError::Closed);
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 pub async fn flush_buffer(
     ring: &Ring,
     fd: &Rc<OwnedFd>,

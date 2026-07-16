@@ -108,6 +108,8 @@ impl Clients {
             serials: RefCell::new(VecDeque::new()),
             checking_queue: Cell::new(false),
             is_xwayland: Cell::new(false),
+            flushing: Cell::new(false),
+            spill: RefCell::new(VecDeque::new()),
         });
         client
             .objects
@@ -202,6 +204,10 @@ pub struct Client {
     shutdown: AsyncEvent,
     serials: RefCell<VecDeque<SerialRange>>,
     checking_queue: Cell<bool>,
+    /// the send task holds this across its awaits; the eager path yields
+    flushing: Cell<bool>,
+    /// eager leftovers, drained by the send task ahead of fresh pending
+    spill: RefCell<VecDeque<crate::client::buffers::OutBuffer>>,
 }
 
 const MAX_SERIAL_RANGES: usize = 64;
@@ -223,6 +229,59 @@ impl Client {
             self.state.slow_clients.push(self.clone());
         }
         self.flush_request.trigger();
+    }
+
+    /// push queued events onto the socket right now instead of waiting
+    /// out the engine's send phase and a ring round-trip; input paths
+    /// call this at frame boundaries. anything the socket won't take
+    /// parks in the spill queue the send task drains first, so byte
+    /// order holds under every interleaving; while the send task is
+    /// mid-flush it owns the socket and this is a no-op
+    pub fn flush_eager(&self) {
+        if self.flushing.get() || !self.spill.borrow().is_empty() {
+            return;
+        }
+        let mut bufs = VecDeque::new();
+        {
+            let mut sw = self.swapchain.borrow_mut();
+            sw.commit();
+            sw.take_pending(&mut bufs);
+        }
+        while let Some(mut b) = bufs.pop_front() {
+            match buffers::try_flush_buffer(&self.socket, &mut b) {
+                Ok(true) => self.swapchain.borrow_mut().recycle(b),
+                // full socket or an error: hand everything to the async
+                // path in order; it owns retries, deadlines and the kill
+                _ => {
+                    let mut spill = self.spill.borrow_mut();
+                    spill.push_back(b);
+                    spill.extend(bufs.drain(..));
+                    drop(spill);
+                    self.flush_request.trigger();
+                    return;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_flushing(&self, v: bool) {
+        self.flushing.set(v);
+    }
+
+    /// assemble one send round: eager spill ahead of fresh pending. the
+    /// spill's head may be a half-sent buffer whose next unsent byte must
+    /// be the next byte on the wire, so nothing may overtake it
+    pub(crate) fn gather_send(&self, bufs: &mut VecDeque<crate::client::buffers::OutBuffer>) {
+        {
+            let mut sw = self.swapchain.borrow_mut();
+            sw.commit();
+            // a swap, not an append: splice the spill in front afterwards
+            sw.take_pending(bufs);
+        }
+        let spill = std::mem::take(&mut *self.spill.borrow_mut());
+        for b in spill.into_iter().rev() {
+            bufs.push_front(b);
+        }
     }
 
     /// recheck after a yield: transient bursts pass, stalled readers get killed
@@ -440,6 +499,31 @@ mod tests {
 
     fn w(bytes: &[u8], word: usize) -> u32 {
         u32::from_ne_bytes(bytes[word * 4..word * 4 + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn eager_spill_stays_ahead_of_fresh_buffers() {
+        use crate::protocol::interfaces::wl_callback;
+        let (_state, client) = test_utils::test_client();
+        // the test peer is closed, so the eager attempt parks everything
+        client.event(|o| wl_callback::done::send(o, ObjectId(101), 1));
+        client.flush_eager();
+        assert!(!client.spill.borrow().is_empty(), "the dead peer spills the buffer");
+        // fresher events recorded before the send round runs
+        client.event(|o| wl_callback::done::send(o, ObjectId(102), 2));
+        let mut bufs = std::collections::VecDeque::new();
+        client.gather_send(&mut bufs);
+        assert!(client.spill.borrow().is_empty(), "the round consumes the spill");
+        let mut bytes = Vec::new();
+        for b in &bufs {
+            bytes.extend_from_slice(b.unsent_bytes());
+        }
+        let seq = test_utils::event_seq(&bytes);
+        assert_eq!(
+            seq,
+            vec![(101, 0), (102, 0)],
+            "spilled bytes go on the wire before anything recorded later"
+        );
     }
 
     #[test]
