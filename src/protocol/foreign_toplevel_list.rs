@@ -93,6 +93,7 @@ impl list_v1::Handler for ExtToplevelList {
     fn stop(&self, _req: list_v1::stop::Request) -> Result<(), Box<dyn std::error::Error>> {
         self.stopped.set(true);
         self.client.event(|o| list_v1::finished::send(o, self.id));
+        sweep_dead(&self.client.state);
         Ok(())
     }
 
@@ -100,8 +101,18 @@ impl list_v1::Handler for ExtToplevelList {
         // the Rc stays in state so the surviving handles keep their events
         self.stopped.set(true);
         self.client.remove_obj(self.id)?;
+        sweep_dead(&self.client.state);
         Ok(())
     }
+}
+
+/// a stopped list with no live handles mints nothing and serves nothing;
+/// keeping it would let bind/stop churn grow the fan-out list forever
+fn sweep_dead(state: &Rc<State>) {
+    state
+        .ext_toplevel_lists
+        .borrow_mut()
+        .retain(|l| !l.stopped.get() || !l.handles.borrow().is_empty());
 }
 
 impl Object for ExtToplevelList {
@@ -184,6 +195,7 @@ impl handle_v1::Handler for ExtToplevelHandle {
                 .borrow_mut()
                 .retain(|h| !(h.id == self.id && h.client.id == self.client.id));
         }
+        sweep_dead(state);
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -269,6 +281,7 @@ pub fn window_unmapped(state: &Rc<State>, win: &Rc<Window>) {
         }
         list.handles.borrow_mut().retain(|h| h.win().is_some());
     }
+    sweep_dead(state);
 }
 
 pub fn title_changed(state: &Rc<State>, win: &Rc<Window>) {
@@ -337,6 +350,24 @@ mod tests {
             off += len;
         }
         out
+    }
+
+    #[test]
+    fn stopped_lists_sweep_out_when_their_last_handle_dies() {
+        let (state, client) = test_client();
+        // churn with nothing mapped: destroy leaves no residue behind
+        for i in 0..5u32 {
+            let l = bind_list(&client, 60 + i);
+            l.destroy(list_v1::destroy::Request {}).unwrap();
+        }
+        assert!(state.ext_toplevel_lists.borrow().is_empty(), "bind/destroy churn");
+        // a stopped list lives exactly as long as its handles do
+        let (s, _xdg, _tl) = mapped_toplevel(&state, &client, [30, 10, 40, 50, 20]);
+        let l = bind_list(&client, 70);
+        l.stop(list_v1::stop::Request {}).unwrap();
+        assert_eq!(state.ext_toplevel_lists.borrow().len(), 1, "a live handle pins it");
+        unmap_toplevel(&s);
+        assert!(state.ext_toplevel_lists.borrow().is_empty(), "last handle gone");
     }
 
     #[test]

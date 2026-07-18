@@ -174,7 +174,12 @@ impl State {
         self.layers.borrow_mut().clear();
         self.ipc_subs.borrow_mut().clear();
         self.ext_toplevel_lists.borrow_mut().clear();
+        self.ftl_managers.borrow_mut().clear();
         self.icc_sessions.borrow_mut().clear();
+        self.casts.borrow_mut().clear();
+        self.cast_tick.take();
+        self.cast_pick.borrow_mut().take();
+        self.lock.borrow_mut().take();
         self.idle.clear();
         self.retired.borrow_mut().clear();
         self.wheel.clear();

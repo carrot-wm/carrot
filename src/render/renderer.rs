@@ -579,19 +579,22 @@ impl Renderer {
     /// sync_file (previous scanout's OUT fence) -> submit wait; temporary
     /// import restores the semaphore after one use.
     pub fn import_wait(&self, fd: OwnedFd) -> Result<vk::Semaphore, RenderError> {
-        use std::os::fd::IntoRawFd;
+        use std::os::fd::{FromRawFd, IntoRawFd};
         let sem = unsafe {
             self.core
                 .device
                 .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
         }?;
+        // the fd only changes hands on a successful import
+        let raw = fd.into_raw_fd();
         let info = vk::ImportSemaphoreFdInfoKHR::default()
             .semaphore(sem)
             .flags(vk::SemaphoreImportFlags::TEMPORARY)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-            .fd(fd.into_raw_fd());
+            .fd(raw);
         if let Err(e) = unsafe { self.core.ext_semaphore_fd.import_semaphore_fd(&info) } {
             unsafe { self.core.device.destroy_semaphore(sem, None) };
+            drop(unsafe { OwnedFd::from_raw_fd(raw) });
             return Err(e.into());
         }
         Ok(sem)

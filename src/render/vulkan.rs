@@ -93,6 +93,15 @@ impl VkCore {
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let info = vk::InstanceCreateInfo::default().application_info(&app);
         let instance = unsafe { entry.create_instance(&info, None) }?;
+        // every failure exit destroys the instance (and the drm fds the
+        // icd parked in it); success disarms and the core's drop owns it
+        let armed = std::cell::Cell::new(true);
+        let guard = instance.clone();
+        let _cleanup = crate::util::OnDrop(|| {
+            if armed.get() {
+                unsafe { guard.destroy_instance(None) };
+            }
+        });
         let pdevs = unsafe { instance.enumerate_physical_devices() }?;
         for pdev in pdevs {
             let exts = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
@@ -163,6 +172,7 @@ impl VkCore {
             let device = unsafe { instance.create_device(pdev, &device_info, None) }?;
             let queue = unsafe { device.get_device_queue(queue_family, 0) };
             let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
+            armed.set(false);
             return Ok(VkCore {
                 ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 ext_modifier: ash::ext::image_drm_format_modifier::Device::new(
@@ -186,7 +196,6 @@ impl VkCore {
                 entry,
             });
         }
-        unsafe { instance.destroy_instance(None) };
         Err(RenderError::NoDevice)
     }
 

@@ -78,8 +78,18 @@ impl manager_v1::Handler for FtlManager {
             .event(|o| manager_v1::finished::send(o, self.id));
         // the object dies; the Rc stays in state so handles keep flowing
         self.client.remove_obj(self.id)?;
+        sweep_dead(&self.client.state);
         Ok(())
     }
+}
+
+/// a stopped manager with no live handles has nothing left to say;
+/// keeping it would let bind/stop churn grow the fan-out list forever
+fn sweep_dead(state: &Rc<State>) {
+    state
+        .ftl_managers
+        .borrow_mut()
+        .retain(|m| !m.stopped.get() || !m.handles.borrow().is_empty());
 }
 
 impl Object for FtlManager {
@@ -275,6 +285,7 @@ impl handle_v1::Handler for FtlHandle {
                 .borrow_mut()
                 .retain(|h| !(h.id == self.id && h.client.id == self.client.id));
         }
+        sweep_dead(state);
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -338,6 +349,7 @@ pub fn window_unmapped(state: &Rc<State>, win: &Rc<Window>) {
         }
         mgr.handles.borrow_mut().retain(|h| h.win().is_some());
     }
+    sweep_dead(state);
 }
 
 pub fn title_changed(state: &Rc<State>, win: &Rc<Window>) {
@@ -411,4 +423,42 @@ pub fn drop_client(state: &Rc<State>, id: ClientId) {
     crate::protocol::foreign_toplevel_list::drop_client(state, id);
     crate::protocol::image_copy_capture::drop_client(state, id);
     state.ftl_managers.borrow_mut().retain(|m| m.client.id != id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::test_utils::test_client;
+    use crate::shell::xdg::test_support::{mapped_toplevel, unmap_toplevel};
+    use manager_v1::Handler as _;
+
+    fn bind_manager(client: &Rc<Client>, id: u32) -> Rc<FtlManager> {
+        ForeignToplevelGlobal.bind(client, ObjectId(id), 3).unwrap();
+        client
+            .state
+            .ftl_managers
+            .borrow()
+            .iter()
+            .find(|m| m.id == ObjectId(id))
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn stopped_managers_sweep_out_when_their_last_handle_dies() {
+        let (state, client) = test_client();
+        // churn with nothing mapped: stop leaves no residue behind
+        for i in 0..5u32 {
+            let m = bind_manager(&client, 60 + i);
+            m.stop(manager_v1::stop::Request {}).unwrap();
+        }
+        assert!(state.ftl_managers.borrow().is_empty(), "bind/stop churn");
+        // a stopped manager lives exactly as long as its handles do
+        let (s, _xdg, _tl) = mapped_toplevel(&state, &client, [30, 10, 40, 50, 20]);
+        let m = bind_manager(&client, 70);
+        m.stop(manager_v1::stop::Request {}).unwrap();
+        assert_eq!(state.ftl_managers.borrow().len(), 1, "a live handle pins it");
+        unmap_toplevel(&s);
+        assert!(state.ftl_managers.borrow().is_empty(), "last handle gone");
+    }
 }

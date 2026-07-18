@@ -796,6 +796,34 @@ mod tests {
     }
 
     #[test]
+    fn reorder_churn_across_sync_commits_leaves_no_stale_entries() {
+        use wl_subsurface::Handler as _;
+        let (_st, client, p) = setup();
+        let (c, _cs) = make_child(&client, &p, 30, 31);
+        let (_g, gs) = make_child(&client, &c, 40, 41);
+        let count = || {
+            let ch = c.children.borrow();
+            let ch = ch.as_ref().unwrap();
+            ch.above.len() + ch.below.len()
+        };
+        // a reorder that migrates into the grandparent's cached state,
+        // then a second one that merges over it before anything applies
+        let cycle = || {
+            gs.place_below(wl_subsurface::place_below::Request { sibling: c.id }).unwrap();
+            c.commit(wl_surface::commit::Request {}).unwrap();
+            gs.place_below(wl_subsurface::place_below::Request { sibling: c.id }).unwrap();
+            c.commit(wl_surface::commit::Request {}).unwrap();
+            p.commit(wl_surface::commit::Request {}).unwrap();
+        };
+        cycle();
+        let settled = count();
+        for _ in 0..10 {
+            cycle();
+        }
+        assert_eq!(count(), settled, "merged reorders drop their stale entries");
+    }
+
+    #[test]
     fn content_gen_moves_on_attach_or_damage_only() {
         let (_st, client, s) = setup();
         let buf = test_buffer(&client, ObjectId(20), 8, 8);

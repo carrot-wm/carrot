@@ -95,7 +95,13 @@ impl PendingState {
                         }
                     }
                     if ps.entry.is_some() {
-                        cur.entry = ps.entry;
+                        // replacing an unapplied reorder drops its stale
+                        // entry, like place() does on the live slot
+                        if let Some(old) = std::mem::replace(&mut cur.entry, ps.entry) {
+                            if old.pending.get() {
+                                old.sub.parent.remove_stack_entry(&old);
+                            }
+                        }
                     }
                     if ps.position.is_some() {
                         cur.position = ps.position;
