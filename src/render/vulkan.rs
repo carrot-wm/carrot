@@ -55,6 +55,9 @@ pub struct VkCore {
     pub ext_fence_fd: ash::khr::external_fence_fd::Device,
     pub ext_semaphore_fd: ash::khr::external_semaphore_fd::Device,
     pub ext_push_desc: ash::khr::push_descriptor::Device,
+    /// optional: sample sealed client shm in place instead of copying
+    pub ext_host: Option<ash::ext::external_memory_host::Device>,
+    pub host_align: u64,
     pub queue: vk::Queue,
     pub queue_family: u32,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -126,6 +129,14 @@ impl VkCore {
                     ));
                 }
             }
+            // optional: host-pointer import, for sampling sealed shm in place
+            let host_import = has_ext(&exts, ash::ext::external_memory_host::NAME);
+            let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            if host_import {
+                let mut props2 =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
+                unsafe { instance.get_physical_device_properties2(pdev, &mut props2) };
+            }
             let families =
                 unsafe { instance.get_physical_device_queue_family_properties(pdev) };
             let queue_family = families
@@ -136,8 +147,11 @@ impl VkCore {
             let queue_info = vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&prio);
-            let ext_ptrs: Vec<*const std::ffi::c_char> =
+            let mut ext_ptrs: Vec<*const std::ffi::c_char> =
                 REQUIRED_EXTS.iter().map(|c| c.as_ptr()).collect();
+            if host_import {
+                ext_ptrs.push(ash::ext::external_memory_host::NAME.as_ptr());
+            }
             let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
                 .synchronization2(true)
                 .dynamic_rendering(true);
@@ -159,6 +173,9 @@ impl VkCore {
                     &instance, &device,
                 ),
                 ext_push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
+                ext_host: host_import
+                    .then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
+                host_align: host_props.min_imported_host_pointer_alignment.max(1),
                 queue,
                 queue_family,
                 mem_props,

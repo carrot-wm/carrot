@@ -619,7 +619,6 @@ impl SeatGlobal {
             if con.active.get() && !is_focus {
                 self.deactivate_constraint(state, con);
             } else if !con.active.get() && !con.dead.get() && is_focus {
-                con.origin.set(self.ptr_origin.get());
                 con.send_active(true);
             }
         }
@@ -631,10 +630,15 @@ impl SeatGlobal {
             return;
         }
         con.send_active(false);
-        // release the lock at the client's position hint, where it last drew
+        // release the lock at the client's position hint, where it last
+        // drew. the hint is surface-local and resolves against where the
+        // surface sits now - fullscreen or a retile can move the surface
+        // while the lock holds, and no motion runs to rebase in between
         if con.kind == Kind::Lock {
             if let Some((hx, hy)) = con.hint.take() {
-                let (ox, oy) = con.origin.get();
+                let Some((ox, oy)) = crate::tree::surface_origin(state, &con.surface) else {
+                    return;
+                };
                 let (w, h) = state.output_size.get();
                 let x = (ox as f64 + hx).clamp(0.0, (w.max(1) - 1) as f64);
                 let y = (oy as f64 + hy).clamp(0.0, (h.max(1) - 1) as f64);
@@ -784,7 +788,10 @@ impl crate::surface::SurfaceExt for CursorExt {
     }
 }
 
-/// tightly packed argb bytes out of the cursor surface's commit shadow
+/// tightly packed argb bytes out of the cursor surface's commit shadow,
+/// or straight from the client buffer when no shadow exists - sealed
+/// pools sample in place and keep none, and their release parks until
+/// replace, so the pages are stable for as long as this cursor shows
 fn cursor_pixels(s: &WlSurface) -> Option<(Vec<u8>, u32, u32)> {
     let buf = s.buffer.borrow();
     let b = &buf.as_ref()?.buf;
@@ -796,8 +803,19 @@ fn cursor_pixels(s: &WlSurface) -> Option<(Vec<u8>, u32, u32)> {
     let need = row * h as usize;
     // dmabuf cursors would need a gpu readback; nobody ships them
     let shadow = s.shm_shadow.borrow();
-    let src = shadow.as_ref().filter(|p| p.len() >= need)?;
-    let mut px = src[..need].to_vec();
+    let mut px = match shadow.as_ref().filter(|p| p.len() >= need) {
+        Some(src) => src[..need].to_vec(),
+        None => {
+            let stride = b.stride as usize;
+            if stride < row {
+                return None;
+            }
+            let access = b.shm_access()?;
+            let mut px = vec![0u8; need];
+            crate::output::fill_from_shm(&access, &mut px, h, row, stride);
+            px
+        }
+    };
     // the plane blends; xrgb needs its alpha forced opaque
     if !b.format.has_alpha() {
         for c in px.chunks_exact_mut(4) {
@@ -1904,7 +1922,10 @@ mod tests {
     }
 
     #[test]
-    fn unlock_lands_on_the_position_hint() {
+    fn unlock_hint_skips_a_surface_the_tree_cannot_place() {
+        // the setup surface belongs to no window or layer, so the hint has
+        // no global origin to resolve against; the pointer must stay put
+        // rather than land somewhere stale
         let (_state, client, seat, s) = setup();
         lock(&client, s.id, 71, 1).unwrap();
         let con = seat.constraint_for(&s).unwrap();
@@ -1917,8 +1938,7 @@ mod tests {
         lp.destroy(zwp_locked_pointer_v1::destroy::Request {}).unwrap();
         let bytes = client.queued_out_bytes();
         assert_eq!(count_events(&bytes, ObjectId(71), 1), 1, "unlocked");
-        // origin 40,30 + hint 400,300
-        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (440.0, 330.0));
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (100.0, 80.0));
         // oneshot never re-arms
         assert!(seat.constraint_for(&s).is_none());
     }

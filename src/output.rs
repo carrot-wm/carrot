@@ -177,7 +177,12 @@ impl Display {
                 cur.set_enabled(false);
             }
             drop(pipe);
-            out.conn.cursor_commit(&out.dev);
+            if !out.conn.cursor_commit(&out.dev) {
+                // the kernel won't take this plane (joined-pipe quirks, odm);
+                // never leave the user cursorless - composite from here on
+                self.set_software_cursor(state, true);
+                return;
+            }
         }
     }
 
@@ -306,6 +311,9 @@ pub struct Output {
     pub global_name: Cell<u32>,
     /// per-output wake; the fan-out task mirrors state.damage into these
     pub damage: AsyncEvent,
+    /// callback pacer: fire the sweep at this instant (0 = nothing owed)
+    cb_at: Cell<u64>,
+    cb_kick: AsyncEvent,
     /// global origin; outputs tile left to right
     pub pos: Cell<(i32, i32)>,
     /// the workspace this output currently shows
@@ -345,6 +353,9 @@ pub struct Output {
     /// latched feedbacks drained here while composing for the display
     present_fbs: RefCell<Vec<crate::protocol::presentation::Feedback>>,
     collect_fbs: Cell<bool>,
+    /// present-compose scratch, reused every frame to spare the allocator
+    ops_scratch: RefCell<Vec<RenderOp>>,
+    live_scratch: RefCell<Vec<((ClientId, u64), u64)>>,
     /// feedbacks riding the queued flip; fired on its completion event
     inflight_fbs: RefCell<Vec<crate::protocol::presentation::Feedback>>,
     inflight_vsync: Cell<bool>,
@@ -386,14 +397,28 @@ struct CleanupJob {
 }
 
 /// the timing model behind late latching: how long a frame costs on the
-/// cpu (latch to flip-queued) and on the gpu (submit to fence), plus an
-/// adaptive safety margin. all nanoseconds
+/// cpu (latch to flip-queued, tracked per path) and on the gpu (submit to
+/// fence, compose only), plus an adaptive safety margin. all nanoseconds
 struct Sched {
-    ewma_cpu: Cell<u64>,
+    /// compose path: latch -> flip queued
+    ewma_compose: Cell<u64>,
+    /// scanout path: latch -> flip queued; no gpu work ever rides this,
+    /// so the compose estimates must never price its deadline
+    ewma_scanout: Cell<u64>,
     ewma_gpu: Cell<u64>,
-    /// AIMD: doubles on a missed vblank, decays linearly on a met one,
-    /// never below the configured floor
+    /// AIMD: doubles on a missed vblank, halves when a flip lands a whole
+    /// vblank early (overshoot, not success), decays linearly on a met
+    /// one. handles transient adversity; the hardware lead lives in cutoff
     margin: Cell<u64>,
+    /// learned commit cutoff: how far ahead of the vblank the kernel needs
+    /// the ioctl. rises above any lead that missed, decays slowly to keep
+    /// probing for a lower edge. the config floor seeds and bounds it
+    cutoff: Cell<u64>,
+    /// a miss has proven where the edge is; until then the seed sheds fast
+    cutoff_settled: Cell<bool>,
+    /// clean frames left before the cutoff may probe downward again; a
+    /// fresh raise arms this so probe misses stay far apart in the tail
+    cutoff_hold: Cell<u32>,
     misses: Cell<u32>,
     clean: Cell<u32>,
     /// enough consecutive misses park the policy on render-at-flip-done
@@ -401,6 +426,8 @@ struct Sched {
     fallback: Cell<bool>,
     /// the glass instant the queued flip aimed for; 0 = nothing aimed
     target_ns: Cell<u64>,
+    /// when that flip's ioctl went in; lead = target - this
+    aim_ioctl_ns: Cell<u64>,
     /// last flip-done actually accounted, so each is counted once
     last_seq: Cell<u64>,
 }
@@ -409,16 +436,30 @@ impl Default for Sched {
     fn default() -> Sched {
         Sched {
             // deliberately fat startup estimates; real samples pull them in
-            ewma_cpu: Cell::new(1_000_000),
+            ewma_compose: Cell::new(1_000_000),
+            ewma_scanout: Cell::new(100_000),
             ewma_gpu: Cell::new(2_000_000),
             margin: Cell::new(0),
+            // the old static floor, now just the starting estimate
+            cutoff: Cell::new(500_000),
+            cutoff_settled: Cell::new(false),
+            cutoff_hold: Cell::new(0),
             misses: Cell::new(0),
             clean: Cell::new(0),
             fallback: Cell::new(false),
             target_ns: Cell::new(0),
+            aim_ioctl_ns: Cell::new(0),
             last_seq: Cell::new(0),
         }
     }
+}
+
+/// which pipeline the coming latch feeds; scanout skips the gpu, so its
+/// deadline sits much closer to the vblank
+#[derive(Copy, Clone, PartialEq)]
+enum PresentPath {
+    Compose,
+    Scanout,
 }
 
 impl Sched {
@@ -427,8 +468,151 @@ impl Sched {
         cell.set(e - e / 8 + sample / 8);
     }
 
-    fn budget_ns(&self, floor_ns: u64) -> u64 {
-        self.ewma_cpu.get() + self.ewma_gpu.get() + self.margin.get().max(floor_ns)
+    fn budget_ns(&self, path: PresentPath, floor_ns: u64) -> u64 {
+        let cpu = match path {
+            PresentPath::Compose => self.ewma_compose.get() + self.ewma_gpu.get(),
+            PresentPath::Scanout => self.ewma_scanout.get(),
+        };
+        cpu + (self.cutoff.get() + self.margin.get()).max(floor_ns)
+    }
+}
+
+/// where a completed flip landed relative to the vblank it aimed for
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum Aim {
+    /// within half a period of the target: the model is honest
+    Clean,
+    /// a vblank (or more) late: the budget lied
+    Miss,
+    /// a vblank early: the aim drifted out and latency doubled silently
+    Early,
+}
+
+fn score_flip(flip_ns: u64, target_ns: u64, period: u64) -> Aim {
+    if flip_ns > target_ns + period / 2 {
+        Aim::Miss
+    } else if flip_ns + period / 2 < target_ns {
+        Aim::Early
+    } else {
+        Aim::Clean
+    }
+}
+
+/// the sleep instant and the vblank it aims for. the budget is clamped
+/// under one period so a fat estimate degrades to render-at-flip-done
+/// instead of silently slipping the aim a whole frame out
+fn latch_instants(now: u64, flip_ns: u64, period: u64, budget: u64) -> (u64, u64) {
+    let budget = budget.min(period.saturating_sub(MIN_SLACK_NS));
+    let k = (now + budget).saturating_sub(flip_ns).div_ceil(period).max(1);
+    let target = flip_ns + k * period;
+    (target - budget, target)
+}
+
+/// online estimate of the kernel's commit deadline. a missed flip proves
+/// its lead was short, so the estimate jumps decisively above it; met
+/// deadlines walk it back down - fast while the seed is still a guess,
+/// slowly once a miss has located the edge, so probe misses stay far out
+/// in the tail. early flips say nothing about the hardware
+fn cutoff_step(cutoff: u64, aim: Aim, lead_ns: u64, period: u64, settled: bool, held: bool) -> u64 {
+    match aim {
+        Aim::Miss => {
+            // only leads probing the estimate's neighborhood carry
+            // information about the hardware edge. a frame that missed
+            // with a fat lead (session start, gpu stall) failed for some
+            // other reason - the margin doubled on the same miss and
+            // covers it. one such miss used to vault the cutoff onto the
+            // period/2 cap, where the settled decay held it all session,
+            // taxing every latch ~0.75ms
+            if lead_ns <= cutoff + CUTOFF_ATTRIB_NS {
+                cutoff.max(lead_ns + CUTOFF_BUMP_NS).min(period / 2)
+            } else {
+                cutoff
+            }
+        }
+        Aim::Clean if held => cutoff,
+        Aim::Clean => cutoff.saturating_sub(if settled {
+            CUTOFF_DECAY_NS
+        } else {
+            CUTOFF_DECAY_FAST_NS
+        }),
+        Aim::Early => cutoff,
+    }
+}
+
+#[cfg(test)]
+mod sched_tests {
+    use super::*;
+
+    const P: u64 = 2_083_381;
+
+    #[test]
+    fn score_lands_where_it_aims() {
+        assert_eq!(score_flip(10 * P, 10 * P, P), Aim::Clean);
+        assert_eq!(score_flip(10 * P + P / 2 - 1, 10 * P, P), Aim::Clean);
+        assert_eq!(score_flip(11 * P, 10 * P, P), Aim::Miss);
+        assert_eq!(score_flip(9 * P, 10 * P, P), Aim::Early);
+    }
+
+    #[test]
+    fn cutoff_learns_the_commit_deadline() {
+        // a probe miss just under the estimate raises it decisively
+        let c = cutoff_step(200_000, Aim::Miss, 250_000, P, true, false);
+        assert_eq!(c, 250_000 + CUTOFF_BUMP_NS);
+        // a miss with a fat lead teaches nothing - startup poison
+        assert_eq!(cutoff_step(200_000, Aim::Miss, 1_900_000, P, true, false), 200_000);
+        // attributed raises still cap at half a period
+        assert_eq!(
+            cutoff_step(P / 2, Aim::Miss, P / 2 + 50_000, P, true, false),
+            P / 2
+        );
+        // an unsettled seed sheds fast; a settled edge probes slowly
+        assert_eq!(
+            cutoff_step(500_000, Aim::Clean, 500_000, P, false, false),
+            500_000 - CUTOFF_DECAY_FAST_NS
+        );
+        assert_eq!(
+            cutoff_step(300_000, Aim::Clean, 300_000, P, true, false),
+            300_000 - CUTOFF_DECAY_NS
+        );
+        // a fresh raise holds the estimate: no downward probing yet
+        assert_eq!(cutoff_step(300_000, Aim::Clean, 300_000, P, true, true), 300_000);
+        // an early flip says nothing about the hardware
+        assert_eq!(cutoff_step(300_000, Aim::Early, 300_000, P, true, false), 300_000);
+    }
+
+    #[test]
+    fn callback_lead_prices_per_pipeline() {
+        // windowed: compose budget + grace, nothing else
+        assert_eq!(callback_lead(FsContent::Windowed, 900_000, 300_000, P), 1_200_000);
+        // fullscreen shm adds the commit-time upload ride
+        assert_eq!(
+            callback_lead(FsContent::Shm, 900_000, 300_000, P),
+            900_000 + UPLOAD_LEAD_NS + 300_000
+        );
+        // fullscreen dmabuf prices with the scanout budget it was given
+        assert_eq!(callback_lead(FsContent::Dmabuf, 600_000, 300_000, P), 900_000);
+        // an oversized chain clamps to the latest wake the period allows,
+        // never reverting to the early flip-done phase
+        assert_eq!(
+            callback_lead(FsContent::Shm, 1_300_000, 600_000, P),
+            P - CB_HEADROOM_NS
+        );
+    }
+
+    #[test]
+    fn latch_aims_one_vblank_out() {
+        let flip = 100 * P;
+        let (latch, target) = latch_instants(flip + 50_000, flip, P, 900_000);
+        assert_eq!(target, flip + P);
+        assert_eq!(latch, target - 900_000);
+        // a poisoned fat budget clamps under one period instead of
+        // sliding the aim a whole frame out
+        let (latch, target) = latch_instants(flip + 50_000, flip, P, 3 * P);
+        assert_eq!(target, flip + P);
+        assert!(latch > flip);
+        // waking late still aims at a reachable vblank
+        let (_, target) = latch_instants(flip + 3 * P + P / 2, flip, P, 900_000);
+        assert!(target > flip + 3 * P + P / 2);
     }
 }
 
@@ -459,13 +643,37 @@ struct ScanoutFb {
 const SCANOUT_FB_IDLE: u64 = 600;
 
 /// how many misses in a row park late-latching, and how many met deadlines
-/// afterwards un-park it
-const MISS_PARK: u32 = 4;
-const CLEAN_RESTORE: u32 = 240;
+/// afterwards un-park it. at 480Hz a frame is ~2ms: parking on 4 was one
+/// bad batch, and half a second to forgive kept whole passes degraded
+const MISS_PARK: u32 = 16;
+const CLEAN_RESTORE: u32 = 30;
 /// linear decay of the miss margin per met deadline
 const MARGIN_DECAY_NS: u64 = 20_000;
+/// a miss proves the lead was short: land the cutoff this far above it
+const CUTOFF_BUMP_NS: u64 = 25_000;
+/// a miss teaches the cutoff only when its lead was within this of the
+/// estimate; farther out, the failure had some other cause
+const CUTOFF_ATTRIB_NS: u64 = 100_000;
+/// clean frames after a raise before downward probing resumes: one probe
+/// miss per ~8.5s at 480Hz instead of several per round
+const CUTOFF_HOLD_FRAMES: u32 = 4096;
+/// per-met-deadline cutoff decay; ~24us/s at 480Hz, so a probe miss costs
+/// one late frame every few hundred - noise beyond the p99
+const CUTOFF_DECAY_NS: u64 = 50;
+/// until the first miss locates the hardware's edge, the seed sheds at
+/// this rate instead - a fat guess costs half a second, not a session.
+/// measured: a 213us seed excess held fullscreen shm at half rate forever
+const CUTOFF_DECAY_FAST_NS: u64 = 1_000;
 /// a deadline closer than this isn't worth a timer round-trip
 const MIN_SLACK_NS: u64 = 100_000;
+/// extra callback lead when a fullscreen shm surface is up: its commit
+/// submits a gpu copy of the whole mode, and the frame's fence must still
+/// beat the scanout cutoff. ~14.7MB over pcie plus slack; any fatter and
+/// the whole chain stops fitting inside a 480Hz period
+const UPLOAD_LEAD_NS: u64 = 650_000;
+/// the latest a paced wake may land after flip-done: kick, timer, sweep,
+/// and the client's wire round-trip all need this much of the period
+const CB_HEADROOM_NS: u64 = 150_000;
 
 pub struct BlurCache {
     /// full res first, then each kawase level at half the previous
@@ -526,6 +734,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                 continue;
             }
         };
+        state.host_import.set(renderer.host_import_supported());
         // every connected connector with a pipe becomes an output,
         // tiled left to right in global space
         let conns: Vec<Rc<Connector>> = dev
@@ -820,7 +1029,9 @@ pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: boo
     let d = state.display.borrow();
     let out = d.as_ref()?.outputs.borrow().get(out_index)?.clone();
     drop(d);
-    let ops = compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never }, None);
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never }, None, &mut ops, &mut live);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -921,7 +1132,9 @@ pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
         let outs = d.outputs.borrow();
         outs.get(out_slot).cloned().or_else(|| outs.first().cloned())?
     };
-    let ops = compose_ops(state, &out, CapCursor::Never, Some(ws_index));
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    compose_ops(state, &out, CapCursor::Never, Some(ws_index), &mut ops, &mut live);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -1176,6 +1389,9 @@ async fn init_card(
     let renderer = Rc::new(
         Renderer::new(&core, vk::Format::B8G8R8A8_UNORM).map_err(|e| format!("renderer: {e}"))?,
     );
+    if renderer.host_import_supported() {
+        println!("carrot: sealed shm pools sample in place (host import)");
+    }
     Ok((dev, core, renderer, devnum))
 }
 
@@ -1613,6 +1829,8 @@ fn init_output(
         index: Cell::new(0),
         global_name: Cell::new(0),
         damage: AsyncEvent::default(),
+        cb_at: Cell::new(0),
+        cb_kick: AsyncEvent::default(),
         pos: Cell::new((0, 0)),
         ws: Cell::new(0),
         usable: Cell::new(Rect::default()),
@@ -1630,6 +1848,8 @@ fn init_output(
         frame_fences: RefCell::new(Vec::new()),
         present_fbs: RefCell::new(Vec::new()),
         collect_fbs: Cell::new(false),
+        ops_scratch: RefCell::new(Vec::new()),
+        live_scratch: RefCell::new(Vec::new()),
         inflight_fbs: RefCell::new(Vec::new()),
         inflight_vsync: Cell::new(true),
         vrr_warned: Cell::new(false),
@@ -1677,41 +1897,73 @@ fn sched_note_flip(out: &Rc<Output>) {
     if period == 0 || flip_ns == 0 {
         return;
     }
-    if flip_ns > target + period / 2 {
-        // missed the aimed-for vblank: back off multiplicatively, and
-        // after a burst park the policy entirely
-        let m = sched.margin.get().max(MARGIN_DECAY_NS);
-        sched.margin.set((m * 2).min(period));
-        sched.clean.set(0);
-        let misses = sched.misses.get() + 1;
-        sched.misses.set(misses);
-        if misses >= MISS_PARK && !sched.fallback.replace(true) {
-            crate::trace!("late-latch parked after {} misses", misses);
+    let aim = score_flip(flip_ns, target, period);
+    let ioctl = sched.aim_ioctl_ns.replace(0);
+    if ioctl != 0 {
+        let lead = target.saturating_sub(ioctl);
+        let held = sched.cutoff_hold.get() > 0;
+        if held && aim == Aim::Clean {
+            sched.cutoff_hold.set(sched.cutoff_hold.get() - 1);
         }
-    } else {
-        sched.misses.set(0);
-        sched.margin.set(sched.margin.get().saturating_sub(MARGIN_DECAY_NS));
-        let clean = sched.clean.get() + 1;
-        sched.clean.set(clean);
-        if clean >= CLEAN_RESTORE && sched.fallback.replace(false) {
-            crate::trace!("late-latch restored after {} met deadlines", clean);
+        let c = cutoff_step(sched.cutoff.get(), aim, lead, period, sched.cutoff_settled.get(), held);
+        if c > sched.cutoff.get() {
+            sched.cutoff_settled.set(true);
+            sched.cutoff_hold.set(CUTOFF_HOLD_FRAMES);
+            crate::trace!("commit cutoff raised to {}us", c / 1000);
+        }
+        sched.cutoff.set(c);
+    }
+    match aim {
+        Aim::Miss => {
+            // the budget lied: back off multiplicatively, and after a
+            // burst park the policy entirely
+            let m = sched.margin.get().max(MARGIN_DECAY_NS);
+            sched.margin.set((m * 2).min(period / 2));
+            sched.clean.set(0);
+            let misses = sched.misses.get() + 1;
+            sched.misses.set(misses);
+            if misses >= MISS_PARK && !sched.fallback.replace(true) {
+                crate::trace!("late-latch parked after {} misses", misses);
+            }
+        }
+        Aim::Early => {
+            // overshoot is not success; pull the aim back in hard
+            sched.margin.set(sched.margin.get() / 2);
+            sched.clean.set(0);
+            crate::trace!("late-latch early flip: margin halved");
+        }
+        Aim::Clean => {
+            sched.misses.set(0);
+            sched.margin.set(sched.margin.get().saturating_sub(MARGIN_DECAY_NS));
+            let clean = sched.clean.get() + 1;
+            sched.clean.set(clean);
+            if clean >= CLEAN_RESTORE && sched.fallback.replace(false) {
+                crate::trace!("late-latch restored after {} met deadlines", clean);
+            }
         }
     }
 }
 
-/// a frame that is exactly one client buffer needs no compose at all: the
-/// buffer goes on the primary plane and the gpu stays idle. eligibility
-/// mirrors what a present compose would draw - anything beyond the bare
-/// fullscreen surface falls back to compositing
-fn scanout_candidate(
+/// the scene-side half of "one client buffer is the whole frame": a bare
+/// fullscreen surface, mode-sized and opaque, with nothing drawn over it.
+/// scanout and the shm copy path both build on this; anything it rejects
+/// falls back to compositing
+fn fs_surface_candidate(
     state: &Rc<State>,
     out: &Rc<Output>,
 ) -> Option<(Rc<WlSurface>, Rc<crate::protocol::shm::WlBuffer>)> {
+    // every veto names itself under --features trace
+    macro_rules! veto {
+        ($why:literal) => {{
+            crate::trace!(concat!("scanout veto: ", $why));
+            return None;
+        }};
+    }
     if crate::protocol::session_lock::locked(state) || tearing_wanted(state, out) {
-        return None;
+        veto!("locked or tearing");
     }
     if out.anim_pending.get() || out.ws_switch.borrow().is_some() {
-        return None;
+        veto!("animation pending");
     }
     // a composited cursor or drag icon needs pixels
     {
@@ -1725,18 +1977,20 @@ fn scanout_candidate(
                 && d.sw_image.borrow().is_some()
                 && out.rect().contains(seat.ptr_x.get() as i32, seat.ptr_y.get() as i32)
             {
-                return None;
+                veto!("software cursor over output");
             }
             if seat.data.drag().is_some_and(|drag| drag.icon.borrow().is_some()) {
-                return None;
+                veto!("drag icon");
             }
         }
     }
     let ws = state.workspaces.borrow().get(out.ws.get())?.clone();
-    let win = ws.fullscreen.borrow().clone()?;
+    let Some(win) = ws.fullscreen.borrow().clone() else {
+        veto!("no fullscreen window");
+    };
     let cfg = state.config.borrow();
     if cfg.layout.float_above_fullscreen && !ws.floats.borrow().is_empty() {
-        return None;
+        veto!("floats above fullscreen");
     }
     drop(cfg);
     // overlay layers draw above fullscreen
@@ -1745,14 +1999,14 @@ fn scanout_candidate(
             && ls.mapped()
             && ls.output.get() == out.index.get()
     }) {
-        return None;
+        veto!("overlay layer mapped");
     }
     if win.anims_live(state.anim_clock.now()) || win.rule_opacity.get().unwrap_or(1.0) < 1.0 {
-        return None;
+        veto!("window anim or opacity rule");
     }
     let surface = win.surface();
     if !surface.mapped.get() {
-        return None;
+        veto!("surface unmapped");
     }
     if surface
         .children
@@ -1760,52 +2014,120 @@ fn scanout_candidate(
         .as_ref()
         .is_some_and(|ch| ch.below.iter().chain(ch.above.iter()).any(|e| !e.pending.get()))
     {
-        return None;
+        veto!("subsurfaces mapped");
     }
     if let Some(tl) = win.xdg_opt() {
         let mut popups = false;
         tl.xdg.for_each_popup(|p| popups |= p.xdg.surface.mapped.get());
         if popups {
-            return None;
+            veto!("popups mapped");
         }
     }
     if surface.transform.get() != crate::surface::Transform::Normal || surface.scale.get() != 1 {
-        return None;
+        veto!("transform or scale");
     }
-    let buf = surface.buffer.borrow().as_ref()?.buf.clone();
-    let img = buf.dmabuf()?;
+    let Some(buf) = surface.buffer.borrow().as_ref().map(|b| b.buf.clone()) else {
+        veto!("no buffer");
+    };
     // the buffer must be the whole frame: mode-sized, geometry-aligned,
     // and with no alpha for the plane to blend
     if buf.rect.width() != out.width as i32
         || buf.rect.height() != out.height as i32
         || buf.format.has_alpha()
     {
-        return None;
+        veto!("not mode-sized or has alpha");
     }
-    let geo = win.geometry();
-    if geo != Rect::new_sized_saturating(0, 0, buf.rect.width(), buf.rect.height())
-        || win.rect.get() != out.rect()
-    {
-        return None;
+    // the fullscreen slot draws at the output rect no matter what the
+    // layout rect says; only a client-declared geometry inset can offset
+    // the buffer within the surface
+    if win.geometry() != Rect::new_sized_saturating(0, 0, buf.rect.width(), buf.rect.height()) {
+        veto!("geometry mismatch");
     }
+    Some((surface, buf))
+}
+
+/// a frame that is exactly one client buffer needs no compose at all: the
+/// buffer goes on the primary plane and the gpu stays idle
+fn scanout_candidate(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+) -> Option<(Rc<WlSurface>, Rc<crate::protocol::shm::WlBuffer>)> {
+    macro_rules! veto {
+        ($why:literal) => {{
+            crate::trace!(concat!("scanout veto: ", $why));
+            return None;
+        }};
+    }
+    let (surface, buf) = fs_surface_candidate(state, out)?;
+    let Some(img) = buf.dmabuf() else {
+        veto!("not a dmabuf");
+    };
     // the primary plane has to take this format+modifier as-is
     {
         let pipe = out.conn.pipe.borrow();
         let plane = &pipe.as_ref()?.primary;
         if !plane.supports(buf.format.drm) {
-            return None;
+            veto!("plane rejects format");
         }
         let mods = plane.modifiers(buf.format.drm);
         if mods.is_empty() {
             // no IN_FORMATS: only implicit/linear layouts are expressible
             if img.modifier != 0 {
-                return None;
+                veto!("plane has no IN_FORMATS, modifier not linear");
             }
         } else if !mods.contains(&img.modifier) {
-            return None;
+            veto!("plane rejects modifier");
         }
     }
     Some((surface, buf))
+}
+
+/// fullscreen sealed shm: the frame is one gpu copy from the imported
+/// pool into the scanout buffer, no render pass. only in-place
+/// attachments qualify - a shadowed buffer was already released and the
+/// client may be rewriting it
+fn shm_fast_candidate(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+) -> Option<(Rc<WlSurface>, vk::Buffer, u64, u32)> {
+    macro_rules! veto {
+        ($why:literal) => {{
+            crate::trace!(concat!("fast veto: ", $why));
+            return None;
+        }};
+    }
+    let (surface, buf) = fs_surface_candidate(state, out)?;
+    if buf.dmabuf().is_some() {
+        // scanout's case, not ours
+        return None;
+    }
+    // byte-identical to the scanout images; anything else composes
+    if buf.format.drm != XRGB8888.drm {
+        veto!("format not xrgb8888");
+    }
+    let Some(off) = buf.shm_sealed_pool() else {
+        veto!("pool not sealed");
+    };
+    if surface.shm_shadow.borrow().is_some() {
+        veto!("shadowed attachment");
+    }
+    let w = buf.rect.width() as u32;
+    let stride = buf.stride as u32;
+    if stride < w * 4 || stride % 4 != 0 {
+        veto!("stride unusable");
+    }
+    let Some(src) = out.renderer.host_buffer_for(off.pool()) else {
+        veto!("host import unavailable");
+    };
+    Some((surface, src, off.pool_offset() as u64, stride / 4))
+}
+
+/// commit-side mirror of the fast path: the commit-time texture upload is
+/// dead work only when the present loop will actually take the copy path,
+/// so this must be exactly the present-side predicate - a looser check
+/// moves the upload onto the latch path instead of skipping it
+fn fs_fast_bound(state: &Rc<State>, out: &Rc<Output>, s: &crate::surface::WlSurface) -> bool {
+    shm_fast_candidate(state, out).is_some_and(|(surface, ..)| surface.uid == s.uid)
 }
 
 /// the drm framebuffer for a client buffer, imported once per wl_buffer
@@ -1932,8 +2254,13 @@ fn scanout_reset(state: &Rc<State>, out: &Rc<Output>) {
 /// and the vblank it would make. None = no meaningful fixed deadline.
 /// a parked policy still aims - met deadlines are what un-park it - but
 /// the caller skips the sleep
-fn latch_deadline(state: &Rc<State>, out: &Rc<Output>) -> Option<(u64, u64)> {
-    if state.config.borrow().debug.latency_policy != crate::config::LatencyPolicy::LateLatch {
+fn latch_deadline(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    path: PresentPath,
+) -> Option<(u64, u64)> {
+    let policy = state.config.borrow().debug.latency_policy;
+    if policy == crate::config::LatencyPolicy::Vblank {
         return None;
     }
     if vrr_wanted(state, out) || tearing_wanted(state, out) {
@@ -1945,19 +2272,36 @@ fn latch_deadline(state: &Rc<State>, out: &Rc<Output>) -> Option<(u64, u64)> {
     if period == 0 || flip_ns == 0 {
         return None;
     }
+    // the learned cutoff carries the hardware lead now; the floor is just
+    // a user-settable safety minimum under cutoff + margin
     let floor_ns = state
         .config
         .borrow()
         .debug
         .latch_margin_us
         .map(|us| us as u64 * 1000)
-        .unwrap_or(500_000);
-    let budget = out.sched.budget_ns(floor_ns);
+        .unwrap_or(150_000);
+    let budget = out.sched.budget_ns(path, floor_ns);
+    crate::trace!(
+        "budget: compose={}us scanout={}us gpu={}us cutoff={}us margin={}us -> {}us",
+        out.sched.ewma_compose.get() / 1000,
+        out.sched.ewma_scanout.get() / 1000,
+        out.sched.ewma_gpu.get() / 1000,
+        out.sched.cutoff.get() / 1000,
+        out.sched.margin.get() / 1000,
+        budget / 1000
+    );
     let now = Time::now().nsec();
-    // the first vblank whose latch instant is still ahead of us
-    let k = (now + budget).saturating_sub(flip_ns).div_ceil(period).max(1);
-    let target = flip_ns + k * period;
-    Some((target - budget, target))
+    if policy == crate::config::LatencyPolicy::Immediate {
+        // hyprland's bet, expressible here: always aim the very next
+        // vblank. content with headroom still latches late for freshness;
+        // content without gets rendered right now and either makes the
+        // scan or slips a frame - no k-decision to say "won't fit"
+        let k = now.saturating_sub(flip_ns) / period + 1;
+        let target = flip_ns + k * period;
+        return Some((target.saturating_sub(budget).max(now), target));
+    }
+    Some(latch_instants(now, flip_ns, period, budget))
 }
 
 /// both scenes travel one step apart; out exits opposite the in's entry
@@ -2007,10 +2351,17 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             .eng
             .spawn("present cleanup", async move { gpu_cleanup_loop(&st, &o).await })
     };
+    let _pacer = {
+        let st = state.clone();
+        let o = out.clone();
+        state
+            .eng
+            .spawn("callback pacer", async move { callback_pacer(&st, &o).await })
+    };
     let mut dirty = false;
     loop {
         EitherEvent(&out.damage, &out.conn.vblank).await;
-        let _ = out.conn.vblank.take();
+        let flipped = out.conn.vblank.take();
         sched_note_flip(out);
         // the completed flip carries the kernel timestamp its feedbacks
         // have been waiting for
@@ -2048,6 +2399,13 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             if let Some(p) = prev {
                 scanout_retire(state, &p);
             }
+            // dead pools' imports go with their last frame
+            out.renderer.prune_host_imports();
+        }
+        // clients wake level with the latch that will consume their next
+        // commit, not at flip-done: nothing goes stale in the gap
+        if flipped && !out.conn.flip_pending.get() {
+            schedule_callbacks(state, out);
         }
         dirty |= out.damage.take();
         dirty |= out.anim_pending.get();
@@ -2056,9 +2414,20 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             continue;
         }
         // late latch: sleep until just before the last instant that still
-        // makes the coming vblank, so the freshest input and commits glass
+        // makes the coming vblank, so the freshest input and commits glass.
+        // the probe only prices the deadline; the candidate is re-checked
+        // for real after the sleep. vblank policy never sleeps, so it
+        // skips the walk entirely
+        let path = if state.config.borrow().debug.latency_policy
+            != crate::config::LatencyPolicy::Vblank
+            && scanout_candidate(state, out).is_some()
+        {
+            PresentPath::Scanout
+        } else {
+            PresentPath::Compose
+        };
         let mut aim_ns = 0;
-        if let Some((deadline, target)) = latch_deadline(state, out) {
+        if let Some((deadline, target)) = latch_deadline(state, out, path) {
             aim_ns = target;
             if !out.sched.fallback.get() && deadline > Time::now().nsec() + MIN_SLACK_NS {
                 let _ = state.ring.timeout(Time::from_nsec(deadline)).await;
@@ -2084,13 +2453,18 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                         out.inflight_vsync.set(true);
                         out.inflight_zero_copy.set(true);
                         if aim_ns != 0 {
+                            let now = Time::now().nsec();
                             out.sched.target_ns.set(aim_ns);
+                            out.sched.aim_ioctl_ns.set(now);
+                            Sched::ewma(&out.sched.ewma_scanout, now.saturating_sub(latch_ns));
                         }
                         // no compose collected these; they ride directly
                         out.inflight_fbs
                             .borrow_mut()
                             .append(&mut surface.latched_feedbacks.borrow_mut());
-                        surface.shown.set(true);
+                        if !surface.shown.replace(true) {
+                            state.shown_surfaces.borrow_mut().push(surface.clone());
+                        }
                         {
                             let mut st = out.scanout.borrow_mut();
                             if st.cur.as_ref().is_none_or(|c| c.uid != buf.uid) {
@@ -2098,7 +2472,6 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                                 st.prev = st.cur.replace(buf.clone());
                             }
                         }
-                        fire_callback_sweep(state);
                         // captures compose their own copy of the scene; a
                         // scanout frame still owes them the new-frame kick
                         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
@@ -2139,16 +2512,6 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 Err(e) => eprintln!("carrot: out-fence import failed: {e}"),
             }
         }
-
-        let ops = compose(state, out);
-        // clients' in-flight renders gate our sampling of their dmabufs
-        for fence in out.frame_fences.borrow_mut().drain(..) {
-            match out.renderer.import_wait(fence) {
-                Ok(sem) => waits.push(sem),
-                Err(e) => eprintln!("carrot: dmabuf fence import failed: {e}"),
-            }
-        }
-        crate::trace!("present: {} ops, paused={}", ops.len(), out.paused.get());
         let target = FrameTarget {
             image: buf.bo.image,
             view: buf.view,
@@ -2156,22 +2519,66 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             height: out.height,
             undefined: buf.undefined.get(),
         };
-        // one submit: staged uploads, deferred offscreen passes, the scene
-        let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
-        let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
-        let frame = match out.renderer.render_frame(
-            uploads,
-            passes,
-            &target,
-            Some([0.1, 0.1, 0.1, 1.0]),
-            &ops,
-            waits,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("carrot: render failed: {e}");
-                continue;
+
+        // fullscreen sealed shm becomes the frame with one copy into the
+        // scanout buffer: the flip's fence covers just the copy, so an
+        // async commit reaches the plane without paying a render pass
+        let frame = if let Some((surface, src, offset, row_texels)) = shm_fast_candidate(state, out)
+        {
+            crate::trace!("fb-fast: surface #{} t={}", surface.uid, Time::now().nsec());
+            out.present_fbs
+                .borrow_mut()
+                .append(&mut surface.latched_feedbacks.borrow_mut());
+            if !surface.shown.replace(true) {
+                state.shown_surfaces.borrow_mut().push(surface.clone());
             }
+            match out.renderer.copy_frame(src, offset, row_texels, &target, waits) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("carrot: fullscreen copy failed: {e}");
+                    continue;
+                }
+            }
+        } else {
+            let mut ops = out.ops_scratch.take();
+            let mut live = out.live_scratch.take();
+            compose(state, out, &mut ops, &mut live);
+            // clients' in-flight renders gate our sampling of their dmabufs
+            for fence in out.frame_fences.borrow_mut().drain(..) {
+                match out.renderer.import_wait(fence) {
+                    Ok(sem) => waits.push(sem),
+                    Err(e) => eprintln!("carrot: dmabuf fence import failed: {e}"),
+                }
+            }
+            crate::trace!("present: {} ops, paused={}", ops.len(), out.paused.get());
+            // one submit: staged uploads, deferred offscreen passes, the scene
+            let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
+            let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+            let f = match out.renderer.render_frame(
+                uploads,
+                passes,
+                &target,
+                Some([0.1, 0.1, 0.1, 1.0]),
+                &ops,
+                waits,
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("carrot: render failed: {e}");
+                    ops.clear();
+                    live.clear();
+                    out.ops_scratch.replace(ops);
+                    out.live_scratch.replace(live);
+                    continue;
+                }
+            };
+            // scratch back, emptied now: ops hold texture refs the frame in
+            // flight no longer needs from us
+            ops.clear();
+            live.clear();
+            out.ops_scratch.replace(ops);
+            out.live_scratch.replace(live);
+            f
         };
         state.frames_in_flight.set(state.frames_in_flight.get() + 1);
         buf.undefined.set(false);
@@ -2214,8 +2621,12 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                     .borrow_mut()
                     .append(&mut out.present_fbs.borrow_mut());
                 if aim_ns != 0 {
+                    let now = Time::now().nsec();
                     out.sched.target_ns.set(aim_ns);
-                    Sched::ewma(&out.sched.ewma_cpu, submit_ns.saturating_sub(latch_ns));
+                    out.sched.aim_ioctl_ns.set(now);
+                    // through the flip ioctl, not just to submit: the whole
+                    // cpu side of the frame prices the next deadline
+                    Sched::ewma(&out.sched.ewma_compose, now.saturating_sub(latch_ns));
                 }
                 // a composited frame replaces any client buffer on the plane
                 out.inflight_zero_copy.set(false);
@@ -2251,10 +2662,6 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             }
         }
 
-        // callbacks fire the moment the scene is latched and the flip is
-        // queued - the gpu tail is not the client's wait. a client that
-        // renders now still catches the next latch
-        fire_callback_sweep(state);
         // everything gated on the render fence retires off-loop
         let retired = if sync.is_some() {
             std::mem::take(&mut *out.retired_tex.borrow_mut())
@@ -2266,24 +2673,246 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
     }
 }
 
+/// what the next frame's pipeline will be, priced differently per path
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum FsContent {
+    /// composited scene: compose budget only
+    Windowed,
+    /// fullscreen shm: commit-time gpu copy rides ahead of the frame
+    Shm,
+    /// fullscreen dmabuf: straight onto the plane, cheapest chain of all
+    Dmabuf,
+}
+
+/// how far before the vblank clients must wake so their commit makes the
+/// latch, priced by the actual pipeline it will feed. a chain that can't
+/// fit one period clamps to the latest wake the period allows: firing as
+/// late as possible degrades gracefully, where reverting to the flip-done
+/// phase cost a flat ~0.6ms and flapped between phases whenever the
+/// budget wobbled across the boundary
+fn callback_lead(content: FsContent, budget: u64, grace: u64, period: u64) -> u64 {
+    let upload = match content {
+        FsContent::Shm => UPLOAD_LEAD_NS,
+        _ => 0,
+    };
+    (budget + upload + grace).min(period.saturating_sub(CB_HEADROOM_NS))
+}
+
+/// pick when the just-flipped frame's clients should wake: for the aimed
+/// policies, just before the coming latch (minus a grace for the client's
+/// own render), so their commits land fresh instead of going stale in the
+/// flip-done-to-latch gap. commit at V-lead, glass at V. vblank policy
+/// (and chains that can't fit the period) keep the flip-done sweep
+fn schedule_callbacks(state: &Rc<State>, out: &Rc<Output>) {
+    let (policy, floor_us, grace_us) = {
+        let cfg = state.config.borrow();
+        (
+            cfg.debug.latency_policy,
+            cfg.debug.latch_margin_us,
+            cfg.debug.callback_grace_us,
+        )
+    };
+    let period = period_ns(out);
+    let (sec, usec) = out.conn.flip_time.get();
+    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+    if policy == crate::config::LatencyPolicy::Vblank || period == 0 || flip_ns == 0 {
+        fire_callback_sweep(state);
+        return;
+    }
+    let content = state
+        .workspaces
+        .borrow()
+        .get(out.ws.get())
+        .and_then(|ws| ws.fullscreen.borrow().clone())
+        .and_then(|win| {
+            let s = win.surface();
+            let dmabuf = s.buffer.borrow().as_ref().map(|a| a.buf.dmabuf().is_some());
+            dmabuf.map(|d| if d { FsContent::Dmabuf } else { FsContent::Shm })
+        })
+        .unwrap_or(FsContent::Windowed);
+    let floor_ns = floor_us.map(|us| us as u64 * 1000).unwrap_or(150_000);
+    let grace = grace_us.map(|us| us as u64 * 1000).unwrap_or(600_000);
+    // scanout frames never touch the gpu: pricing them with the compose
+    // budget (whose gpu ewma freezes stale during pure-scanout stretches)
+    // overflowed the period and silently unpaced the cheapest path
+    let path = match content {
+        FsContent::Dmabuf => PresentPath::Scanout,
+        _ => PresentPath::Compose,
+    };
+    let budget = out.sched.budget_ns(path, floor_ns);
+    let lead = callback_lead(content, budget, grace, period);
+    crate::trace!(
+        "cb: {:?} budget={}us lead={}us phase=+{}us",
+        content,
+        budget / 1000,
+        lead / 1000,
+        (period.saturating_sub(lead)) / 1000
+    );
+    out.cb_at.set(flip_ns + period - lead);
+    out.cb_kick.trigger();
+}
+
+/// waits out each scheduled wake and runs the sweep; one per output,
+/// coalescing kicks (the sweep drains a shared list, so overlap is cheap)
+async fn callback_pacer(state: &Rc<State>, out: &Rc<Output>) {
+    loop {
+        out.cb_kick.triggered().await;
+        let at = out.cb_at.replace(0);
+        if at == 0 {
+            continue;
+        }
+        if at > Time::now().nsec() {
+            let _ = state.ring.timeout(Time::from_nsec(at)).await;
+        }
+        fire_callback_sweep(state);
+    }
+}
+
 /// frame callbacks for everything some compose (or scanout) marked shown
-/// since the last sweep; clients nobody can see stop rendering into the void
+/// since the last sweep; clients nobody can see stop rendering into the
+/// void. fired at flip-done, so a frame's callbacks land at its glass
 fn fire_callback_sweep(state: &Rc<State>) {
-    let ms = (Time::now().nsec() / 1_000_000) as u32;
     // the cursor surface never rides a scene walk but its client still
     // paces animated cursors off frame callbacks
     if let Some(seat) = state.seat.borrow().clone() {
         if let crate::input::seat::CursorState::Surface(s) = &*seat.cursor.borrow() {
-            s.shown.set(true);
+            if !s.shown.replace(true) {
+                state.shown_surfaces.borrow_mut().push(s.clone());
+            }
         }
     }
-    state.clients.for_each(|c| {
-        c.objects.for_each_surface(|s| {
-            if s.mapped.get() && s.shown.replace(false) {
-                s.fire_frame_callbacks(ms);
+    // only surfaces some compose (or scanout) marked since the last sweep;
+    // nobody walks every client every vblank
+    let mut list = state.shown_surfaces.take();
+    if list.is_empty() {
+        return;
+    }
+    let ms = (Time::now().nsec() / 1_000_000) as u32;
+    for s in list.drain(..) {
+        if s.shown.replace(false) && s.mapped.get() {
+            s.fire_frame_callbacks(ms);
+        }
+    }
+    // hand the capacity back unless a callback handler raced a new mark in
+    let mut slot = state.shown_surfaces.borrow_mut();
+    if slot.is_empty() {
+        *slot = list;
+    }
+}
+
+/// tightly pack client shm rows into upload staging; short reads zero-fill
+/// like the draw-time path, never leaking staging bytes
+pub(crate) fn fill_from_shm(access: &ShmAccess, dst: &mut [u8], bh: u32, row: usize, stride: usize) {
+    match access {
+        ShmAccess::Ptr(p) => unsafe {
+            if stride == row {
+                std::ptr::copy_nonoverlapping(*p, dst.as_mut_ptr(), row * bh as usize);
+            } else {
+                for yy in 0..bh as usize {
+                    std::ptr::copy_nonoverlapping(
+                        p.add(yy * stride),
+                        dst[yy * row..].as_mut_ptr(),
+                        row,
+                    );
+                }
             }
-        });
-    });
+        },
+        ShmAccess::Fd { fd, offset } => {
+            for yy in 0..bh as usize {
+                let dst = &mut dst[yy * row..yy * row + row];
+                let mut done = 0;
+                while done < row {
+                    match rustix::io::pread(fd, &mut dst[done..], (offset + yy * stride + done) as u64)
+                    {
+                        Ok(0) | Err(_) => {
+                            dst[done..].fill(0);
+                            break;
+                        }
+                        Ok(n) => done += n,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// shm pixels ride from the client buffer straight into upload staging the
+/// moment they commit - one copy, off the present's latch path. returns
+/// true when every output holding a size-matched texture got the pixels,
+/// so the caller can skip the shadow and still release the buffer now.
+/// first-draw textures, resizes, and a busy ring report false; those
+/// outputs re-source at draw time as before
+pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> bool {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return false };
+    let buffer = s.buffer.borrow();
+    let Some(att) = buffer.as_ref() else { return false };
+    let buf = &att.buf;
+    if buf.dmabuf().is_some() {
+        return false;
+    }
+    let (bw, bh) = (buf.rect.width() as u32, buf.rect.height() as u32);
+    if bw == 0 || bh == 0 {
+        return false;
+    }
+    let Some(access) = buf.shm_access() else {
+        return false;
+    };
+    let row = (bw * 4) as usize;
+    let stride = buf.stride as usize;
+    if stride < row {
+        return false;
+    }
+    let key = (s.client.id, s.uid);
+    let cur = s.content_gen.get();
+    let mut uploaded = 0usize;
+    let mut missed = false;
+    for out in d.outputs.borrow().iter() {
+        let mut textures = out.textures.borrow_mut();
+        let Some(entry) = textures.get_mut(&key) else {
+            continue;
+        };
+        if entry.0.width != bw || entry.0.height != bh {
+            missed = true;
+            continue;
+        }
+        if entry.1 == cur {
+            uploaded += 1;
+            continue;
+        }
+        // the fullscreen fast path copies straight from the pool at
+        // present; a texture copy here would be dead work riding ahead
+        // of it. the stale gen makes a composed frame re-read the pool
+        if fs_fast_bound(state, out, s) {
+            uploaded += 1;
+            continue;
+        }
+        // sealed pools copy on the gpu straight out of the import; the
+        // cpu only records a command buffer. everyone else fills staging
+        let res = if let Some((hbuf, poff)) = buf.shm_sealed_pool().and_then(|off| {
+            out.renderer
+                .host_buffer_for(off.pool())
+                .map(|b| (b, off.pool_offset()))
+        }) {
+            out.renderer
+                .upload_now_from(&entry.0, hbuf, poff as u64, (stride / 4) as u32)
+        } else {
+            out.renderer
+                .upload_now(&entry.0, |dst| fill_from_shm(&access, dst, bh, row, stride))
+        };
+        match res {
+            Ok(true) => {
+                entry.1 = cur;
+                uploaded += 1;
+            }
+            Ok(false) => missed = true,
+            Err(e) => {
+                crate::trace!("commit upload failed: {e}");
+                missed = true;
+            }
+        }
+    }
+    uploaded > 0 && !missed
 }
 
 /// the render-fence side of a frame: texture retirement, dmabuf release
@@ -2485,13 +3114,17 @@ enum DrawMode {
     Rest,
 }
 
-fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
+fn compose(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+) {
     // presentation feedbacks are claimed only by display composes, never
     // by captures
     out.collect_fbs.set(true);
-    let ops = compose_ops(state, out, CapCursor::Present, None);
+    compose_ops(state, out, CapCursor::Present, None, ops, live);
     out.collect_fbs.set(false);
-    ops
 }
 
 fn compose_ops(
@@ -2499,7 +3132,9 @@ fn compose_ops(
     out: &Rc<Output>,
     cursor: CapCursor,
     ws_override: Option<usize>,
-) -> Vec<RenderOp> {
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+) {
     let present = cursor == CapCursor::Present;
     if present {
         // animations sample the moment this frame will glass, not "now"
@@ -2531,11 +3166,10 @@ fn compose_ops(
     // captures sample at the already-frozen clock and must not disturb
     // the present's redraw latch: their scene isn't the one on glass
     let latch = out.anim_pending.get();
-    let ops = compose_scene(state, out, cursor, ws_override);
+    compose_scene(state, out, cursor, ws_override, ops, live);
     if !present {
         out.anim_pending.set(latch);
     }
-    ops
 }
 
 fn compose_scene(
@@ -2543,7 +3177,9 @@ fn compose_scene(
     out: &Rc<Output>,
     cursor: CapCursor,
     ws_override: Option<usize>,
-) -> Vec<RenderOp> {
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+) {
     let mode = if cursor == CapCursor::Present {
         DrawMode::Present
     } else if ws_override.is_some() {
@@ -2551,20 +3187,20 @@ fn compose_scene(
     } else {
         DrawMode::Capture
     };
-    let mut ops = Vec::new();
-    let mut live: Vec<((ClientId, u64), u64)> = Vec::new();
+    ops.clear();
+    live.clear();
     // a locked session shows nothing but the lock surface; an output
     // without one stays a cleared frame
     if crate::protocol::session_lock::locked(state) {
         let screen = out.rect();
         if let Some(s) = crate::protocol::session_lock::compose_locked(state, &out.conn.name) {
-            draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, 0.0, &mut ops, &mut live);
+            draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, 0.0, ops, live);
         }
         if cursor != CapCursor::Never {
-            draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
+            draw_sw_cursor(state, out, ops, cursor == CapCursor::Always);
         }
         if mode != DrawMode::Present {
-            return ops;
+            return;
         }
         // normal content must not keep textures alive across the lock
         let mut textures = out.textures.borrow_mut();
@@ -2579,13 +3215,13 @@ fn compose_scene(
             }
         }
         drop(textures);
-        return ops;
+        return;
     }
     let ws = {
         let list = state.workspaces.borrow();
         match list.get(ws_override.unwrap_or(out.ws.get())) {
             Some(w) => w.clone(),
-            None => return ops,
+            None => return,
         }
     };
     let focused = state
@@ -2604,8 +3240,8 @@ fn compose_scene(
     // rest composes pin layers too: no anim transforms, no prunes
     let lrest = mode == DrawMode::Rest;
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live, lrest);
-        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live, lrest);
+        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, ops, live, lrest);
+        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, ops, live, lrest);
     }
     let sw = out.ws_switch.borrow().clone();
     let now = state.anim_clock.now();
@@ -2621,12 +3257,12 @@ fn compose_scene(
             let from = state.workspaces.borrow().get(s.from_ws).cloned();
             if let Some(from) = from {
                 let mark = ops.len();
-                ws_scene(state, out, &from, &focused, &cfg, screen, &mut ops, &mut live, mode);
+                ws_scene(state, out, &from, &focused, &cfg, screen, ops, live, mode);
                 let d = if s.vert { [0.0, off_out as f32] } else { [off_out as f32, 0.0] };
                 apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_out, d, out_dims(out));
             }
             let mark = ops.len();
-            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live, mode);
+            ws_scene(state, out, &ws, &focused, &cfg, screen, ops, live, mode);
             let d = if s.vert { [0.0, off_in as f32] } else { [off_in as f32, 0.0] };
             apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_in, d, out_dims(out));
             out.anim_pending.set(true);
@@ -2635,15 +3271,15 @@ fn compose_scene(
             if sw.is_some() && mode == DrawMode::Present {
                 *out.ws_switch.borrow_mut() = None;
             }
-            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live, mode);
+            ws_scene(state, out, &ws, &focused, &cfg, screen, ops, live, mode);
         }
     }
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live, lrest);
-        draw_closing_list(state, out, &out.closing_layers, &mut ops, mode);
+        draw_layer(state, out, crate::shell::layer::TOP, screen, ops, live, lrest);
+        draw_closing_list(state, out, &out.closing_layers, ops, mode);
     }
-    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live, lrest);
-    draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
+    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, ops, live, lrest);
+    draw_layer_popups(state, out, fs.is_some(), screen, ops, live);
     // a drag icon rides the pointer, above everything but the cursor
     if ws_override.is_none() {
         if let Some(seat) = state.seat.borrow().clone() {
@@ -2651,24 +3287,24 @@ fn compose_scene(
                 if let Some(icon) = drag.icon.borrow().clone() {
                     let (dx, dy) = drag.icon_off.get();
                     let (px, py) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
-                    draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, 0.0, &mut ops, &mut live);
+                    draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, 0.0, ops, live);
                 }
             }
         }
     }
     if cursor != CapCursor::Never {
-        draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
+        draw_sw_cursor(state, out, ops, cursor == CapCursor::Always);
     }
 
     // an override composes a side scene: mark its sources so the present
     // sweep keeps them cached between ticks instead of evict/import churn
     if ws_override.is_some() {
-        note_cast_keys(out, &live);
-        return ops;
+        note_cast_keys(out, live);
+        return;
     }
     // captures observe; only the present's sweep evicts
     if mode != DrawMode::Present {
-        return ops;
+        return;
     }
     // textures for gone buffers don't outlive the frame, except cast
     // sources fed within the last second
@@ -2687,7 +3323,6 @@ fn compose_scene(
             out.retired_tex.borrow_mut().push(t);
         }
     }
-    ops
 }
 
 /// below children, surface, above children - in index order
@@ -2705,7 +3340,9 @@ fn draw_surface_tree(
     if !surface.mapped.get() {
         return;
     }
-    surface.shown.set(true);
+    if !surface.shown.replace(true) {
+        surface.client.state.shown_surfaces.borrow_mut().push(surface.clone());
+    }
     if out.collect_fbs.get() {
         let mut latched = surface.latched_feedbacks.borrow_mut();
         if !latched.is_empty() {
@@ -2951,6 +3588,24 @@ fn draw_buffer(
         // unchanged surface samples the texture it already has
         let cur = s.content_gen.get();
         let entry = textures.get_mut(&key).unwrap();
+        if entry.1 != cur {
+            // sealed pools sample in place: the gpu copies straight out of
+            // the imported client pages, no cpu byte ever moves
+            if let Some((hbuf, poff)) = buf.shm_sealed_pool().and_then(|off| {
+                out.renderer
+                    .host_buffer_for(off.pool())
+                    .map(|b| (b, off.pool_offset()))
+            }) {
+                let up = out.renderer.external_pre_upload(
+                    &entry.0,
+                    hbuf,
+                    poff as u64,
+                    (buf.stride / 4) as u32,
+                );
+                out.preuploads.borrow_mut().push(up);
+                entry.1 = cur;
+            }
+        }
         if entry.1 != cur {
             let shadow = s.shm_shadow.borrow();
             let row = (bw * 4) as usize;

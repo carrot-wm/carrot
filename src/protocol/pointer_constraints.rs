@@ -36,9 +36,6 @@ pub struct Constraint {
     pub dead: Cell<bool>,
     pub hint: Cell<Option<(f64, f64)>>,
     pub region: RefCell<Option<Rc<crate::rect::Region>>>,
-    /// the surface's global origin, captured at activation - the hint is
-    /// surface-local and must resolve against where the lock began
-    pub origin: Cell<(i32, i32)>,
 }
 
 impl Constraint {
@@ -139,7 +136,6 @@ impl ConstraintsManager {
             dead: Cell::new(false),
             hint: Cell::new(None),
             region: RefCell::new(region),
-            origin: Cell::new((0, 0)),
         });
         match kind {
             Kind::Lock => c.add_client_obj(Rc::new(LockedPointer {

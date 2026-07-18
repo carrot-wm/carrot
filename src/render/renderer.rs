@@ -9,7 +9,8 @@ use crate::render::shaders;
 use crate::render::vulkan::{RenderError, VkCore};
 use ash::vk;
 use std::cell::{Cell, RefCell};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
 // -- push constants; layouts mirror the hand-built spir-v --
@@ -241,8 +242,9 @@ impl PrePass {
     }
 }
 
-/// a filled staging buffer waiting for its copy; recorded before every
-/// draw pass of the frame, freed when the frame's fence signals
+/// a buffer-to-image copy waiting to record before the frame's draw
+/// passes. either owned staging (filled by the cpu, freed at frame
+/// retire) or a view into an imported client pool (never freed here)
 pub struct PreUpload {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -250,6 +252,59 @@ pub struct PreUpload {
     width: u32,
     height: u32,
     undefined: bool,
+    /// byte offset of the first pixel within `buffer`
+    offset: u64,
+    /// source row stride in texels; 0 = tightly packed
+    row_texels: u32,
+    /// owned staging is freed with the frame; imports belong to the pool
+    owned: bool,
+}
+
+/// a commit-time upload in flight: its staging survives until the fence
+/// says the copy retired, then the slot (and its capacity) recycles
+struct UploadSlot {
+    cb: vk::CommandBuffer,
+    fence: vk::Fence,
+    buf: vk::Buffer,
+    mem: vk::DeviceMemory,
+    cap: u64,
+    ptr: *mut u8,
+}
+
+impl UploadSlot {
+    fn new(dev: &ash::Device, pool: vk::CommandPool) -> Result<UploadSlot, RenderError> {
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { dev.allocate_command_buffers(&alloc) }?[0];
+        let fence = unsafe {
+            dev.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        }?;
+        Ok(UploadSlot {
+            cb,
+            fence,
+            buf: vk::Buffer::null(),
+            mem: vk::DeviceMemory::null(),
+            cap: 0,
+            ptr: std::ptr::null_mut(),
+        })
+    }
+}
+
+/// enough for a burst of commits in one cycle; a busy ring falls back to
+/// the draw-time staging path, never blocks
+const UPLOAD_SLOTS: usize = 3;
+
+/// a sealed client pool imported as gpu-visible memory; the held Rc keeps
+/// the mapping alive for as long as the import exists
+struct HostImport {
+    mem: Rc<crate::clientmem::ClientMem>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
 }
 
 /// offscreen target + readback buffer the captures reuse call to call
@@ -327,6 +382,8 @@ pub struct Renderer {
     free_cbs: RefCell<Vec<vk::CommandBuffer>>,
     tex_uid: Cell<u64>,
     capture: RefCell<Option<CaptureTarget>>,
+    upload_slots: RefCell<Vec<UploadSlot>>,
+    host_imports: RefCell<HashMap<usize, HostImport>>,
 }
 
 impl Renderer {
@@ -499,6 +556,8 @@ impl Renderer {
             free_cbs: RefCell::new(Vec::new()),
             tex_uid: Cell::new(0),
             capture: RefCell::new(None),
+            upload_slots: RefCell::new(Vec::new()),
+            host_imports: RefCell::new(HashMap::new()),
         })
     }
 
@@ -590,6 +649,69 @@ impl Renderer {
         self.submit_frame(cb, waits, uploads)
     }
 
+    /// a fullscreen client buffer becomes the whole frame: one
+    /// buffer->image copy into the scanout target, no render pass. the
+    /// caller flips on the returned frame's fence like any composed frame
+    pub fn copy_frame(
+        &self,
+        src: vk::Buffer,
+        offset: u64,
+        row_texels: u32,
+        target: &FrameTarget,
+        waits: Vec<vk::Semaphore>,
+    ) -> Result<Frame, RenderError> {
+        let dev = &self.core.device;
+        let cb = self.take_cb()?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        // take the target from the display side, hand it back after
+        let acquire = [image_barrier(target.image)
+            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .dst_queue_family_index(self.core.queue_family)
+            .old_layout(if target.undefined {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                vk::ImageLayout::GENERAL
+            })
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+        barrier2(dev, cb, &acquire);
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(offset)
+            .buffer_row_length(row_texels)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: target.width,
+                height: target.height,
+                depth: 1,
+            });
+        unsafe {
+            dev.cmd_copy_buffer_to_image(
+                cb,
+                src,
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+        let release = [image_barrier(target.image)
+            .src_queue_family_index(self.core.queue_family)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+        barrier2(dev, cb, &release);
+        unsafe { dev.end_command_buffer(cb) }?;
+        self.submit_frame(cb, waits, Vec::new())
+    }
+
     /// staging copies, then the offscreen pre-passes in list order
     fn record_pre(&self, cb: vk::CommandBuffer, uploads: &[PreUpload], passes: &[PrePass]) {
         let dev = &self.core.device;
@@ -613,6 +735,8 @@ impl Renderer {
             barrier2(dev, cb, &to_dst);
             for u in uploads {
                 let region = vk::BufferImageCopy::default()
+                    .buffer_offset(u.offset)
+                    .buffer_row_length(u.row_texels)
                     .image_subresource(
                         vk::ImageSubresourceLayers::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1205,8 +1329,10 @@ impl Renderer {
                 self.core.device.destroy_semaphore(*s, None);
             }
             for u in &frame.staging {
-                self.core.device.destroy_buffer(u.buffer, None);
-                self.core.device.free_memory(u.memory, None);
+                if u.owned {
+                    self.core.device.destroy_buffer(u.buffer, None);
+                    self.core.device.free_memory(u.memory, None);
+                }
             }
         }
         self.free_cbs.borrow_mut().push(frame.cb);
@@ -1694,9 +1820,423 @@ impl Renderer {
             width: tex.width,
             height: tex.height,
             undefined: tex.undefined.get(),
+            offset: 0,
+            row_texels: 0,
+            owned: true,
         };
         tex.undefined.set(false);
         Ok(up)
+    }
+
+    /// a copy straight out of an imported client pool: no staging, no cpu
+    /// bytes moved. the pool import outlives the frame on its own
+    pub fn external_pre_upload(
+        &self,
+        tex: &Texture,
+        buffer: vk::Buffer,
+        offset: u64,
+        row_texels: u32,
+    ) -> PreUpload {
+        let up = PreUpload {
+            buffer,
+            memory: vk::DeviceMemory::null(),
+            image: tex.image,
+            width: tex.width,
+            height: tex.height,
+            undefined: tex.undefined.get(),
+            offset,
+            row_texels,
+            owned: false,
+        };
+        tex.undefined.set(false);
+        up
+    }
+
+    pub fn host_import_supported(&self) -> bool {
+        self.core.ext_host.is_some()
+    }
+
+    /// the vk buffer viewing a sealed client pool, importing on first
+    /// sight. holding the pool's Rc keeps the mapping alive; prune drops
+    /// imports whose pool object is otherwise gone
+    pub fn host_buffer_for(
+        &self,
+        mem: &Rc<crate::clientmem::ClientMem>,
+    ) -> Option<vk::Buffer> {
+        let key = Rc::as_ptr(mem) as usize;
+        if let Some(e) = self.host_imports.borrow().get(&key) {
+            // a null entry remembers a pool that can't import (write-sealed
+            // memfds and the like), so commits stop retrying the syscalls
+            if e.buffer == vk::Buffer::null() {
+                return None;
+            }
+            return Some(e.buffer);
+        }
+        // host-pointer import first (no page pinning); drivers that reject
+        // file-backed pages there get the udmabuf bridge instead
+        let (buffer, memory) = self
+            .import_host_ptr(mem)
+            .or_else(|| self.import_udmabuf(mem))
+            .unwrap_or((vk::Buffer::null(), vk::DeviceMemory::null()));
+        self.host_imports.borrow_mut().insert(
+            key,
+            HostImport {
+                mem: mem.clone(),
+                buffer,
+                memory,
+            },
+        );
+        (buffer != vk::Buffer::null()).then_some(buffer)
+    }
+
+    fn import_host_ptr(
+        &self,
+        mem: &Rc<crate::clientmem::ClientMem>,
+    ) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+        let Some(ext) = self.core.ext_host.as_ref() else {
+            crate::trace!("host import: ext missing");
+            return None;
+        };
+        let dev = &self.core.device;
+        let ptr = mem.base_ptr();
+        let len = mem.mapped_len() as u64;
+        let align = self.core.host_align;
+        if ptr.is_null() || len == 0 || (ptr as u64) % align != 0 || len % align != 0 {
+            crate::trace!(
+                "host import: alignment ptr%a={} len%a={} len={} a={}",
+                (ptr as u64) % align,
+                len % align,
+                len,
+                align
+            );
+            return None;
+        }
+        let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
+        let res = unsafe {
+            (ext.fp().get_memory_host_pointer_properties_ext)(
+                ext.device(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                ptr.cast(),
+                &mut host_props,
+            )
+        };
+        if res != vk::Result::SUCCESS {
+            crate::trace!("host import: props query {res:?}");
+            return None;
+        }
+        let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let buf_info = vk::BufferCreateInfo::default()
+            .size(len)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .push_next(&mut ext_info);
+        let buf = match unsafe { dev.create_buffer(&buf_info, None) } {
+            Ok(b) => b,
+            Err(e) => {
+                crate::trace!("host import: create buffer {e}");
+                return None;
+            }
+        };
+        let buf_guard = crate::util::OnDrop(|| unsafe { dev.destroy_buffer(buf, None) });
+        let reqs = unsafe { dev.get_buffer_memory_requirements(buf) };
+        let bits = reqs.memory_type_bits & host_props.memory_type_bits;
+        if bits == 0 || reqs.size > len {
+            crate::trace!(
+                "host import: no fit bits={:#x}&{:#x} req={} len={}",
+                reqs.memory_type_bits,
+                host_props.memory_type_bits,
+                reqs.size,
+                len
+            );
+            return None;
+        }
+        let mem_type = bits.trailing_zeros();
+        let mut import_info = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+            .host_pointer(ptr.cast_mut().cast());
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(len)
+            .memory_type_index(mem_type)
+            .push_next(&mut import_info);
+        let vmem = match unsafe { dev.allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                crate::trace!("host import: alloc {e}");
+                return None;
+            }
+        };
+        if let Err(e) = unsafe { dev.bind_buffer_memory(buf, vmem, 0) } {
+            crate::trace!("host import: bind {e}");
+            unsafe { dev.free_memory(vmem, None) };
+            return None;
+        }
+        std::mem::forget(buf_guard);
+        Some((buf, vmem))
+    }
+
+    /// dmabuf-bridge import: the pool's udmabuf binds as a transfer source.
+    /// covers drivers whose host-pointer path rejects file-backed pages
+    fn import_udmabuf(
+        &self,
+        mem: &Rc<crate::clientmem::ClientMem>,
+    ) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+        let dev = &self.core.device;
+        let dmabuf = mem.udmabuf()?;
+        let len = mem.mapped_len() as u64;
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        if let Err(e) = unsafe {
+            self.core.ext_mem_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                dmabuf.as_raw_fd(),
+                &mut fd_props,
+            )
+        } {
+            crate::trace!("udmabuf import: fd props {e}");
+            return None;
+        }
+        let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let buf_info = vk::BufferCreateInfo::default()
+            .size(len)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .push_next(&mut ext_info);
+        let buf = match unsafe { dev.create_buffer(&buf_info, None) } {
+            Ok(b) => b,
+            Err(e) => {
+                crate::trace!("udmabuf import: create buffer {e}");
+                return None;
+            }
+        };
+        let buf_guard = crate::util::OnDrop(|| unsafe { dev.destroy_buffer(buf, None) });
+        let reqs = unsafe { dev.get_buffer_memory_requirements(buf) };
+        let bits = reqs.memory_type_bits & fd_props.memory_type_bits;
+        if bits == 0 || reqs.size > len {
+            crate::trace!(
+                "udmabuf import: no fit bits={:#x}&{:#x} req={} len={}",
+                reqs.memory_type_bits,
+                fd_props.memory_type_bits,
+                reqs.size,
+                len
+            );
+            return None;
+        }
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buf);
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(dmabuf.as_raw_fd());
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(len)
+            .memory_type_index(bits.trailing_zeros())
+            .push_next(&mut import)
+            .push_next(&mut dedicated);
+        let vmem = match unsafe { dev.allocate_memory(&alloc, None) } {
+            Ok(m) => {
+                // the device owns the fd now
+                std::mem::forget(dmabuf);
+                m
+            }
+            Err(e) => {
+                crate::trace!("udmabuf import: alloc {e}");
+                return None;
+            }
+        };
+        if let Err(e) = unsafe { dev.bind_buffer_memory(buf, vmem, 0) } {
+            crate::trace!("udmabuf import: bind {e}");
+            unsafe { dev.free_memory(vmem, None) };
+            return None;
+        }
+        std::mem::forget(buf_guard);
+        Some((buf, vmem))
+    }
+
+    /// drop imports whose pool object nobody else holds anymore. call
+    /// between frames - never while a submitted frame may still read them
+    pub fn prune_host_imports(&self) {
+        let dev = &self.core.device;
+        self.host_imports.borrow_mut().retain(|_, e| {
+            if Rc::strong_count(&e.mem) > 1 {
+                return true;
+            }
+            unsafe {
+                dev.destroy_buffer(e.buffer, None);
+                dev.free_memory(e.memory, None);
+            }
+            false
+        });
+    }
+
+    /// commit-time upload: fill staging and put the copy on the queue right
+    /// now, so the frame that samples this texture pays nothing for it.
+    /// same-queue submission order is the only synchronization needed.
+    /// Ok(false) = ring busy, the draw-time staging path covers it
+    pub fn upload_now(
+        &self,
+        tex: &Texture,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<bool, RenderError> {
+        let dev = &self.core.device;
+        let size = (tex.width * tex.height * 4) as u64;
+        let mut slots = self.upload_slots.borrow_mut();
+        let mut idx = None;
+        for (i, s) in slots.iter().enumerate() {
+            if unsafe { dev.get_fence_status(s.fence) }? {
+                idx = Some(i);
+                break;
+            }
+        }
+        let idx = match idx {
+            Some(i) => i,
+            None if slots.len() < UPLOAD_SLOTS => {
+                slots.push(UploadSlot::new(dev, self.pool)?);
+                slots.len() - 1
+            }
+            None => return Ok(false),
+        };
+        let slot = &mut slots[idx];
+        if slot.cap < size {
+            unsafe {
+                if slot.buf != vk::Buffer::null() {
+                    dev.destroy_buffer(slot.buf, None);
+                    dev.free_memory(slot.mem, None);
+                }
+            }
+            slot.buf = vk::Buffer::null();
+            slot.cap = 0;
+            slot.ptr = std::ptr::null_mut();
+            let buf_info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC);
+            let buf = unsafe { dev.create_buffer(&buf_info, None) }?;
+            let buf_guard = crate::util::OnDrop(|| unsafe { dev.destroy_buffer(buf, None) });
+            let reqs = unsafe { dev.get_buffer_memory_requirements(buf) };
+            let mem_type = self.core.find_memory_type(
+                reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size)
+                .memory_type_index(mem_type);
+            let mem = unsafe { dev.allocate_memory(&alloc, None) }?;
+            let mem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(mem, None) });
+            unsafe {
+                dev.bind_buffer_memory(buf, mem, 0)?;
+                // persistent map: the slot's staging lives as long as it does
+                slot.ptr = dev.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+            }
+            std::mem::forget(mem_guard);
+            std::mem::forget(buf_guard);
+            slot.buf = buf;
+            slot.mem = mem;
+            slot.cap = size;
+        }
+        fill(unsafe { std::slice::from_raw_parts_mut(slot.ptr, size as usize) });
+        let (cb, fence, buf) = (slot.cb, slot.fence, slot.buf);
+        drop(slots);
+        self.record_and_submit_upload(cb, fence, tex, buf, 0, 0)?;
+        Ok(true)
+    }
+
+    /// commit-time upload with zero cpu bytes: the ring copies straight
+    /// from an imported client pool during the idle gap before the latch.
+    /// Ok(false) = ring busy, the draw-time path covers it
+    pub fn upload_now_from(
+        &self,
+        tex: &Texture,
+        src: vk::Buffer,
+        offset: u64,
+        row_texels: u32,
+    ) -> Result<bool, RenderError> {
+        let dev = &self.core.device;
+        let mut slots = self.upload_slots.borrow_mut();
+        let mut idx = None;
+        for (i, s) in slots.iter().enumerate() {
+            if unsafe { dev.get_fence_status(s.fence) }? {
+                idx = Some(i);
+                break;
+            }
+        }
+        let idx = match idx {
+            Some(i) => i,
+            None if slots.len() < UPLOAD_SLOTS => {
+                slots.push(UploadSlot::new(dev, self.pool)?);
+                slots.len() - 1
+            }
+            None => return Ok(false),
+        };
+        let (cb, fence) = (slots[idx].cb, slots[idx].fence);
+        drop(slots);
+        self.record_and_submit_upload(cb, fence, tex, src, offset, row_texels)?;
+        Ok(true)
+    }
+
+    fn record_and_submit_upload(
+        &self,
+        cb: vk::CommandBuffer,
+        fence: vk::Fence,
+        tex: &Texture,
+        src: vk::Buffer,
+        offset: u64,
+        row_texels: u32,
+    ) -> Result<(), RenderError> {
+        let dev = &self.core.device;
+        unsafe {
+            dev.begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+        }
+        let to_dst = [image_barrier(tex.image)
+            .old_layout(if tex.undefined.get() {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            })
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+        barrier2(dev, cb, &to_dst);
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(offset)
+            .buffer_row_length(row_texels)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: tex.width,
+                height: tex.height,
+                depth: 1,
+            });
+        unsafe {
+            dev.cmd_copy_buffer_to_image(
+                cb,
+                src,
+                tex.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+        let to_sample = [image_barrier(tex.image)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
+        barrier2(dev, cb, &to_sample);
+        unsafe {
+            dev.end_command_buffer(cb)?;
+            dev.reset_fences(&[fence])?;
+            let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+            let submit = vk::SubmitInfo2::default().command_buffer_infos(&cbs);
+            dev.queue_submit2(self.core.queue, &[submit], fence)?;
+        }
+        tex.undefined.set(false);
+        Ok(())
     }
 }
 
@@ -1730,6 +2270,17 @@ impl Drop for Renderer {
             dev.destroy_pipeline_layout(self.tex_layout, None);
             dev.destroy_descriptor_set_layout(self.tex_set_layout, None);
             dev.destroy_sampler(self.sampler, None);
+            for s in self.upload_slots.borrow_mut().drain(..) {
+                if s.buf != vk::Buffer::null() {
+                    dev.destroy_buffer(s.buf, None);
+                    dev.free_memory(s.mem, None);
+                }
+                dev.destroy_fence(s.fence, None);
+            }
+            for (_, e) in self.host_imports.borrow_mut().drain() {
+                dev.destroy_buffer(e.buffer, None);
+                dev.free_memory(e.memory, None);
+            }
             dev.destroy_command_pool(self.pool, None);
         }
     }

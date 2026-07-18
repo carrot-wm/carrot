@@ -2,11 +2,13 @@
 // against shrinking can never SIGBUS; unsealed pools are read through their fd
 // instead of the mapping, so the process needs no signal handler.
 
-use rustix::fs::{SealFlags, fcntl_get_seals, fstat, ftruncate};
+use rustix::fs::{Mode, OFlags, SealFlags, fcntl_get_seals, fstat, ftruncate, open};
 use rustix::io::Errno;
+use rustix::ioctl::{Ioctl, IoctlOutput, Opcode, ioctl, opcode};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
+use std::ffi::c_void;
 use std::fmt;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -83,6 +85,50 @@ impl ClientMem {
         self.requested
     }
 
+    /// sealed against shrinking: the mapping (and anything importing it)
+    /// can never fault
+    pub fn sealed(&self) -> bool {
+        self.sealed
+    }
+
+    pub fn base_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+
+    /// page-rounded mapping length
+    pub fn mapped_len(&self) -> usize {
+        self.len
+    }
+
+    /// bridge a sealed pool to a dmabuf through the kernel's udmabuf
+    /// device, for drivers whose host-pointer import rejects file-backed
+    /// pages. the fd pins the pool's pages until every importer lets go
+    pub fn udmabuf(&self) -> Option<OwnedFd> {
+        if !self.sealed || self.len == 0 {
+            return None;
+        }
+        let dev = match open("/dev/udmabuf", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                crate::trace!("udmabuf: open {e}");
+                return None;
+            }
+        };
+        let mut arg = udmabuf_create {
+            memfd: self.fd.as_raw_fd() as u32,
+            flags: UDMABUF_FLAGS_CLOEXEC,
+            offset: 0,
+            size: self.len as u64,
+        };
+        match unsafe { ioctl(&dev, UdmabufCreate { data: &mut arg }) } {
+            Ok(fd) => Some(unsafe { OwnedFd::from_raw_fd(fd) }),
+            Err(e) => {
+                crate::trace!("udmabuf: create {e}");
+                None
+            }
+        }
+    }
+
     pub fn offset(self: &Rc<Self>, offset: usize) -> ClientMemOffset {
         ClientMemOffset {
             mem: self.clone(),
@@ -113,6 +159,14 @@ pub enum ShmAccess<'a> {
 }
 
 impl ClientMemOffset {
+    pub fn pool(&self) -> &Rc<ClientMem> {
+        &self.mem
+    }
+
+    pub fn pool_offset(&self) -> usize {
+        self.offset
+    }
+
     /// writes go through the fd: the mapping is PROT_READ only
     pub fn write_target(&self) -> (&Rc<OwnedFd>, usize) {
         (&self.mem.fd, self.offset)
@@ -128,5 +182,39 @@ impl ClientMemOffset {
                 offset: self.offset,
             }
         }
+    }
+}
+
+// -- udmabuf plumbing --
+
+const UDMABUF_FLAGS_CLOEXEC: u32 = 0x01;
+
+#[repr(C)]
+struct udmabuf_create {
+    memfd: u32,
+    flags: u32,
+    offset: u64,
+    size: u64,
+}
+
+struct UdmabufCreate<'a> {
+    data: &'a mut udmabuf_create,
+}
+
+unsafe impl Ioctl for UdmabufCreate<'_> {
+    // the ioctl's return value is the new dmabuf fd
+    type Output = i32;
+    const IS_MUTATING: bool = false;
+
+    fn opcode(&self) -> Opcode {
+        opcode::write::<udmabuf_create>(b'u', 0x42)
+    }
+
+    fn as_ptr(&mut self) -> *mut c_void {
+        (self.data as *mut udmabuf_create).cast()
+    }
+
+    unsafe fn output_from_ptr(out: IoctlOutput, _: *mut c_void) -> rustix::io::Result<i32> {
+        Ok(out)
     }
 }

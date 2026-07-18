@@ -238,7 +238,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -696,7 +696,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -918,9 +918,9 @@ dependencies = [
 
 [[package]]
 name = "taproot-origin"
-version = "0.26.3"
+version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c62b608cbfe78162e14456957c4adf798d8ea9d3eeac3209850f37b92cdfcce7"
+checksum = "a56ddf3eb4a64402dc156cb1d035fbb67ee1c9fdc25f18d19f55951bbb1333d5"
 dependencies = [
  "bitflags 2.13.0",
  "linux-raw-sys 0.9.4",

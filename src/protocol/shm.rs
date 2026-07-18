@@ -217,6 +217,16 @@ pub enum BufferStorage {
     Dmabuf(DmabufImage),
 }
 
+impl WlBuffer {
+    /// shm backed by a sealed pool: safe to import and sample in place
+    pub fn shm_sealed_pool(&self) -> Option<&ClientMemOffset> {
+        match &self.storage {
+            BufferStorage::Shm(off) if off.pool().sealed() => Some(off),
+            _ => None,
+        }
+    }
+}
+
 pub struct DmabufImage {
     pub planes: Vec<DmabufPlane>,
     pub modifier: u64,

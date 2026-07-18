@@ -23,10 +23,12 @@ impl WlDisplay {
 impl wl_display::Handler for WlDisplay {
     fn sync(&self, req: wl_display::sync::Request) -> Result<(), Box<dyn std::error::Error>> {
         let c = &self.client;
-        c.add_client_obj(Rc::new(WlCallback { id: req.callback }))?;
+        // the callback lives for exactly this request, so it never enters
+        // the table: no allocation, no insert/remove, same wire traffic
+        c.objects.vacant_client_id(req.callback)?;
         // done argument is unspecified, stays 0
         c.event(|o| wl_callback::done::send(o, req.callback, 0));
-        c.remove_obj(req.callback)?;
+        c.event(|o| wl_display::delete_id::send(o, WL_DISPLAY_ID, req.callback.0));
         Ok(())
     }
 

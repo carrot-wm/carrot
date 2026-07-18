@@ -2402,6 +2402,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unlock_hint_resolves_the_surface_position_at_release() {
+        use crate::protocol::interfaces::{zwp_locked_pointer_v1, zwp_pointer_constraints_v1};
+        use crate::protocol::pointer_constraints::{ConstraintsManager, LockedPointer};
+        use crate::protocol::Fixed;
+        use zwp_locked_pointer_v1::Handler as _;
+        use zwp_pointer_constraints_v1::Handler as _;
+
+        // pointer parked over the second tile; lock it there
+        let (state, client, seat, _tl1, tl2) = grab_setup();
+        let s2 = tl2.xdg.surface.clone();
+        let mgr = ConstraintsManager {
+            id: ObjectId(70),
+            client: client.clone(),
+            version: 1,
+        };
+        mgr.lock_pointer(zwp_pointer_constraints_v1::lock_pointer::Request {
+            id: ObjectId(71),
+            surface: s2.id,
+            pointer: ObjectId(0),
+            region: ObjectId(0),
+            lifetime: 1,
+        })
+        .unwrap();
+        let con = seat.constraint_for(&s2).unwrap();
+        assert!(con.active.get(), "lock engages on the focused surface");
+        let lp = LockedPointer { id: ObjectId(71), con };
+        lp.set_cursor_position_hint(zwp_locked_pointer_v1::set_cursor_position_hint::Request {
+            surface_x: Fixed::from_int(100),
+            surface_y: Fixed::from_int(50),
+        })
+        .unwrap();
+        // the surface moves while the lock holds: fullscreen repaints it
+        // at the output origin, and no motion runs in between to rebase
+        tl2.set_fullscreen(xdg_toplevel::set_fullscreen::Request { output: ObjectId::NONE })
+            .unwrap();
+        lp.destroy(zwp_locked_pointer_v1::destroy::Request {}).unwrap();
+        // the hint is surface-local: it lands relative to the fullscreen
+        // origin, not the tile rect the lock activated on
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (100.0, 50.0));
+    }
+
+    #[test]
     fn a_tiled_resize_drag_steps_the_split_ratio() {
         let (state, _client, seat, tl1, tl2) = grab_setup();
         let win1 = tl1.window.borrow().clone().unwrap();

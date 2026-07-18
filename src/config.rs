@@ -172,7 +172,7 @@ pub struct ScrollCfg {
 impl Default for ScrollCfg {
     fn default() -> ScrollCfg {
         ScrollCfg {
-            preset_widths: vec![1.0 / 3.0, 0.5, 2.0 / 3.0],
+            preset_widths: vec![1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0],
             default_width: ColWidthCfg::Prop(0.5),
             center_focus: CenterFocus::Never,
         }
@@ -282,6 +282,8 @@ pub struct DebugCfg {
     pub latency_policy: LatencyPolicy,
     /// floor under the adaptive latch margin, microseconds
     pub latch_margin_us: Option<u32>,
+    /// how long before the latch clients get woken to draw, microseconds
+    pub callback_grace_us: Option<u32>,
 }
 
 /// when the present loop starts rendering a dirty frame
@@ -292,6 +294,10 @@ pub enum LatencyPolicy {
     LateLatch,
     /// render as soon as the pipe frees up (one frame of queue depth)
     Vblank,
+    /// always aim the very next vblank and let a late ioctl slip a frame,
+    /// rather than scheduling around the possibility: lowest p50, riskier
+    /// p99 under load
+    Immediate,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Default)]

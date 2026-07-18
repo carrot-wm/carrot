@@ -1445,6 +1445,53 @@ fn popups_hit(
 // layer-parented popups sit above every layer, then overlay, top, the
 // windows, bottom, background. fullscreen hides top and everything below
 // the windows.
+/// where a surface's local (0,0) sits in global space right now: the
+/// inverse of surface_at, for surface-local protocol coordinates that
+/// resolve at application time (a lock's cursor position hint). the
+/// surface may have moved since such a coordinate was produced
+pub fn surface_origin(state: &Rc<State>, surface: &Rc<WlSurface>) -> Option<(i32, i32)> {
+    let root = surface.get_root();
+    if let Some(win) = window_for_surface_any(state, &root) {
+        if !win.surface().mapped.get() {
+            return None;
+        }
+        let rect = win.draw_rect(state);
+        let geo = win.geometry();
+        return offset_within(&root, surface, (rect.x1 - geo.x1, rect.y1 - geo.y1));
+    }
+    let layers = state.layers.borrow().clone();
+    for ls in layers.iter() {
+        if Rc::ptr_eq(&ls.surface, &root) && ls.mapped() {
+            let r = ls.rect.get();
+            return offset_within(&root, surface, (r.x1, r.y1));
+        }
+    }
+    None
+}
+
+/// walk subsurfaces from root to target, accumulating child offsets
+fn offset_within(
+    root: &Rc<WlSurface>,
+    target: &Rc<WlSurface>,
+    base: (i32, i32),
+) -> Option<(i32, i32)> {
+    if Rc::ptr_eq(root, target) {
+        return Some(base);
+    }
+    let children = root.children.borrow();
+    let ch = children.as_ref()?;
+    for e in ch.below.iter().chain(ch.above.iter()) {
+        if e.pending.get() {
+            continue;
+        }
+        let (px, py) = e.sub.position.get();
+        if let Some(o) = offset_within(&e.sub.surface, target, (base.0 + px, base.1 + py)) {
+            return Some(o);
+        }
+    }
+    None
+}
+
 pub fn surface_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<WlSurface>, i32, i32)> {
     use crate::shell::layer;
     // a locked session has exactly one hittable thing per output

@@ -102,8 +102,10 @@ layout {
 
     // Tuning for the scrolling mode:
     // scrolling {
-    //     // the widths cycle-column-width steps through
-    //     preset-widths 0.333 0.5 0.667
+    //     // the widths cycle-column-width steps through; 1.0 is the full
+    //     // working area, and anything up to 10.0 makes a column wider
+    //     // than the output that the strip scrolls across
+    //     preset-widths 0.333 0.5 0.667 1.0
     //     default-width 0.5
     //     // "never", "always" or "on-overflow"
     //     center-focus "never"
@@ -329,8 +331,10 @@ binds {
 // debug {
 //     render-drm-device "/dev/dri/card0"
 //     ignore-drm-device "card1"
-//     latency-policy "late-latch"    // or "vblank": render at flip-done
-//     latch-margin-us 500            // floor under the adaptive margin
+//     latency-policy "late-latch"    // "vblank": render at flip-done;
+//                                    // "immediate": chase every next vblank
+//     latch-margin-us 150            // safety floor under the learned commit cutoff
+//     callback-grace-us 600          // client draw window before the latch
 // }
 "##;
 

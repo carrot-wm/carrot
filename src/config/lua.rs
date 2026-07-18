@@ -405,9 +405,9 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                                 .iter()
                                 .filter_map(vnum)
                                 .collect();
-                            if ws.is_empty() || ws.iter().any(|w| !(0.05..=1.0).contains(w)) {
+                            if ws.is_empty() || ws.iter().any(|w| !(0.05..=10.0).contains(w)) {
                                 return Err(
-                                    "preset_widths is one or more proportions in 0.05..1".into()
+                                    "preset_widths is one or more proportions in 0.05..10".into()
                                 );
                             }
                             l.scrolling.preset_widths = ws;
@@ -417,7 +417,7 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                                 need_num(&v, &key)?,
                                 "default_width",
                                 0.05,
-                                1.0,
+                                10.0,
                             )?);
                         }
                         "default_width_px" => {
@@ -1135,11 +1135,15 @@ fn debug(v: &Value, cfg: &mut Config) -> Result<(), String> {
                 cfg.debug.latency_policy = match need_str(&v, &key)?.as_str() {
                     "late-latch" => crate::config::LatencyPolicy::LateLatch,
                     "vblank" => crate::config::LatencyPolicy::Vblank,
+                    "immediate" => crate::config::LatencyPolicy::Immediate,
                     other => return Err(format!("unknown latency_policy `{other}`")),
                 }
             }
             "latch_margin_us" => {
                 cfg.debug.latch_margin_us = Some(need_int(&v, &key)?.max(0) as u32);
+            }
+            "callback_grace_us" => {
+                cfg.debug.callback_grace_us = Some(need_int(&v, &key)?.max(0) as u32);
             }
             other => return Err(format!("unknown debug key `{other}`")),
         }

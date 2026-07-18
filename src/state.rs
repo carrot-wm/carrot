@@ -75,8 +75,14 @@ pub struct State {
     pub scanout_hold: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
     /// buffer uids currently on (or queued to) a plane, one entry per output
     pub scanout_uids: RefCell<Vec<u64>>,
+    /// surfaces drawn since the last callback sweep; the sweep drains this
+    /// instead of walking every surface of every client each vblank
+    pub shown_surfaces: RefCell<Vec<std::rc::Rc<crate::surface::WlSurface>>>,
     /// frames between render submit and fence; gates the retired drain
     pub frames_in_flight: std::cell::Cell<u32>,
+    /// the renderer imports sealed shm pools: those buffers sample in
+    /// place and release like dmabufs instead of copying at commit
+    pub host_import: std::cell::Cell<bool>,
     /// the render device + (fourcc, modifier) set the dmabuf global speaks
     /// for; filled when the display comes up
     pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
@@ -135,7 +141,9 @@ impl State {
             retired: RefCell::new(Vec::new()),
             scanout_hold: RefCell::new(Vec::new()),
             scanout_uids: RefCell::new(Vec::new()),
+            shown_surfaces: RefCell::new(Vec::new()),
             frames_in_flight: std::cell::Cell::new(0),
+            host_import: std::cell::Cell::new(false),
             dmabuf_info: RefCell::new(None),
             anim_clock: crate::anim::AnimClock::new(),
             retire_tex: RefCell::new(Vec::new()),

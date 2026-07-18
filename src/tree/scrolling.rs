@@ -197,9 +197,11 @@ impl Strip {
         if c.full_width {
             return area_w;
         }
+        // wider than the view is fine: the strip scrolls across the column
+        // and keep-in-view pins to its leading edge
         match c.width {
-            ColWidth::Prop(p) => ((p * area_w as f64).round() as i32).clamp(1, area_w),
-            ColWidth::Fixed(px) => px.clamp(1, area_w),
+            ColWidth::Prop(p) => ((p * area_w as f64).round() as i32).max(1),
+            ColWidth::Fixed(px) => px.max(1),
         }
     }
 
@@ -744,11 +746,27 @@ mod tests {
         assert!(s.cycle_width(&w[0], &cfg(), false));
         assert_eq!(s.layout(area(), &cfg())[0].1.width(), 667);
         assert!(s.cycle_width(&w[0], &cfg(), false));
+        assert_eq!(s.layout(area(), &cfg())[0].1.width(), 1000);
+        assert!(s.cycle_width(&w[0], &cfg(), false));
         assert_eq!(s.layout(area(), &cfg())[0].1.width(), 333);
         assert!(s.toggle_full_width(&w[0]));
         assert_eq!(s.layout(area(), &cfg())[0].1.width(), 1000);
         assert!(s.toggle_full_width(&w[0]));
         assert_eq!(s.layout(area(), &cfg())[0].1.width(), 333);
+    }
+
+    #[test]
+    fn a_column_wider_than_the_view_scrolls_instead_of_clamping() {
+        let (_st, w) = setup(1);
+        let s = Strip::default();
+        let mut c = cfg();
+        c.preset_widths = vec![1.5];
+        s.insert(&w[0], &c);
+        assert!(s.cycle_width(&w[0], &c, false));
+        let r = s.layout(area(), &c)[0].1;
+        // half a view wider than the output, pinned to its leading edge
+        assert_eq!(r.width(), 1500);
+        assert_eq!(r.x1, area().x1);
     }
 
     #[test]

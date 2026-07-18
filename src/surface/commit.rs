@@ -253,7 +253,11 @@ impl WlSurface {
             let old = self.buffer.borrow_mut().take();
             if let Some(old) = old {
                 let st = &self.client.state;
-                if old.buf.dmabuf().is_some() && st.display.borrow().is_some() {
+                // dmabufs and host-imported shm are sampled in place, so
+                // their release waits out the frame that may reference them
+                let in_place = old.buf.dmabuf().is_some()
+                    || (st.host_import.get() && old.buf.shm_sealed_pool().is_some());
+                if in_place && st.display.borrow().is_some() {
                     // a buffer on a plane outlives render frames: it holds
                     // until the flip that replaces it completes
                     if st.scanout_uids.borrow().contains(&old.buf.uid) {
@@ -278,18 +282,47 @@ impl WlSurface {
         // clients single-buffer instead of aging pools, and compositing
         // reads the shadow, never client memory that may be rewritten
         if content_changed {
-            let att = self.buffer.borrow();
-            if let Some(att) = att.as_ref() {
-                if att.buf.dmabuf().is_none()
-                    && capture_shadow(&att.buf, &mut self.shm_shadow.borrow_mut())
-                {
-                    att.send_release.set(false);
-                    if !att.buf.destroyed.get() {
-                        let b = &att.buf;
-                        b.client.event(|o| {
-                            crate::protocol::interfaces::wl_buffer::release::send(o, b.id)
-                        });
+            // sealed pools sample in place at frame time: no copy at all,
+            // no shadow, no early release - the attachment parks like a
+            // dmabuf's when replaced
+            let in_place = self.client.state.host_import.get()
+                && self.buffer.borrow().as_ref().is_some_and(|a| {
+                    a.buf.dmabuf().is_none() && a.buf.shm_sealed_pool().is_some()
+                });
+            if in_place {
+                // zero cpu bytes: the upload ring copies from the imported
+                // pool during the idle gap before the latch. the parked
+                // release (at replace) sits well past the copy's fence, so
+                // the client never rewrites pages the gpu still reads
+                let _ = crate::output::upload_on_commit(&self.client.state, self);
+                self.shm_shadow.borrow_mut().take();
+            } else {
+                // one copy: client pixels go straight into upload staging,
+                // off the present's latch path. the shadow only exists for
+                // frames the direct path couldn't cover (first draw,
+                // resize, busy ring)
+                let direct = crate::output::upload_on_commit(&self.client.state, self);
+                let att = self.buffer.borrow();
+                if let Some(att) = att.as_ref() {
+                    if att.buf.dmabuf().is_none()
+                        && (direct
+                            || capture_shadow(&att.buf, &mut self.shm_shadow.borrow_mut()))
+                    {
+                        att.send_release.set(false);
+                        if !att.buf.destroyed.get() {
+                            let b = &att.buf;
+                            b.client.event(|o| {
+                                crate::protocol::interfaces::wl_buffer::release::send(o, b.id)
+                            });
+                        }
                     }
+                }
+                drop(att);
+                if direct {
+                    // stale the moment the direct path lands; a texture
+                    // rebuilt later re-reads the client buffer instead of
+                    // an old frame
+                    self.shm_shadow.borrow_mut().take();
                 }
             }
         }

@@ -49,6 +49,38 @@ pub const WL_DISPLAY_ID: ObjectId = ObjectId(1);
 /// server-allocated ids start here
 pub const MIN_SERVER_ID: u32 = 0xff00_0000;
 
+/// object ids are small dense u32s and the tables are per-client, so
+/// sip-hashing them buys nothing but cycles; one fibonacci multiply
+/// spreads the low bits across the table mask
+#[derive(Default, Clone, Copy)]
+pub struct IdHash;
+
+pub struct IdHasher(u64);
+
+impl std::hash::BuildHasher for IdHash {
+    type Hasher = IdHasher;
+    fn build_hasher(&self) -> IdHasher {
+        IdHasher(0)
+    }
+}
+
+impl std::hash::Hasher for IdHasher {
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // ObjectId hashes as a single write_u32; anything else still mixes
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// signed 24.8 fixed point
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fixed(pub i32);

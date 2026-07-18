@@ -4,7 +4,7 @@
 
 use super::ClientError;
 use crate::protocol::wire::MsgReader;
-use crate::protocol::{DispatchError, MIN_SERVER_ID, ObjectId};
+use crate::protocol::{DispatchError, IdHash, MIN_SERVER_ID, ObjectId};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -26,21 +26,21 @@ pub trait Object {
 
 #[derive(Default)]
 pub struct Objects {
-    map: RefCell<HashMap<ObjectId, Rc<dyn Object>>>,
+    map: RefCell<HashMap<ObjectId, Rc<dyn Object>, IdHash>>,
     /// server-id free bitmap: set bit = offset free for reuse
     free_server: RefCell<Vec<usize>>,
     /// typed side tables for by-id lookups from other interfaces
-    surfaces: RefCell<HashMap<ObjectId, Rc<crate::surface::WlSurface>>>,
-    regions: RefCell<HashMap<ObjectId, Rc<crate::surface::WlRegion>>>,
-    buffers: RefCell<HashMap<ObjectId, Rc<crate::protocol::shm::WlBuffer>>>,
-    toplevels: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgToplevel>>>,
-    popups: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPopup>>>,
-    outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::WlOutput>>>,
-    xdg_outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::XdgOutput>>>,
+    surfaces: RefCell<HashMap<ObjectId, Rc<crate::surface::WlSurface>, IdHash>>,
+    regions: RefCell<HashMap<ObjectId, Rc<crate::surface::WlRegion>, IdHash>>,
+    buffers: RefCell<HashMap<ObjectId, Rc<crate::protocol::shm::WlBuffer>, IdHash>>,
+    toplevels: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgToplevel>, IdHash>>,
+    popups: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPopup>, IdHash>>,
+    outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::WlOutput>, IdHash>>,
+    xdg_outputs: RefCell<HashMap<ObjectId, Rc<crate::protocol::output::XdgOutput>, IdHash>>,
     /// client-scoped per spec: any xdg_wm_base bind may use any of them
-    positioners: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPositioner>>>,
+    positioners: RefCell<HashMap<ObjectId, Rc<crate::shell::xdg::XdgPositioner>, IdHash>>,
     capture_sources:
-        RefCell<HashMap<ObjectId, Rc<crate::protocol::image_copy_capture::CaptureSource>>>,
+        RefCell<HashMap<ObjectId, Rc<crate::protocol::image_copy_capture::CaptureSource>, IdHash>>,
 }
 
 impl Objects {
@@ -85,6 +85,18 @@ impl Objects {
         }
         words.push(!1usize);
         ObjectId(MIN_SERVER_ID + ((words.len() - 1) * usize::BITS as usize) as u32)
+    }
+
+    /// legal, unused client id? lets one-request objects (wl_display.sync)
+    /// skip the table round-trip entirely
+    pub fn vacant_client_id(&self, id: ObjectId) -> Result<(), ClientError> {
+        if id.0 == 0 || id.0 >= MIN_SERVER_ID {
+            return Err(ClientError::ClientIdOutOfBounds(id));
+        }
+        if self.map.borrow().contains_key(&id) {
+            return Err(ClientError::IdAlreadyInUse(id));
+        }
+        Ok(())
     }
 
     /// removes the entry; the caller (Client::remove_obj) owns delete_id
@@ -248,5 +260,48 @@ impl Objects {
 
     pub fn forget_capture_source(&self, id: ObjectId) {
         self.capture_sources.borrow_mut().remove(&id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct T(ObjectId);
+    impl Object for T {
+        fn id(&self) -> ObjectId {
+            self.0
+        }
+        fn interface(&self) -> &'static str {
+            "t"
+        }
+        fn handle_request(
+            self: Rc<Self>,
+            _: u32,
+            _: &mut MsgReader<'_>,
+        ) -> Result<(), DispatchError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn vacancy_matches_add_semantics() {
+        let o = Objects::default();
+        assert!(o.vacant_client_id(ObjectId(3)).is_ok());
+        assert!(matches!(
+            o.vacant_client_id(ObjectId(0)),
+            Err(ClientError::ClientIdOutOfBounds(_))
+        ));
+        assert!(matches!(
+            o.vacant_client_id(ObjectId(MIN_SERVER_ID)),
+            Err(ClientError::ClientIdOutOfBounds(_))
+        ));
+        o.add_client_object(Rc::new(T(ObjectId(3)))).unwrap();
+        assert!(matches!(
+            o.vacant_client_id(ObjectId(3)),
+            Err(ClientError::IdAlreadyInUse(_))
+        ));
+        o.remove(ObjectId(3)).unwrap();
+        assert!(o.vacant_client_id(ObjectId(3)).is_ok());
     }
 }

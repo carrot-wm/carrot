@@ -264,10 +264,11 @@ impl Connector {
         let primary = take_plane(PlaneType::Primary, XRGB8888.drm)
             .ok_or(DrmError::NoPrimaryPlane(self.id))?;
         primary.crtc.set(crtc.id);
-        // joined modes: the kernel gangs two pipes and manages their cursor
-        // planes itself - any cursor prop we stage arms phantom doubled
-        // cursor state (the 1px smudge). composite the cursor instead.
-        let cursor = if mode_needs_joiner(&mode) {
+        // joined modes on xe: the kernel gangs two pipes and any cursor prop
+        // we stage arms phantom doubled cursor state (the 1px smudge).
+        // amdgpu joins internally and its cursor plane stays sane, so only
+        // xe composites the cursor.
+        let cursor = if mode_needs_joiner(&mode) && dev.driver == "xe" {
             eprintln!(
                 "carrot: {}: joined mode, hardware cursor off (composited instead)",
                 self.name
@@ -462,32 +463,43 @@ impl Connector {
     }
 
     /// cursor-only update between flips; a pending flip already carries the
-    /// change. no out-fence: nothing new gets scanned out
-    pub fn cursor_commit(&self, dev: &DrmDevice) {
+    /// change. no out-fence: nothing new gets scanned out. false = the
+    /// kernel rejected the plane outright - the caller should stop trusting
+    /// it and composite the cursor instead
+    pub fn cursor_commit(&self, dev: &DrmDevice) -> bool {
         if self.flip_pending.get() {
-            return;
+            return true;
         }
         let pipe = self.pipe.borrow();
         let Some(pipe) = pipe.as_ref() else {
-            return;
+            return true;
         };
         if !pipe.active.get() {
-            return;
+            return true;
         }
         let Some(cur) = &pipe.cursor else {
-            return;
+            return true;
         };
         if !cur.changed() {
-            return;
+            return true;
         }
         let mut ch = self.change.borrow_mut();
         ch.clear();
         cur.apply(&mut ch, pipe.crtc.id);
         match ch.commit(dev.fd.as_fd(), atomic::NONBLOCK, 0) {
-            Ok(()) => cur.commit_done(),
+            Ok(()) => {
+                cur.commit_done();
+                true
+            }
             // contention: next motion retries
-            Err(Errno::BUSY) => {}
-            Err(e) => crate::trace!("cursor commit: {e}"),
+            Err(Errno::BUSY) => true,
+            Err(e) => {
+                eprintln!(
+                    "carrot: {}: cursor plane commit failed ({e}); compositing the cursor instead",
+                    self.name
+                );
+                false
+            }
         }
     }
 

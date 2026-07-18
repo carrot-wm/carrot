@@ -43,7 +43,7 @@ fn usage() -> ! {
                    toggle-floating | close-window | focus-next | focus-prev |\n\
                    focus-left|right|up|down | swap-left|right|up|down |\n\
                    split-ratio +-D | spawn CMD.. | quit\n\
-         queries:  monitors | workspaces | windows | clients\n\
+         queries:  monitors | workspaces | windows | clients | errors\n\
          control:  reload | subscribe"
     );
     std::process::exit(2)
@@ -113,6 +113,25 @@ fn render(cmd: &str, line: &str) {
         println!("{line}");
         return;
     };
+    // config diagnostics read as lines, not a json array
+    if cmd == "errors" {
+        let errs = ok["errors"].as_array().cloned().unwrap_or_default();
+        if errs.is_empty() && !ok["failed"].as_bool().unwrap_or(false) {
+            println!("config ok");
+        }
+        for e in &errs {
+            println!("{}", plain(e));
+        }
+        if let Some(cold) = ok["cold-keys-pending"].as_array() {
+            for c in cold {
+                println!("pending until restart: {}", plain(c));
+            }
+        }
+        if !errs.is_empty() {
+            std::process::exit(1);
+        }
+        return;
+    }
     match ok {
         serde_json::Value::Array(items) => {
             for (i, it) in items.iter().enumerate() {
@@ -176,8 +195,8 @@ fn main() {
             format!("{{\"swap-dir\":\"{}\"}}", &cmd["swap-".len()..])
         }
         cmd @ ("toggle-fullscreen" | "toggle-floating" | "close-window" | "focus-next"
-        | "focus-prev" | "quit" | "monitors" | "workspaces" | "windows" | "clients" | "reload"
-        | "subscribe" | "dump-shadow" | "dpms-on" | "dpms-off") => {
+        | "focus-prev" | "quit" | "monitors" | "workspaces" | "windows" | "clients" | "errors"
+        | "reload" | "subscribe" | "dump-shadow" | "dpms-on" | "dpms-off") => {
             serde_json::json!(cmd).to_string()
         }
         _ => usage(),
