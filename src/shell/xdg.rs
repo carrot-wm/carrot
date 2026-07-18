@@ -317,6 +317,9 @@ impl XdgPositioner {
     }
 }
 
+/// far past any real geometry, small enough that solver sums stay in i32
+const POS_RANGE: i32 = 1 << 24;
+
 impl xdg_positioner::Handler for XdgPositioner {
     fn destroy(
         &self,
@@ -336,7 +339,7 @@ impl xdg_positioner::Handler for XdgPositioner {
                 .protocol_error(self.id, 0, "positioner size must be positive");
             return Ok(());
         }
-        self.edit(|v| v.size = (req.width, req.height));
+        self.edit(|v| v.size = (req.width.min(POS_RANGE), req.height.min(POS_RANGE)));
         Ok(())
     }
 
@@ -349,7 +352,12 @@ impl xdg_positioner::Handler for XdgPositioner {
                 .protocol_error(self.id, 0, "anchor rect size must be non-negative");
             return Ok(());
         }
-        let r = Rect::new_sized_saturating(req.x, req.y, req.width, req.height);
+        let r = Rect::new_sized_saturating(
+            req.x.clamp(-POS_RANGE, POS_RANGE),
+            req.y.clamp(-POS_RANGE, POS_RANGE),
+            req.width.min(POS_RANGE),
+            req.height.min(POS_RANGE),
+        );
         self.edit(|v| v.anchor_rect = r);
         Ok(())
     }
@@ -395,7 +403,12 @@ impl xdg_positioner::Handler for XdgPositioner {
         &self,
         req: xdg_positioner::set_offset::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.edit(|v| v.offset = (req.x, req.y));
+        self.edit(|v| {
+            v.offset = (
+                req.x.clamp(-POS_RANGE, POS_RANGE),
+                req.y.clamp(-POS_RANGE, POS_RANGE),
+            )
+        });
         Ok(())
     }
 
@@ -2241,6 +2254,52 @@ pub(crate) mod tests {
         let mut n = 0;
         ls.for_each_popup(|_| n += 1);
         assert_eq!(n, 1, "the popup was adopted exactly once");
+    }
+
+    #[test]
+    fn absurd_positioner_coordinates_stay_in_the_solvable_range() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let base = mk_base(&client, 30);
+        let (_s, _xdg, _tl) = mk_toplevel(&client, &base, 10, 40, 50);
+        let ps = WlSurface::new(ObjectId(11), &client, 6);
+        client.add_client_obj(ps.clone()).unwrap();
+        client.objects.track_surface(ps.clone());
+        base.get_xdg_surface(xdg_wm_base::get_xdg_surface::Request {
+            id: ObjectId(60),
+            surface: ObjectId(11),
+        })
+        .unwrap();
+        let pxdg = base.surfaces.borrow().get(&ObjectId(60)).cloned().unwrap();
+        base.create_positioner(xdg_wm_base::create_positioner::Request { id: ObjectId(45) })
+            .unwrap();
+        {
+            let pos = client.objects.positioner(ObjectId(45)).unwrap();
+            use xdg_positioner::Handler as _;
+            pos.set_size(xdg_positioner::set_size::Request { width: 50, height: 30 })
+                .unwrap();
+            pos.set_anchor_rect(xdg_positioner::set_anchor_rect::Request {
+                x: 2_000_000_000,
+                y: 0,
+                width: 10,
+                height: 10,
+            })
+            .unwrap();
+            pos.set_offset(xdg_positioner::set_offset::Request { x: 2_000_000_000, y: 0 })
+                .unwrap();
+        }
+        // the sums the solver runs on these once wrapped i32
+        pxdg.get_popup(xdg_surface::get_popup::Request {
+            id: ObjectId(51),
+            parent: ObjectId(40),
+            positioner: ObjectId(45),
+        })
+        .unwrap();
+        let XdgExt::Popup(p) = &*pxdg.ext.borrow() else {
+            panic!("the popup constructs");
+        };
+        let (x, _) = p.rel.get();
+        assert!(x > 0 && x <= 1 << 26, "clamped placement, no wrap: {x}");
     }
 
     #[test]

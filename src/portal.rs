@@ -148,6 +148,8 @@ fn response_to(c: &DbusConn, serial: u32, dest: &str, code: u32) {
     });
 }
 
+const SCREENCAST_PROPS: [&str; 3] = ["version", "AvailableSourceTypes", "AvailableCursorModes"];
+
 fn prop_variant(b: &mut MsgBuilder, prop: &str) -> bool {
     match prop {
         "version" => b.put_variant("u", |b| b.put_u32(VERSION)),
@@ -176,17 +178,25 @@ fn serve_properties(conn: &Rc<DbusConn>) {
                 );
                 return;
             }
-            let mut ok = false;
-            c.reply(call, "v", |b| ok = prop_variant(b, &prop));
-            if !ok {
-                // the reply already went out; unknown props answer as u 0,
-                // which the frontend treats as absent
+            // an unknown property answers with the proper error; a "v"
+            // header over an empty body is malformed and the bus daemon
+            // disconnects senders of invalid messages
+            if !SCREENCAST_PROPS.contains(&prop.as_str()) {
+                c.reply_err(
+                    call,
+                    "org.freedesktop.DBus.Error.UnknownProperty",
+                    "no such property",
+                );
+                return;
             }
+            c.reply(call, "v", |b| {
+                prop_variant(b, &prop);
+            });
         }
         "GetAll" => {
             c.reply(call, "a{sv}", |b| {
                 b.put_array(8, |b| {
-                    for p in ["version", "AvailableSourceTypes", "AvailableCursorModes"] {
+                    for p in SCREENCAST_PROPS {
                         b.align(8);
                         b.put_str(p);
                         prop_variant(b, p);

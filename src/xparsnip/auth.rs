@@ -14,13 +14,20 @@ pub fn cookie_for_display(display: u32) -> Option<Vec<u8>> {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".Xauthority"))
         })?;
     let data = std::fs::read(path).ok()?;
-    let want = display.to_string();
+    find_cookie(&data, &display.to_string())
+}
+
+fn find_cookie(data: &[u8], want: &str) -> Option<Vec<u8>> {
     let mut o = 0;
     while o + 2 <= data.len() {
         o += 2;
         let mut field = |data: &[u8]| -> Option<(usize, usize)> {
             let len = be16(data, o)?;
             let start = o + 2;
+            // a record truncated mid-field ends the file, not the process
+            if start + len > data.len() {
+                return None;
+            }
             o = start + len;
             Some((start, len))
         };
@@ -35,4 +42,27 @@ pub fn cookie_for_display(display: u32) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(number: &[u8], name: &[u8], cookie: &[u8]) -> Vec<u8> {
+        let mut d = vec![1, 0];
+        for f in [&b""[..], number, name, cookie] {
+            d.extend_from_slice(&(f.len() as u16).to_be_bytes());
+            d.extend_from_slice(f);
+        }
+        d
+    }
+
+    #[test]
+    fn a_truncated_record_yields_none_instead_of_panicking() {
+        let mut d = record(b"0", b"MIT-MAGIC-COOKIE-1", &[0xab; 16]);
+        d.truncate(33); // the declared 16 cookie bytes end mid-file
+        assert!(find_cookie(&d, "0").is_none());
+        let whole = record(b"0", b"MIT-MAGIC-COOKIE-1", &[0xab; 16]);
+        assert_eq!(find_cookie(&whole, "0").unwrap(), vec![0xab; 16]);
+    }
 }

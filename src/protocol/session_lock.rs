@@ -426,10 +426,18 @@ impl SurfaceExt for LockExt {
                 .protocol_error(ls.id, NULL_BUFFER, "lock surface committed without a buffer");
             return None;
         }
-        // exact-size requirement, checked before the buffer can land
+        // exact-size requirement, checked before the buffer can land; the
+        // configured size lives in surface-local coordinates, so this
+        // commit's scale and transform apply before comparing
         if let Some(Some(b)) = &pending.buffer {
-            let (w, h) = ls.acked_size.get();
-            if (b.buf.rect.width() as u32, b.buf.rect.height() as u32) != (w, h) {
+            let (mut bw, mut bh) = (b.buf.rect.width(), b.buf.rect.height());
+            let transform = pending.transform.unwrap_or(ls.surface.transform.get());
+            if transform.swaps_dimensions() {
+                std::mem::swap(&mut bw, &mut bh);
+            }
+            let scale = pending.scale.unwrap_or(ls.surface.scale.get()).max(1) as u32;
+            let logical = ((bw as u32).div_ceil(scale), (bh as u32).div_ceil(scale));
+            if logical != ls.acked_size.get() {
                 ls.client.protocol_error(
                     ls.id,
                     DIMENSIONS_MISMATCH,

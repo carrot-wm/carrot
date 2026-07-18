@@ -434,9 +434,11 @@ impl<'a> Rd<'a> {
             }
             Some(b'a') => {
                 let len = self.u32()? as usize;
-                // element alignment for the aligned types that can appear here
+                // element alignment for the aligned types that can appear
+                // here; dict entries pad to 8 like structs, and skipping
+                // that pad as payload desyncs everything after the array
                 match sig.as_bytes().get(1) {
-                    Some(b'(' | b't' | b'x' | b'd') => self.align(8)?,
+                    Some(b'(' | b'{' | b't' | b'x' | b'd') => self.align(8)?,
                     _ => {}
                 }
                 self.take(len)?;
@@ -462,6 +464,22 @@ mod tests {
         b.put_u32(major);
         b.put_u32(minor);
         b.finish()
+    }
+
+    #[test]
+    fn skipping_a_dict_value_lands_on_the_next_field() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&16u32.to_le_bytes()); // element bytes
+        body.extend_from_slice(&[0; 4]); // dict entries pad to 8
+        body.extend_from_slice(&1u32.to_le_bytes()); // key "k"
+        body.extend_from_slice(b"k\0");
+        body.extend_from_slice(&[1, b'u', 0]); // variant sig
+        body.extend_from_slice(&[0; 3]); // pad to the value
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.extend_from_slice(&0xdead_beefu32.to_le_bytes()); // next field
+        let mut r = Rd::new(&body, &[]);
+        r.skip_value("a{sv}").unwrap();
+        assert_eq!(r.u32().unwrap(), 0xdead_beef, "the entry pad is not payload");
     }
 
     #[test]

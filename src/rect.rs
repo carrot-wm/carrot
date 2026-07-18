@@ -45,12 +45,14 @@ impl Rect {
         }
     }
 
+    // saturating: region extents can legitimately span the whole i32
+    // range, and a span is a magnitude, not a coordinate
     pub fn width(self) -> i32 {
-        self.x2 - self.x1
+        self.x2.saturating_sub(self.x1)
     }
 
     pub fn height(self) -> i32 {
-        self.y2 - self.y1
+        self.y2.saturating_sub(self.y1)
     }
 
     pub fn is_empty(self) -> bool {

@@ -2175,6 +2175,11 @@ fn shm_fast_candidate(
     if stride < w * 4 || stride % 4 != 0 {
         veto!("stride unusable");
     }
+    // gpu copies address the pool by texel; an odd offset is legal on
+    // the wire but can't ride the import
+    if off.pool_offset() % 4 != 0 {
+        veto!("offset unaligned");
+    }
     let Some(src) = out.renderer.host_buffer_for(off.pool()) else {
         veto!("host import unavailable");
     };
@@ -2977,6 +2982,8 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
         // cpu only records a command buffer. everyone else fills staging
         let res = if let Some((hbuf, off)) = buf
             .shm_sealed_pool()
+            // gpu copies address the pool by texel; unaligned layouts stage
+            .filter(|off| off.pool_offset() % 4 == 0 && stride % 4 == 0)
             .and_then(|off| out.renderer.host_buffer_for(off.pool()).map(|b| (b, off)))
         {
             out.renderer.upload_now_from(
@@ -3681,6 +3688,8 @@ fn draw_buffer(
             // the imported client pages, no cpu byte ever moves
             if let Some((hbuf, off)) = buf
                 .shm_sealed_pool()
+                // gpu copies address the pool by texel; unaligned layouts stage
+                .filter(|off| off.pool_offset() % 4 == 0 && buf.stride % 4 == 0)
                 .and_then(|off| out.renderer.host_buffer_for(off.pool()).map(|b| (b, off)))
             {
                 let up = out.renderer.external_pre_upload(
