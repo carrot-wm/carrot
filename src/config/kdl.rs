@@ -45,8 +45,8 @@ pub(super) fn parse_bare(src: &str) -> Result<Config, Vec<String>> {
 }
 
 /// nested includes stop here; a config nine files deep is a cycle bug,
-/// not a use case
-const MAX_INCLUDE_DEPTH: usize = 8;
+/// not a use case. the lua loader enforces the same bound
+pub(super) const MAX_INCLUDE_DEPTH: usize = 8;
 
 /// resolve one include argument against the including file's directory
 fn include_target(node: &KdlNode, dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -60,11 +60,14 @@ fn include_target(node: &KdlNode, dir: &std::path::Path) -> Option<std::path::Pa
 }
 
 /// which sections any file in the include tree speaks; drives the
-/// wholesale list reset before anything applies
+/// wholesale list reset before anything applies. carries the same
+/// visited set as the walk - the depth bound alone leaves a cyclic
+/// graph exponential before it trips
 fn scan_names(
     doc: &KdlDocument,
     dir: Option<&std::path::Path>,
     depth: usize,
+    visited: &mut Vec<std::path::PathBuf>,
     f: &mut impl FnMut(&str),
 ) {
     for node in doc.nodes() {
@@ -75,10 +78,16 @@ fn scan_names(
             }
             let Some(dir) = dir else { continue };
             let Some(target) = include_target(node, dir) else { continue };
+            let canon = target.canonicalize().unwrap_or_else(|_| target.clone());
+            if visited.contains(&canon) {
+                continue;
+            }
             // unreadable or broken files are the walk's problem to report
             if let Ok(text) = std::fs::read_to_string(&target) {
                 if let Ok(sub) = text.parse::<KdlDocument>() {
-                    scan_names(&sub, target.parent(), depth + 1, f);
+                    visited.push(canon);
+                    scan_names(&sub, target.parent(), depth + 1, visited, f);
+                    visited.pop();
                 }
             }
             continue;
@@ -109,7 +118,7 @@ fn parse_into(
     // default's entries wholesale, wherever in the include tree it lives;
     // nothing embedded leaks underneath
     if reset_lists {
-        scan_names(&doc, dir, 0, &mut |name| match name {
+        scan_names(&doc, dir, 0, &mut Vec::new(), &mut |name| match name {
             "binds" => cfg.binds.clear(),
             "output" => cfg.outputs.clear(),
             "window-rule" => cfg.rules.clear(),

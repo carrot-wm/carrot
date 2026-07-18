@@ -75,6 +75,26 @@ fn scrolling(node: &KdlNode, out: &mut ScrollCfg, cx: &mut Cx) {
                     out.preset_widths = ws;
                 }
             }
+            "preset-heights" => {
+                let hs: Vec<f64> = c
+                    .entries()
+                    .iter()
+                    .filter(|e| e.name().is_none())
+                    .filter_map(|e| {
+                        e.value().as_float().or_else(|| e.value().as_integer().map(|i| i as f64))
+                    })
+                    .collect();
+                if hs.is_empty() || hs.iter().any(|h| !(0.05..=0.95).contains(h)) {
+                    cx.at(c, "preset-heights is one or more proportions in 0.05..0.95");
+                } else {
+                    out.preset_heights = hs;
+                }
+            }
+            "center-single-column" => {
+                if let Some(b) = cx.flag(c) {
+                    out.center_single = b;
+                }
+            }
             "default-width" => {
                 if let Some(v) = cx.float(c) {
                     match f64_in(v, "default-width", 0.05, 10.0) {

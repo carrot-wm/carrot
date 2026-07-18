@@ -67,10 +67,18 @@ impl Layout {
         }
     }
 
-    /// keep the strip's active column in step with real focus
-    pub fn note_focus_win(&self, win: &Window) {
-        if self.mode.get() == LayoutMode::Scrolling {
-            self.strip.note_focus(win);
+    /// keep the strip's active column in step with real focus; true when
+    /// the active column changed
+    pub fn note_focus_win(&self, win: &Window) -> bool {
+        self.mode.get() == LayoutMode::Scrolling && self.strip.note_focus(win)
+    }
+
+    /// where focus lands when nothing better is known: the strip
+    /// remembers its active column, dwindle starts at the first leaf
+    pub fn default_focus(&self) -> Option<Rc<Window>> {
+        match self.mode.get() {
+            LayoutMode::Dwindle => self.dwindle.first(),
+            LayoutMode::Scrolling => self.strip.active_window(),
         }
     }
 }

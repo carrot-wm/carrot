@@ -82,6 +82,11 @@
               "move-column-left" "move-column-right"
               "cycle-column-width" "cycle-column-width-back" "toggle-full-width"
               "center-column"
+              "focus-column-first" "focus-column-last"
+              "move-column-to-first" "move-column-to-last"
+              "consume-window-into-column" "expel-window-from-column"
+              "expand-column-to-available-width"
+              "cycle-window-height" "cycle-window-height-back" "reset-window-height"
               "pointer-move" "pointer-resize"
               "set-layout"
               "quit"
@@ -623,20 +628,29 @@
                           scrolling = mkOption {
                             type = types.nullOr (types.submodule {
                               options = {
+                                # widths above 1.0 are columns wider than the output
                                 preset_widths = mkOption {
-                                  type = types.nullOr (types.listOf (types.numbers.between 0.05 1.0));
+                                  type = types.nullOr (types.listOf (types.numbers.between 0.05 10.0));
                                   default = null;
                                 };
                                 default_width = mkOption {
-                                  type = types.nullOr (types.numbers.between 0.05 1.0);
+                                  type = types.nullOr (types.numbers.between 0.05 10.0);
                                   default = null;
                                 };
                                 default_width_px = mkOption {
                                   type = types.nullOr (types.numbers.between 50 100000);
                                   default = null;
                                 };
+                                preset_heights = mkOption {
+                                  type = types.nullOr (types.listOf (types.numbers.between 0.05 0.95));
+                                  default = null;
+                                };
                                 center_focus = mkOption {
                                   type = types.nullOr (types.enum ["never" "always" "on-overflow"]);
+                                  default = null;
+                                };
+                                center_single_column = mkOption {
+                                  type = types.nullOr types.bool;
                                   default = null;
                                 };
                               };

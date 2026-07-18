@@ -83,6 +83,7 @@ dependencies = [
  "ash",
  "dlopen-rs",
  "elf_loader",
+ "gc-arena",
  "kbvm",
  "kdl",
  "piccolo",

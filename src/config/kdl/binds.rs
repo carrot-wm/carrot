@@ -223,6 +223,46 @@ fn action(node: &KdlNode, cx: &mut Cx) -> Option<Action> {
             none(cx, name);
             Action::CenterColumn
         }
+        "focus-column-first" => {
+            none(cx, name);
+            Action::FocusColumnFirst
+        }
+        "focus-column-last" => {
+            none(cx, name);
+            Action::FocusColumnLast
+        }
+        "move-column-to-first" => {
+            none(cx, name);
+            Action::MoveColumnToFirst
+        }
+        "move-column-to-last" => {
+            none(cx, name);
+            Action::MoveColumnToLast
+        }
+        "consume-window-into-column" => {
+            none(cx, name);
+            Action::ConsumeIntoColumn
+        }
+        "expel-window-from-column" => {
+            none(cx, name);
+            Action::ExpelFromColumn
+        }
+        "expand-column-to-available-width" => {
+            none(cx, name);
+            Action::ExpandColumn
+        }
+        "cycle-window-height" => {
+            none(cx, name);
+            Action::CycleWindowHeight
+        }
+        "cycle-window-height-back" => {
+            none(cx, name);
+            Action::CycleWindowHeightBack
+        }
+        "reset-window-height" => {
+            none(cx, name);
+            Action::ResetWindowHeight
+        }
         "pointer-move" => {
             none(cx, name);
             Action::PointerMove

@@ -1951,6 +1951,21 @@ pub(crate) mod tests {
         popid: u32,
         parent: ObjectId,
     ) -> (Rc<WlSurface>, Rc<XdgSurface>, Rc<XdgPopup>) {
+        mk_popup_at(client, base, sid, xid, pid, popid, parent, 0, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mk_popup_at(
+        client: &Rc<Client>,
+        base: &Rc<XdgWmBase>,
+        sid: u32,
+        xid: u32,
+        pid: u32,
+        popid: u32,
+        parent: ObjectId,
+        ax: i32,
+        ay: i32,
+    ) -> (Rc<WlSurface>, Rc<XdgSurface>, Rc<XdgPopup>) {
         let s = WlSurface::new(ObjectId(sid), client, 6);
         client.add_client_obj(s.clone()).unwrap();
         client.objects.track_surface(s.clone());
@@ -1968,8 +1983,8 @@ pub(crate) mod tests {
             pos.set_size(xdg_positioner::set_size::Request { width: 50, height: 30 })
                 .unwrap();
             pos.set_anchor_rect(xdg_positioner::set_anchor_rect::Request {
-                x: 0,
-                y: 0,
+                x: ax,
+                y: ay,
                 width: 10,
                 height: 10,
             })
@@ -1985,6 +2000,31 @@ pub(crate) mod tests {
         .unwrap();
         let popup = xdg.popup().unwrap();
         (s, xdg, popup)
+    }
+
+    #[test]
+    fn popup_overhang_covers_the_neighbor_window() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let base = mk_base(&client, 30);
+        let (s1, x1, t1) = mk_toplevel(&client, &base, 10, 40, 50);
+        map(&state, &client, &s1, &x1, 20);
+        let (s2, x2, t2) = mk_toplevel(&client, &base, 13, 43, 53);
+        map(&state, &client, &s2, &x2, 21);
+        let a = t1.window.borrow().clone().unwrap();
+        let b = t2.window.borrow().clone().unwrap();
+        let (ra, rb) = (a.draw_rect(&state), b.draw_rect(&state));
+        assert!(ra.x2 <= rb.x1, "the windows sit side by side");
+        // a menu anchored at the parent's right edge spills over the
+        // neighbor; the overhang must hit the menu, not the neighbor
+        let (ps, px, p) =
+            mk_popup_at(&client, &base, 11, 41, 45, 51, ObjectId(40), ra.width() - 10, 0);
+        map(&state, &client, &ps, &px, 22);
+        let (rx, ry) = p.rel.get();
+        let (probe_x, probe_y) = (ra.x1 + rx + 25, ra.y1 + ry + 15);
+        assert!(probe_x > rb.x1, "the probe point lies over the neighbor");
+        let (hit, _, _) = crate::tree::surface_at(&state, probe_x, probe_y).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ps), "the overhang hits the popup");
     }
 
     #[test]
@@ -2410,7 +2450,7 @@ pub(crate) mod tests {
         use zwp_pointer_constraints_v1::Handler as _;
 
         // pointer parked over the second tile; lock it there
-        let (state, client, seat, _tl1, tl2) = grab_setup();
+        let (_state, client, seat, _tl1, tl2) = grab_setup();
         let s2 = tl2.xdg.surface.clone();
         let mgr = ConstraintsManager {
             id: ObjectId(70),

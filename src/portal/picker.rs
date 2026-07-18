@@ -131,11 +131,17 @@ fn candidates(state: &Rc<State>, types: u32) -> String {
         // extra only the picker can reach
         let d = state.display.borrow();
         let outs = d.as_ref().map(|d| d.outputs.borrow().clone()).unwrap_or_default();
-        for (i, ws) in state.workspaces.borrow().iter().enumerate() {
-            let output = outs
-                .get(ws.output.get())
-                .map(|o| o.conn.name.clone())
-                .unwrap_or_default();
+        // every workspace the binds can reach is offerable, visited or
+        // not; picking an unborn one creates it like switching would
+        let count = state.workspaces.borrow().len().max(bind_reach(state));
+        for i in 0..count {
+            let slot = state
+                .workspaces
+                .borrow()
+                .get(i)
+                .map(|ws| ws.output.get())
+                .unwrap_or_else(|| state.focused_output.get());
+            let output = outs.get(slot).map(|o| o.conn.name.clone()).unwrap_or_default();
             out.push_str(
                 &json!({
                     "kind": "workspace",
@@ -172,9 +178,46 @@ fn candidates(state: &Rc<State>, types: u32) -> String {
     out
 }
 
+/// highest workspace index any bind reaches, as a count
+fn bind_reach(state: &Rc<State>) -> usize {
+    use crate::config::Action;
+    let cfg = state.config.borrow();
+    cfg.binds
+        .iter()
+        .map(|b| match b.action {
+            Action::FocusWorkspace(n) | Action::MoveToWorkspace(n) | Action::SendToWorkspace(n) => {
+                n + 1
+            }
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unvisited_workspaces_are_offered() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        let mut cfg = (**state.config.borrow()).clone();
+        cfg.binds.push(crate::config::Bind {
+            mods: 0,
+            key: 2,
+            action: crate::config::Action::FocusWorkspace(8),
+            on_release: false,
+            repeat: false,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
+        });
+        *state.config.borrow_mut() = Rc::new(cfg);
+        let list = candidates(&state, super::super::SOURCE_MONITOR);
+        let n = list.lines().filter(|l| l.contains("\"kind\":\"workspace\"")).count();
+        assert_eq!(n, 9, "every bind-reachable workspace is offered");
+        assert!(list.contains("\"ws:9\""), "the unborn tail workspace is listed");
+    }
 
     #[test]
     fn choices_parse_and_garbage_cancels() {

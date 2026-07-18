@@ -1085,6 +1085,7 @@ impl SeatGlobal {
                     kb.send_modifiers(serial, m);
                 }
             });
+            client.flush_eager();
             let group = self.mods.get().group;
             if pressed && map.repeats(key, group) {
                 self.arm_repeat(key);
@@ -1113,9 +1114,16 @@ impl SeatGlobal {
     }
 
     fn ptr_frame(&self, client: ClientId) {
+        let mut flush = None;
         self.for_each_pointer(client, wl_pointer::frame::SINCE, |p| {
             p.client.event(|o| wl_pointer::frame::send(o, p.id));
+            flush = Some(p.client.clone());
         });
+        // the frame closes an input batch: put it on the wire now instead
+        // of waiting out the engine's send phase
+        if let Some(c) = flush {
+            c.flush_eager();
+        }
     }
 
     /// deepest mapped surface under the global point, in z order
@@ -1668,7 +1676,8 @@ impl SeatGlobal {
         }
     }
 
-    /// give the keyboard to the window under the cursor, else the first tile
+    /// give the keyboard to the window under the cursor, else the
+    /// layout's default pick
     pub fn ensure_focus(self: &Rc<Self>, state: &Rc<State>) {
         if self.kb_focus.borrow().is_some() {
             return;
@@ -1680,7 +1689,7 @@ impl SeatGlobal {
         let ws = crate::tree::active(state);
         let target = crate::tree::window_at(state, self.ptr_x.get() as i32, self.ptr_y.get() as i32)
             .map(|(w, ..)| w)
-            .or_else(|| ws.tiling.first())
+            .or_else(|| ws.tiling.default_focus())
             .or_else(|| ws.top_float());
         if let Some(win) = target {
             super::focus::set_keyboard_focus(state, self, Some(win.surface()));

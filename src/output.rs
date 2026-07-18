@@ -591,10 +591,12 @@ mod sched_tests {
         );
         // fullscreen dmabuf prices with the scanout budget it was given
         assert_eq!(callback_lead(FsContent::Dmabuf, 600_000, 300_000, P), 900_000);
-        // an oversized chain clamps to the latest wake the period allows,
-        // never reverting to the early flip-done phase
+        // an oversized fullscreen-shm chain wakes at flip-done: only the
+        // earliest commit's fence makes the coming scan
+        assert_eq!(callback_lead(FsContent::Shm, 1_300_000, 600_000, P), P);
+        // oversized windowed chains keep the latest-wake clamp
         assert_eq!(
-            callback_lead(FsContent::Shm, 1_300_000, 600_000, P),
+            callback_lead(FsContent::Windowed, 3_000_000, 600_000, P),
             P - CB_HEADROOM_NS
         );
     }
@@ -852,7 +854,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
         {
             let mut list = state.workspaces.borrow_mut();
             while list.len() < outputs.len().min(9) {
-                list.push(Rc::new(crate::tree::workspace::Workspace::default()));
+                list.push(crate::tree::new_workspace(&state));
             }
             for i in 0..outputs.len().min(9) {
                 list[i].output.set(i);
@@ -1650,9 +1652,9 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
         let idx = match found {
             Some(i) => i,
             None => {
-                let w = crate::tree::workspace::Workspace::default();
+                let w = crate::tree::new_workspace(state);
                 w.output.set(o.index.get());
-                list.push(Rc::new(w));
+                list.push(w);
                 list.len() - 1
             }
         };
@@ -2426,10 +2428,18 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         } else {
             PresentPath::Compose
         };
+        // the copy path never late-latches: its frame is one client buffer
+        // that arrived with the commit, so there is nothing fresher to
+        // sleep for, and the copy's fence needs every microsecond ahead
+        // of the hardware cutoff
+        let fast_bound = path == PresentPath::Compose && shm_fast_candidate(state, out).is_some();
         let mut aim_ns = 0;
         if let Some((deadline, target)) = latch_deadline(state, out, path) {
             aim_ns = target;
-            if !out.sched.fallback.get() && deadline > Time::now().nsec() + MIN_SLACK_NS {
+            if !fast_bound
+                && !out.sched.fallback.get()
+                && deadline > Time::now().nsec() + MIN_SLACK_NS
+            {
                 let _ = state.ring.timeout(Time::from_nsec(deadline)).await;
                 // whatever arrived with the timer - input completions,
                 // commits - routes before the scene is latched
@@ -2695,7 +2705,18 @@ fn callback_lead(content: FsContent, budget: u64, grace: u64, period: u64) -> u6
         FsContent::Shm => UPLOAD_LEAD_NS,
         _ => 0,
     };
-    (budget + upload + grace).min(period.saturating_sub(CB_HEADROOM_NS))
+    let want = budget + upload + grace;
+    // an oversized fullscreen-shm chain wakes its client at flip-done:
+    // the frame copy owns most of the period, so only the earliest
+    // commit's fence still makes the coming scan - the latest-wake clamp
+    // lands ~50us past the hardware cutoff and phase-locks a whole
+    // session into one-vblank-late presents
+    let cap = if content == FsContent::Shm && want > period {
+        period
+    } else {
+        period.saturating_sub(CB_HEADROOM_NS)
+    };
+    want.min(cap)
 }
 
 /// pick when the just-flipped frame's clients should wake: for the aimed
@@ -3984,10 +4005,15 @@ fn ws_scene(
     mode: DrawMode,
 ) {
     let fs = ws.fullscreen.borrow().clone();
+    let mut tiled = Vec::new();
+    let mut strip_d = None;
     if fs.is_none() {
         let mark = ops.len();
-        ws.tiling
-            .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live, mode));
+        ws.tiling.for_each(|win| {
+            if let Some(r) = draw_window(state, out, focused, cfg, win, ops, live, mode) {
+                tiled.push((win.clone(), r));
+            }
+        });
         draw_closings(state, out, ws, ops, mode);
         if ws.tiling.mode() == crate::config::LayoutMode::Scrolling && mode != DrawMode::Rest {
             let now = state.anim_clock.now();
@@ -3996,18 +4022,52 @@ fn ws_scene(
                 let d = [(dx / out.width as f64 * 2.0) as f32, 0.0];
                 apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, 1.0, d, out_dims(out));
                 out.anim_pending.set(true);
+                strip_d = Some(d);
             } else if mode == DrawMode::Present {
                 *ws.tiling.strip.view_anim.borrow_mut() = None;
             }
         }
     }
+    let mut above = Vec::new();
     if let Some(f) = &fs {
-        draw_window(state, out, focused, cfg, screen, f, ops, live, mode);
+        if let Some(r) = draw_window(state, out, focused, cfg, f, ops, live, mode) {
+            above.push((f.clone(), r));
+        }
     }
     if fs.is_none() || cfg.layout.float_above_fullscreen {
         for win in ws.floats.borrow().iter() {
-            draw_window(state, out, focused, cfg, screen, win, ops, live, mode);
+            if let Some(r) = draw_window(state, out, focused, cfg, win, ops, live, mode) {
+                above.push((win.clone(), r));
+            }
         }
+    }
+    // popups draw once every body has: a menu overhanging its parent
+    // covers the neighbor instead of vanishing under it. tiled popups
+    // ride the strip translate their parents rode
+    let pmark = ops.len();
+    for (win, r) in &tiled {
+        draw_window_popups(state, out, win, *r, screen, ops, live);
+    }
+    if let Some(d) = strip_d {
+        apply_batch(&mut ops[pmark..], [0.0, 0.0], 1.0, 1.0, d, out_dims(out));
+    }
+    for (win, r) in &above {
+        draw_window_popups(state, out, win, *r, screen, ops, live);
+    }
+}
+
+/// the lifted popup pass, anchored to the rect the body drew at
+fn draw_window_popups(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    win: &Rc<crate::tree::Window>,
+    rect: Rect,
+    screen: Rect,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<((ClientId, u64), u64)>,
+) {
+    if let Some(tl) = win.xdg_opt() {
+        draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
     }
 }
 
@@ -4085,6 +4145,7 @@ fn draw_resize_xfade(
         &mut tl,
     );
     if tmp.is_empty() {
+        crate::trace!("rz: no live ops #{}", win.ident);
         return false;
     }
     remap_local(&mut tmp, out, target);
@@ -4097,6 +4158,7 @@ fn draw_resize_xfade(
     if rz.snapshot.is_none() {
         let (all_ops, keys, srange) = win.last_batch.borrow().clone();
         if all_ops.is_empty() || srange.is_empty() {
+            crate::trace!("rz: no last batch #{}", win.ident);
             return false;
         }
         {
@@ -4105,6 +4167,7 @@ fn draw_resize_xfade(
                 .iter()
                 .any(|(k, uid)| t.get(k).map(|(tex, _)| tex.uid) != Some(*uid))
             {
+                crate::trace!("rz: stale batch textures #{}", win.ident);
                 return false;
             }
         }
@@ -4113,11 +4176,15 @@ fn draw_resize_xfade(
         let (fw, fh) = (rz.from_rect.width().max(1), rz.from_rect.height().max(1));
         let tex = match out.renderer.create_render_texture(fw as u32, fh as u32) {
             Ok(t) => t,
-            Err(_) => return false,
+            Err(_) => {
+                crate::trace!("rz: snapshot alloc failed #{}", win.ident);
+                return false;
+            }
         };
         out.prepasses
             .borrow_mut()
             .push(PrePass::new(&tex, Some([0.0; 4]), old_ops));
+        crate::trace!("rz: snapshot built #{}", win.ident);
         rz.snapshot = Some(tex);
     }
     // the live side re-renders every frame. the texture is allocated once
@@ -4172,20 +4239,21 @@ fn push_xfade_op(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// one window body (no popups); returns the rect it drew at, the anchor
+/// for the later popup pass
 fn draw_window(
     state: &Rc<State>,
     out: &Rc<Output>,
     focused: &Option<Rc<WlSurface>>,
     cfg: &crate::config::Config,
-    screen: Rect,
     win: &Rc<crate::tree::Window>,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<((ClientId, u64), u64)>,
     mode: DrawMode,
-) {
+) -> Option<Rect> {
     let surface = win.surface();
     if !surface.mapped.get() {
-        return;
+        return None;
     }
     let mark = ops.len();
     let lmark = live.len();
@@ -4205,6 +4273,12 @@ fn draw_window(
         match &mut m.resize {
             Some(rz) if rz.anim.settled(now) => {
                 if mode == DrawMode::Present {
+                    crate::trace!(
+                        "rz: settled #{} had_snapshot={} t={}",
+                        win.ident,
+                        rz.snapshot.is_some(),
+                        now
+                    );
                     let mut q = state.retire_tex.borrow_mut();
                     q.extend(rz.snapshot.take());
                     q.extend(rz.live.take());
@@ -4242,7 +4316,7 @@ fn draw_window(
     // a rule-hidden window leaves the compositor only as a black stand-in
     if mode != DrawMode::Present && win.rule_no_capture.get() {
         push_blackout(out, rect, round, ops);
-        return;
+        return None;
     }
     if win.rule_blur.get() && !win.fullscreen.get() {
         push_blur_backdrop(out, rect, round, ops);
@@ -4327,9 +4401,6 @@ fn draw_window(
         draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, round, ops, live);
     }
     let send = ops.len();
-    if let Some(tl) = win.xdg_opt() {
-        draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
-    }
     // captured before dim and the open transform, minus the blur backdrop:
     // close anims and resize snapshots replay clean, untransformed content
     if !xfaded {
@@ -4394,6 +4465,7 @@ fn draw_window(
     if win.anims_live(state.anim_clock.now()) {
         out.anim_pending.set(true);
     }
+    Some(rect)
 }
 
 // -- closing windows: the final batch outlives the surface --

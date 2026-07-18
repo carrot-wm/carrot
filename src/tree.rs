@@ -340,6 +340,16 @@ impl Window {
                 match &mut m.resize {
                     Some(rz) => {
                         let p = rz.anim.clamped_value(now);
+                        crate::trace!(
+                            "rz: retarget #{} p={:.2} {}x{} -> {}x{} t={}",
+                            self.ident,
+                            p,
+                            old.width(),
+                            old.height(),
+                            r.width(),
+                            r.height(),
+                            now
+                        );
                         let cw = rz.from.0 as f64 + (old.width() - rz.from.0) as f64 * p;
                         let ch = rz.from.1 as f64 + (old.height() - rz.from.1) as f64 * p;
                         rz.from = (cw.round() as i32, ch.round() as i32);
@@ -353,6 +363,15 @@ impl Window {
                         );
                     }
                     None => {
+                        crate::trace!(
+                            "rz: start #{} {}x{} -> {}x{} t={}",
+                            self.ident,
+                            old.width(),
+                            old.height(),
+                            r.width(),
+                            r.height(),
+                            now
+                        );
                         m.resize = Some(ResizeAnim {
                             anim: crate::config::build_anim(
                                 &state.anim_clock,
@@ -554,30 +573,41 @@ impl Window {
 
 // -- workspaces --
 
+/// every workspace starts in the configured layout mode; a bare
+/// Workspace::default() carries the compile-time mode and strands the
+/// scrolling verbs on whatever it happened to be
+pub fn new_workspace(state: &Rc<State>) -> Rc<Workspace> {
+    let w = Workspace::default();
+    w.tiling.set_mode_empty(state.config.borrow().layout.mode);
+    Rc::new(w)
+}
+
 pub fn active(state: &Rc<State>) -> Rc<Workspace> {
     let mut list = state.workspaces.borrow_mut();
     if list.is_empty() {
-        let w = Workspace::default();
-        w.tiling.set_mode_empty(state.config.borrow().layout.mode);
-        list.push(Rc::new(w));
+        let w = new_workspace(state);
+        list.push(w);
     }
     let idx = state.active_ws.get().min(list.len() - 1);
     list[idx].clone()
+}
+
+/// grow the workspace list until `idx` exists; demand sites are switching,
+/// window moves, and workspace shares. new ones land on the focused output
+pub fn ensure_workspace(state: &Rc<State>, idx: usize) {
+    let mut list = state.workspaces.borrow_mut();
+    while list.len() <= idx {
+        let w = new_workspace(state);
+        w.output.set(state.focused_output.get());
+        list.push(w);
+    }
 }
 
 pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     if state.active_ws.get() == idx && !state.workspaces.borrow().is_empty() {
         return;
     }
-    {
-        let mut list = state.workspaces.borrow_mut();
-        while list.len() <= idx {
-            let w = Workspace::default();
-            w.output.set(state.focused_output.get());
-            w.tiling.set_mode_empty(state.config.borrow().layout.mode);
-            list.push(Rc::new(w));
-        }
-    }
+    ensure_workspace(state, idx);
     let prev_out = state.focused_output.get();
     state.active_ws.set(idx);
     let ws = active(state);
@@ -613,10 +643,13 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
         let (cx, cy) = cursor_pos(state);
         window_at(state, cx, cy)
             .map(|(w, ..)| w)
-            .or_else(|| ws.tiling.first())
+            .or_else(|| ws.tiling.default_focus())
             .or_else(|| ws.top_float())
     };
     focus_window(state, target.as_ref());
+    // casts sourcing the workspace that just left the glass switch to
+    // tick feeding; without the nudge a client mid-callback never wakes
+    crate::portal::cast::glass_changed(state);
     crate::ipc::emit(state, &serde_json::json!({ "workspace": idx + 1 }));
     state.damage.trigger();
 }
@@ -706,15 +739,7 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
         ws.tiling.remove(&win);
     }
     relayout(state, &ws);
-    {
-        let mut list = state.workspaces.borrow_mut();
-        while list.len() <= n {
-            let w = Workspace::default();
-            w.output.set(state.focused_output.get());
-            w.tiling.set_mode_empty(state.config.borrow().layout.mode);
-            list.push(Rc::new(w));
-        }
-    }
+    ensure_workspace(state, n);
     let target = state.workspaces.borrow()[n].clone();
     let area = tiling_area_for(state, &target);
     let scfg = state.config.borrow().layout.scrolling.clone();
@@ -733,7 +758,7 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
         let (cx, cy) = cursor_pos(state);
         let next = window_at(state, cx, cy)
             .map(|(w, ..)| w)
-            .or_else(|| ws.tiling.first())
+            .or_else(|| ws.tiling.default_focus())
             .or_else(|| ws.top_float());
         focus_window(state, next.as_ref());
     }
@@ -896,6 +921,13 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
             focus_window(state, Some(&next));
             warp_pointer_into(state, from, &next);
             state.damage.trigger();
+            return;
+        }
+        // no neighbor that way: an over-wide column pans instead, so the
+        // part past the view is reachable from the same keys
+        if matches!(dir, Dir::Left | Dir::Right) && ws.tiling.strip.pan(dir == Dir::Left) {
+            relayout(state, &ws);
+            state.damage.trigger();
         }
         return;
     }
@@ -953,7 +985,13 @@ pub(crate) fn focus_window(state: &Rc<State>, win: Option<&Rc<Window>>) {
     if let Some(w) = win {
         if !w.floating.get() {
             if let Some(ws) = workspace_of(state, w) {
-                ws.tiling.note_focus_win(w);
+                // focus handed from outside the strip's own verbs
+                // (activation, cycling, a closing window's successor) can
+                // land on an offscreen column; the view follows focus
+                if ws.tiling.note_focus_win(w) {
+                    relayout(state, &ws);
+                    state.damage.trigger();
+                }
             }
         }
     }
@@ -1206,7 +1244,7 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
         let next = ws
             .tiling
             .window_at(mx, my)
-            .or_else(|| ws.tiling.first())
+            .or_else(|| ws.tiling.default_focus())
             .or_else(|| ws.top_float());
         focus_window(state, next.as_ref());
     }
@@ -1354,6 +1392,31 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
 pub fn window_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<Window>, Rc<WlSurface>, i32, i32)> {
     let ws = workspace_at(state, x, y);
     let fs = ws.fullscreen.borrow().clone();
+    // popups stack above every body, so the part overhanging the parent
+    // hits the popup and not the window it hangs over; float popups over
+    // fullscreen's over tiled, mirroring the draw order
+    let float_vis = fs.is_none() || state.config.borrow().layout.float_above_fullscreen;
+    if float_vis {
+        for win in ws.floats.borrow().iter().rev() {
+            if let Some(hit) = win_popups_hit(state, win, x, y) {
+                return Some(hit);
+            }
+        }
+    }
+    if let Some(f) = &fs {
+        if let Some(hit) = win_popups_hit(state, f, x, y) {
+            return Some(hit);
+        }
+    } else {
+        // later columns draw later; the last hit is the topmost
+        let mut hit = None;
+        ws.tiling.for_each(|w| {
+            hit = win_popups_hit(state, w, x, y).or(hit.take());
+        });
+        if hit.is_some() {
+            return hit;
+        }
+    }
     let check_floats = |list: &Workspace| -> Option<(Rc<Window>, Rc<WlSurface>, i32, i32)> {
         for win in list.floats.borrow().iter().rev() {
             if let Some(hit) = window_hit(state, win, x, y) {
@@ -1379,6 +1442,22 @@ pub fn window_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<Window>, Rc<Wl
     }
     let win = ws.tiling.window_at(x, y)?;
     window_hit(state, &win, x, y)
+}
+
+/// a window's popup subtree alone, anchored like the draw pass
+fn win_popups_hit(
+    state: &Rc<State>,
+    win: &Rc<Window>,
+    x: i32,
+    y: i32,
+) -> Option<(Rc<Window>, Rc<WlSurface>, i32, i32)> {
+    if !win.surface().mapped.get() {
+        return None;
+    }
+    let tl = win.xdg_opt()?;
+    let rect = win.draw_rect(state);
+    let (s, sx, sy) = popups_hit(&tl.xdg, rect.x1, rect.y1, x, y)?;
+    Some((win.clone(), s, sx, sy))
 }
 
 fn window_hit(
@@ -1574,6 +1653,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_new_workspace_carries_the_configured_mode() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        let mut c = crate::config::Config::default();
+        c.layout.mode = crate::config::LayoutMode::Scrolling;
+        *state.config.borrow_mut() = Rc::new(c);
+        let w = new_workspace(&state);
+        assert_eq!(w.tiling.mode(), crate::config::LayoutMode::Scrolling);
+    }
+
+    #[test]
     fn move_anim_offsets_visual_rect() {
         let (state, client) = crate::client::test_utils::test_client();
         let base = crate::shell::xdg::tests::mk_base(&client, 90);
@@ -1595,6 +1684,43 @@ mod tests {
         assert_eq!(win.visual_rect(&state).x1, 200);
         assert!(!win.anims_live(state.anim_clock.now()));
         assert!(win.anims.borrow().move_.is_none());
+    }
+
+    #[test]
+    fn outside_focus_scrolls_the_strip_to_the_window() {
+        let (state, client) = crate::client::test_utils::test_client();
+        state.output_size.set((800, 600));
+        let base = crate::shell::xdg::tests::mk_base(&client, 500);
+        let mut surfs = Vec::new();
+        for i in 0..4u32 {
+            let (s, x, _t) = crate::shell::xdg::tests::mk_toplevel(
+                &client,
+                &base,
+                501 + i * 3,
+                502 + i * 3,
+                503 + i * 3,
+            );
+            crate::shell::xdg::tests::map(&state, &client, &s, &x, 30 + i);
+            surfs.push(s);
+        }
+        let ws = active(&state);
+        set_layout(&state, &ws, crate::config::LayoutMode::Scrolling);
+        relayout(&state, &ws);
+        let head = window_for_surface(&state, &surfs[0]).unwrap();
+        let tail = window_for_surface(&state, &surfs[3]).unwrap();
+        // a protocol-side focus (activation) on the far column scrolls
+        // the view there, no strip verb involved
+        focus_window(&state, Some(&tail));
+        let at_tail = ws.tiling.strip.view_px();
+        assert!(at_tail > 0.0, "the strip scrolled to the tail column");
+        assert!(ws.tiling.strip.view_anim.borrow().is_some(), "the scroll animates");
+        // and back: the head column left-aligns the view again
+        focus_window(&state, Some(&head));
+        assert!(ws.tiling.strip.view_px().abs() < 0.5, "the view follows focus back");
+        // a stationary focus never restarts the scroll
+        *ws.tiling.strip.view_anim.borrow_mut() = None;
+        focus_window(&state, Some(&head));
+        assert!(ws.tiling.strip.view_anim.borrow().is_none(), "no column change, no scroll");
     }
 
     #[test]

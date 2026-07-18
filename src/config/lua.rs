@@ -33,36 +33,114 @@ pub fn parse_at(src: &str, path: &std::path::Path) -> Result<Config, Vec<String>
     parse_inner(src, path.parent().map(std::path::Path::to_path_buf))
 }
 
+/// the loader's spine while includes run: the dir the next relative
+/// path resolves against (top = the file currently executing) and the
+/// canonicalized chain for cycle reporting. both pop when a file ends
+struct Includes {
+    dirs: Vec<std::path::PathBuf>,
+    visited: Vec<std::path::PathBuf>,
+    budget: usize,
+}
+
+impl Includes {
+    fn pop(&mut self) {
+        self.dirs.pop();
+        self.visited.pop();
+    }
+}
+
+/// runs when an included file finishes or errors; either way its frame
+/// leaves the spine
+#[derive(gc_arena::Collect)]
+#[collect(require_static)]
+struct IncludeDone {
+    inc: std::rc::Rc<std::cell::RefCell<Includes>>,
+}
+
+impl<'gc> piccolo::Sequence<'gc> for IncludeDone {
+    fn poll(
+        &mut self,
+        _ctx: piccolo::Context<'gc>,
+        _exec: piccolo::Execution<'gc, '_>,
+        _stack: piccolo::Stack<'gc, '_>,
+    ) -> Result<piccolo::SequencePoll<'gc>, piccolo::Error<'gc>> {
+        self.inc.borrow_mut().pop();
+        Ok(piccolo::SequencePoll::Return)
+    }
+
+    fn error(
+        &mut self,
+        _ctx: piccolo::Context<'gc>,
+        _exec: piccolo::Execution<'gc, '_>,
+        error: piccolo::Error<'gc>,
+        _stack: piccolo::Stack<'gc, '_>,
+    ) -> Result<piccolo::SequencePoll<'gc>, piccolo::Error<'gc>> {
+        self.inc.borrow_mut().pop();
+        Err(error)
+    }
+}
+
 fn parse_inner(src: &str, dir: Option<std::path::PathBuf>) -> Result<Config, Vec<String>> {
     let mut lua = Lua::core();
     let ex = lua
         .try_enter(|ctx| {
             // `include("file.lua")` runs the file in the same globals; the
-            // core sandbox has no io, so the loader is ours to provide
+            // core sandbox has no io, so the loader is ours to provide.
+            // same fences as the kdl walk: relative paths anchor to the
+            // including file, a canonicalized chain names cycles, nesting
+            // stops at the shared depth bound
             if let Some(dir) = dir {
-                let budget = std::rc::Rc::new(std::cell::Cell::new(0usize));
-                let include = Callback::from_fn(&ctx, move |ctx, _, mut stack| {
-                    let name: piccolo::String = stack.consume(ctx)?;
-                    let rel = std::str::from_utf8(name.as_bytes())
-                        .unwrap_or_default()
-                        .to_string();
-                    if budget.replace(budget.get() + 1) >= 64 {
-                        return Err("include: too many included files"
-                            .into_value(ctx)
-                            .into());
-                    }
-                    let q = std::path::Path::new(&rel);
-                    let p = if q.is_absolute() { q.to_path_buf() } else { dir.join(q) };
-                    let text = match std::fs::read_to_string(&p) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            return Err(format!("include {}: {e}", p.display())
+                let inc = std::rc::Rc::new(std::cell::RefCell::new(Includes {
+                    dirs: vec![dir],
+                    visited: Vec::new(),
+                    budget: 0,
+                }));
+                let include = Callback::from_fn(&ctx, {
+                    let inc = inc.clone();
+                    move |ctx, _, mut stack| {
+                        let name: piccolo::String = stack.consume(ctx)?;
+                        let rel = std::str::from_utf8(name.as_bytes())
+                            .unwrap_or_default()
+                            .to_string();
+                        let mut st = inc.borrow_mut();
+                        if st.budget >= 64 {
+                            return Err("include: too many included files"
                                 .into_value(ctx)
                                 .into());
                         }
-                    };
-                    let closure = Closure::load(ctx, Some(rel.as_str()), text.as_bytes())?;
-                    Ok(CallbackReturn::Call { function: closure.into(), then: None })
+                        st.budget += 1;
+                        if st.visited.len() >= super::kdl::MAX_INCLUDE_DEPTH {
+                            return Err("include nesting too deep".into_value(ctx).into());
+                        }
+                        let q = std::path::Path::new(&rel);
+                        let cur = st.dirs.last().cloned().unwrap_or_default();
+                        let p = if q.is_absolute() { q.to_path_buf() } else { cur.join(q) };
+                        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                        if st.visited.contains(&canon) {
+                            return Err(format!("include cycle through {}", p.display())
+                                .into_value(ctx)
+                                .into());
+                        }
+                        let text = match std::fs::read_to_string(&p) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return Err(format!("include {}: {e}", p.display())
+                                    .into_value(ctx)
+                                    .into());
+                            }
+                        };
+                        let closure = Closure::load(ctx, Some(rel.as_str()), text.as_bytes())?;
+                        st.dirs.push(p.parent().map(|d| d.to_path_buf()).unwrap_or(cur));
+                        st.visited.push(canon);
+                        drop(st);
+                        Ok(CallbackReturn::Call {
+                            function: closure.into(),
+                            then: Some(piccolo::BoxSequence::new(
+                                &ctx,
+                                IncludeDone { inc: inc.clone() },
+                            )),
+                        })
+                    }
                 });
                 ctx.set_global("include", include)?;
             }
@@ -411,6 +489,22 @@ fn layout(v: &Value, cfg: &mut Config) -> Result<(), String> {
                                 );
                             }
                             l.scrolling.preset_widths = ws;
+                        }
+                        "preset_heights" => {
+                            let hs: Vec<f64> = indexed_entries(&v, &key)?
+                                .iter()
+                                .filter_map(vnum)
+                                .collect();
+                            if hs.is_empty() || hs.iter().any(|h| !(0.05..=0.95).contains(h)) {
+                                return Err(
+                                    "preset_heights is one or more proportions in 0.05..0.95"
+                                        .into(),
+                                );
+                            }
+                            l.scrolling.preset_heights = hs;
+                        }
+                        "center_single_column" => {
+                            l.scrolling.center_single = need_bool(&v, &key)?;
                         }
                         "default_width" => {
                             l.scrolling.default_width = ColWidthCfg::Prop(super::f64_in(
@@ -931,6 +1025,16 @@ fn action_from(name: &str, args: &[LuaArg]) -> Result<Action, String> {
         "cycle-column-width-back" => Action::CycleColumnWidthBack,
         "toggle-full-width" => Action::ToggleFullWidth,
         "center-column" => Action::CenterColumn,
+        "focus-column-first" => Action::FocusColumnFirst,
+        "focus-column-last" => Action::FocusColumnLast,
+        "move-column-to-first" => Action::MoveColumnToFirst,
+        "move-column-to-last" => Action::MoveColumnToLast,
+        "consume-window-into-column" => Action::ConsumeIntoColumn,
+        "expel-window-from-column" => Action::ExpelFromColumn,
+        "expand-column-to-available-width" => Action::ExpandColumn,
+        "cycle-window-height" => Action::CycleWindowHeight,
+        "cycle-window-height-back" => Action::CycleWindowHeightBack,
+        "reset-window-height" => Action::ResetWindowHeight,
         "pointer-move" => Action::PointerMove,
         "pointer-resize" => Action::PointerResize,
         "set-layout" => match args.first() {

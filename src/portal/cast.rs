@@ -149,6 +149,13 @@ pub async fn start(
         _resizer: resizer,
     });
     state.casts.borrow_mut().push(cast.clone());
+    // a source born off-glass owes the tick its first frames: no glass
+    // change or visible commit will ever come to mark it dirty
+    if !cast.on_glass(state) {
+        crate::trace!("cast: born hidden, tick bootstrap");
+        cast.dirty.set(true);
+        state.cast_kick.trigger();
+    }
     let tick = state.cast_tick.take();
     if tick.is_some() {
         state.cast_tick.set(tick);
@@ -171,6 +178,7 @@ pub fn surface_committed(state: &Rc<State>, surface: &Rc<crate::surface::WlSurfa
     // any workspace, not just the active one: a hidden cast's source is
     // off-glass by definition, so the active-only lookup never finds it
     let win = crate::tree::window_for_surface_any(state, &root);
+    crate::trace!("cast: commit root={} win={}", root.id, win.is_some());
     let mut kick = false;
     for c in state.casts.borrow().iter() {
         if c.dead.get() || c.dirty.get() {
@@ -189,7 +197,36 @@ pub fn surface_committed(state: &Rc<State>, surface: &Rc<crate::surface::WlSurfa
             }
             _ => false,
         };
+        if hit {
+            crate::trace!("cast: src commit glass={} dirty={}", c.on_glass(state), c.dirty.get());
+        }
         if hit && !c.on_glass(state) {
+            c.dirty.set(true);
+            kick = true;
+        }
+    }
+    if kick {
+        state.cast_kick.trigger();
+    }
+}
+
+/// the glass changed: a source that just went hidden owes the tick a
+/// bootstrap frame. its client may hold a frame callback nothing else
+/// will ever fire - presents no longer walk that workspace, and the
+/// commit-driven tick can't start without the commit that callback gates
+pub fn glass_changed(state: &Rc<State>) {
+    if state.casts.borrow().is_empty() {
+        return;
+    }
+    let mut kick = false;
+    for c in state.casts.borrow().iter() {
+        crate::trace!(
+            "cast: glass change dead={} dirty={} glass={}",
+            c.dead.get(),
+            c.dirty.get(),
+            c.on_glass(state)
+        );
+        if !c.dead.get() && !c.dirty.get() && !c.on_glass(state) {
             c.dirty.set(true);
             kick = true;
         }
@@ -221,7 +258,14 @@ async fn tick_loop(state: Rc<State>) {
                     earliest = Some(earliest.map_or(due, |e: u64| e.min(due)));
                     continue;
                 }
-                c.feed_hidden(&state);
+                if c.feed_hidden(&state) {
+                    c.dirty.set(false);
+                } else {
+                    // stream blocked (negotiation, mid-resize): stay dirty
+                    // and poll again shortly, or the wakeup is lost
+                    let retry = Time::now().nsec() + 50_000_000;
+                    earliest = Some(earliest.map_or(retry, |e: u64| e.min(retry)));
+                }
             }
             if sweep {
                 state.casts.borrow_mut().retain(|c| !c.dead.get());
@@ -288,6 +332,9 @@ fn workspace_source(
     state: &Rc<State>,
     index: usize,
 ) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
+    // sharing is a demand site like switching: a workspace the session
+    // never visited exists from the moment someone streams it
+    crate::tree::ensure_workspace(state, index);
     let out_slot = state
         .workspaces
         .borrow()
@@ -483,40 +530,47 @@ impl Cast {
         self.push_frame(state, cap, w, h);
     }
 
-    fn push_frame(&self, state: &Rc<State>, cap: Cap, w: u32, h: u32) {
+    /// false = the stream couldn't take a frame right now (negotiation,
+    /// mid-resize, failed capture); the tick retries those
+    fn push_frame(&self, state: &Rc<State>, cap: Cap, w: u32, h: u32) -> bool {
         {
             let n = self.node.borrow();
             if w != n.width || h != n.height {
+                crate::trace!("cast: size want {}x{} node {}x{}", w, h, n.width, n.height);
                 if self.resize_target.get() != (w, h) {
                     self.resize_target.set((w, h));
                     self.resize_req.push((w, h));
                 }
-                return;
+                return false;
             }
             if !n.ready() {
-                return;
+                crate::trace!("cast: node not ready");
+                return false;
             }
         }
         let now = Time::now().nsec();
         if now.saturating_sub(self.last.get()) < self.frame_ns - self.frame_ns / 10 {
-            return;
+            // fresh enough counts as fed
+            return true;
         }
         let px = match cap {
             Cap::Out(idx) => {
                 let Some(region) = crate::rect::Rect::new_sized(0, 0, w as i32, h as i32) else {
-                    return;
+                    return false;
                 };
                 crate::output::screencopy(state, idx, region, self.cursor)
             }
             Cap::Ws(index) => crate::output::workspace_copy(state, index),
             Cap::Win(win) => crate::output::window_capture(state, &win),
         };
-        let Some(px) = px else { return };
+        crate::trace!("cast: frame {} t={}", px.is_some(), Time::now().nsec());
+        let Some(px) = px else { return false };
         self.node.borrow_mut().produce(|dst, _| {
             let n = px.len().min(dst.len());
             dst[..n].copy_from_slice(&px[..n]);
         });
         self.last.set(now);
+        true
     }
 
     /// the present tail composes this source right now; the tick stays out
@@ -537,43 +591,52 @@ impl Cast {
         }
     }
 
-    /// tick-driven feed for a source that is off glass
-    fn feed_hidden(&self, state: &Rc<State>) {
-        self.dirty.set(false);
+    /// tick-driven feed for a source that is off glass; false = blocked,
+    /// the caller keeps it dirty and retries. the heartbeat fires either
+    /// way so the hidden clients stay alive through stream negotiation
+    fn feed_hidden(&self, state: &Rc<State>) -> bool {
         let ms = (Time::now().nsec() / 1_000_000) as u32;
         match &self.source {
-            Source::Output(_) => {}
+            Source::Output(_) => true,
             Source::Window { win, .. } => {
                 let Some(win) = win.upgrade() else {
                     self.dead.set(true);
-                    return;
+                    return true;
                 };
                 if !win.surface().mapped.get() {
-                    return;
+                    return true;
                 }
                 let rect = win.draw_rect(state);
                 if rect.is_empty() {
-                    return;
+                    return true;
                 }
-                self.push_frame(state, Cap::Win(win.clone()), rect.width() as u32, rect.height() as u32);
+                let fed = self.push_frame(
+                    state,
+                    Cap::Win(win.clone()),
+                    rect.width() as u32,
+                    rect.height() as u32,
+                );
                 fire_tree(&win.surface(), ms);
+                fed
             }
             Source::Workspace(index) => {
                 let Some(ws) = state.workspaces.borrow().get(*index).cloned() else {
                     self.dead.set(true);
-                    return;
+                    return true;
                 };
                 let (w, h) = {
                     let d = state.display.borrow();
-                    let Some(d) = d.as_ref() else { return };
+                    let Some(d) = d.as_ref() else { return true };
                     let outs = d.outputs.borrow();
                     let Some(out) = outs.get(ws.output.get()).or_else(|| outs.first()) else {
-                        return;
+                        return true;
                     };
                     (out.width, out.height)
                 };
-                self.push_frame(state, Cap::Ws(*index), w, h);
+                crate::trace!("cast: tick ws {} feed", index);
+                let fed = self.push_frame(state, Cap::Ws(*index), w, h);
                 ws.for_each(|win| fire_tree(&win.surface(), ms));
+                fed
             }
         }
     }

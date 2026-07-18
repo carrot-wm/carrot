@@ -52,6 +52,19 @@ pub enum Action {
     CycleColumnWidthBack,
     ToggleFullWidth,
     CenterColumn,
+    FocusColumnFirst,
+    FocusColumnLast,
+    MoveColumnToFirst,
+    MoveColumnToLast,
+    /// pull the first window of the column to the right into the active one
+    ConsumeIntoColumn,
+    /// push the active column's bottom window into a fresh column right of it
+    ExpelFromColumn,
+    /// grow the active column into the view space its neighbors leave unused
+    ExpandColumn,
+    CycleWindowHeight,
+    CycleWindowHeightBack,
+    ResetWindowHeight,
     SetLayout(SetLayoutArg),
     /// grab the window under the cursor and let the pointer carry it
     /// while the chord is held: a mouse bind ends on button release, a
@@ -165,16 +178,22 @@ pub enum WsAxis {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScrollCfg {
     pub preset_widths: Vec<f64>,
+    /// tile-height shares cycle-window-height steps through
+    pub preset_heights: Vec<f64>,
     pub default_width: ColWidthCfg,
     pub center_focus: CenterFocus,
+    /// center a lone column even when center-focus is off
+    pub center_single: bool,
 }
 
 impl Default for ScrollCfg {
     fn default() -> ScrollCfg {
         ScrollCfg {
             preset_widths: vec![1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0],
+            preset_heights: vec![1.0 / 3.0, 0.5, 2.0 / 3.0],
             default_width: ColWidthCfg::Prop(0.5),
             center_focus: CenterFocus::Never,
+            center_single: false,
         }
     }
 }
@@ -1211,6 +1230,47 @@ mod tests {
         assert_eq!(cfg.layout.gaps_in, 9);
         // without a file anchor the loader stays out of the sandbox
         assert!(lua::parse(main).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lua_nested_includes_anchor_to_their_file() {
+        let dir = std::env::temp_dir().join(format!("carrot-lnest-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        // mid includes inner by a bare name: it must resolve inside sub/,
+        // not against the top-level file's directory
+        std::fs::write(dir.join("sub/inner.lua"), "carrot.layout = { gaps_in = 11 }").unwrap();
+        std::fs::write(dir.join("sub/mid.lua"), "include(\"inner.lua\")").unwrap();
+        // and once mid returns, the anchor pops back to the top level
+        std::fs::write(dir.join("top.lua"), "carrot.layout.gaps_out = 4").unwrap();
+        let main = "carrot = {}\ninclude(\"sub/mid.lua\")\ninclude(\"top.lua\")";
+        let cfg = lua::parse_at(main, &dir.join("carrot.lua")).unwrap();
+        assert_eq!(cfg.layout.gaps_in, 11);
+        assert_eq!(cfg.layout.gaps_out, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lua_include_cycles_and_depth_fail_loudly() {
+        let dir = std::env::temp_dir().join(format!("carrot-lcyc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.lua"), "carrot = {}\ninclude(\"b.lua\")").unwrap();
+        std::fs::write(dir.join("b.lua"), "include(\"a.lua\")").unwrap();
+        let text = std::fs::read_to_string(dir.join("a.lua")).unwrap();
+        let errs = lua::parse_at(&text, &dir.join("a.lua")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("include cycle through")), "{errs:?}");
+        // a straight chain past the shared bound is named as too deep
+        for i in 0..10 {
+            std::fs::write(
+                dir.join(format!("c{i}.lua")),
+                format!("include(\"c{}.lua\")", i + 1),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("c10.lua"), "carrot.layout = { gaps_in = 1 }").unwrap();
+        let main = "carrot = {}\ninclude(\"c0.lua\")";
+        let errs = lua::parse_at(main, &dir.join("carrot.lua")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("include nesting too deep")), "{errs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

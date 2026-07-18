@@ -231,7 +231,7 @@ impl Strip {
         let cols = self.cols.borrow();
         let active = self.active.get().min(xs.len() - 1);
         let (ax, acw) = xs[active];
-        self.view.set(self.keep_in_view(&xs, ax as f64, acw as f64, aw as f64, cfg.center_focus));
+        self.view.set(self.keep_in_view(&xs, ax as f64, acw as f64, aw as f64, cfg));
         let view = self.view.get();
         let mut out = Vec::new();
         for (c, (cx, cw)) in cols.iter().zip(xs.iter()) {
@@ -255,12 +255,15 @@ impl Strip {
 
     // the view only scrolls when the active column would clip, and it
     // scrolls the minimum amount; wider-than-view columns left-align
-    fn keep_in_view(&self, xs: &[(i32, i32)], col_x: f64, col_w: f64, area_w: f64, mode: CenterFocus) -> f64 {
+    fn keep_in_view(&self, xs: &[(i32, i32)], col_x: f64, col_w: f64, area_w: f64, cfg: &ScrollCfg) -> f64 {
+        let mode = cfg.center_focus;
         let cur = self.view.get();
         if col_w >= area_w {
-            return col_x;
+            // over-wide: any pan across the column survives relayout;
+            // arriving from elsewhere clamps to the nearer edge
+            return cur.clamp(col_x, col_x + col_w - area_w);
         }
-        if mode == CenterFocus::Always {
+        if mode == CenterFocus::Always || (xs.len() == 1 && cfg.center_single) {
             return col_x - (area_w - col_w) / 2.0;
         }
         let (lo, hi) = (col_x + col_w - area_w, col_x);
@@ -291,18 +294,20 @@ impl Strip {
 
     // -- focus --
 
-    /// sync active column/tile to wherever focus actually landed
+    /// sync active column/tile to wherever focus actually landed; true
+    /// when the active column moved and the view may need to follow
     pub fn note_focus(&self, win: &Window) -> bool {
         let Some((ci, ti)) = self.locate(win) else {
             return false;
         };
-        if ci != self.active.get() {
+        let moved = ci != self.active.get();
+        if moved {
             self.prev_active.set(self.active.get());
             self.restore.set(None);
             self.active.set(ci);
         }
         self.cols.borrow_mut()[ci].active_tile = ti;
-        true
+        moved
     }
 
     pub fn focus_dir(&self, dir: Dir) -> Option<Rc<Window>> {
@@ -504,8 +509,223 @@ impl Strip {
         }
     }
 
+    /// slide the view across an over-wide active column; keep-in-view
+    /// clamps rather than pins, so the pan holds until focus moves on
+    pub fn pan(&self, back: bool) -> bool {
+        let area_w = self.last_area.get().width();
+        if area_w <= 0 {
+            return false;
+        }
+        let xs = self.extents(area_w);
+        if xs.is_empty() {
+            return false;
+        }
+        let (cx, cw) = xs[self.active.get().min(xs.len() - 1)];
+        if cw <= area_w {
+            return false;
+        }
+        let (lo, hi) = (cx as f64, (cx + cw - area_w) as f64);
+        let step = area_w as f64 / 2.0 * if back { -1.0 } else { 1.0 };
+        let new = (self.view.get() + step).clamp(lo, hi);
+        if (new - self.view.get()).abs() < 1.0 {
+            return false;
+        }
+        self.view.set(new);
+        true
+    }
+
+    /// jump focus to the strip's first or last column
+    pub fn focus_edge(&self, last: bool) -> Option<Rc<Window>> {
+        let cols = self.cols.borrow();
+        if cols.is_empty() {
+            return None;
+        }
+        let target = if last { cols.len() - 1 } else { 0 };
+        let active = self.active.get().min(cols.len() - 1);
+        if target == active {
+            return None;
+        }
+        self.prev_active.set(active);
+        self.restore.set(None);
+        self.active.set(target);
+        let c = &cols[target];
+        c.tiles.get(c.active_tile).or_else(|| c.tiles.first()).cloned()
+    }
+
+    /// carry the window's whole column to the strip's first or last slot
+    pub fn move_column_to_edge(&self, win: &Window, last: bool) -> bool {
+        let Some((ci, _)) = self.locate(win) else {
+            return false;
+        };
+        let mut cols = self.cols.borrow_mut();
+        let target = if last { cols.len() - 1 } else { 0 };
+        if ci == target {
+            return false;
+        }
+        let col = cols.remove(ci);
+        cols.insert(target, col);
+        self.active.set(target);
+        self.restore.set(None);
+        true
+    }
+
+    /// pull the first window of the column to the right into the bottom
+    /// of this one
+    pub fn consume_into(&self, win: &Window) -> bool {
+        let Some((ci, _)) = self.locate(win) else {
+            return false;
+        };
+        let mut cols = self.cols.borrow_mut();
+        if ci + 1 >= cols.len() {
+            return false;
+        }
+        let (tile, emptied) = {
+            let src = &mut cols[ci + 1];
+            let t = src.tiles.remove(0);
+            src.weights.remove(0);
+            if src.active_tile >= src.tiles.len() && !src.tiles.is_empty() {
+                src.active_tile = src.tiles.len() - 1;
+            }
+            (t, src.tiles.is_empty())
+        };
+        if emptied {
+            cols.remove(ci + 1);
+        }
+        let c = &mut cols[ci];
+        c.tiles.push(tile);
+        c.weights.push(1.0);
+        self.active.set(ci);
+        self.restore.set(None);
+        true
+    }
+
+    /// push this column's bottom window into a fresh column on its right;
+    /// focus follows only when the bottom window was the focused one
+    pub fn expel_from(&self, win: &Window) -> bool {
+        let Some((ci, ti)) = self.locate(win) else {
+            return false;
+        };
+        let mut cols = self.cols.borrow_mut();
+        let c = &mut cols[ci];
+        if c.tiles.len() < 2 {
+            return false;
+        }
+        let was_bottom = ti == c.tiles.len() - 1;
+        let tile = c.tiles.pop().unwrap();
+        c.weights.pop();
+        if c.active_tile >= c.tiles.len() {
+            c.active_tile = c.tiles.len() - 1;
+        }
+        let (width, preset_idx) = (c.width, c.preset_idx);
+        cols.insert(
+            ci + 1,
+            Column {
+                tiles: vec![tile],
+                active_tile: 0,
+                width,
+                preset_idx,
+                full_width: false,
+                weights: vec![1.0],
+            },
+        );
+        self.active.set(if was_bottom { ci + 1 } else { ci });
+        self.restore.set(None);
+        true
+    }
+
+    /// grow the active column into the view space the other fully visible
+    /// columns leave unused; a lone column just fills the view
+    pub fn expand_width(&self, win: &Window) -> bool {
+        let Some((ci, _)) = self.locate(win) else {
+            return false;
+        };
+        let area_w = self.last_area.get().width();
+        if area_w <= 0 {
+            return false;
+        }
+        let xs = self.extents(area_w);
+        let view = self.view.get();
+        let mut visible = 0i64;
+        let mut ours = 0i32;
+        for (i, (x, w)) in xs.iter().enumerate() {
+            if *x as f64 >= view - 0.5 && (*x + *w) as f64 <= view + area_w as f64 + 0.5 {
+                visible += *w as i64;
+                if i == ci {
+                    ours = *w;
+                }
+            }
+        }
+        if ours == 0 {
+            return false;
+        }
+        let leftover = area_w as i64 - visible;
+        if leftover <= 0 {
+            return false;
+        }
+        let mut cols = self.cols.borrow_mut();
+        let c = &mut cols[ci];
+        c.width = ColWidth::Fixed(ours + leftover as i32);
+        c.preset_idx = None;
+        c.full_width = false;
+        true
+    }
+
+    /// the strip's notion of the focused window, for refocus after ops
+    /// that shuffle columns
+    pub fn active_window(&self) -> Option<Rc<Window>> {
+        let cols = self.cols.borrow();
+        let c = cols.get(self.active.get().min(cols.len().checked_sub(1)?))?;
+        c.tiles.get(c.active_tile).or_else(|| c.tiles.first()).cloned()
+    }
+
+    /// walk a tile's height share along the preset ladder: it takes that
+    /// fraction of the column and the rest keep their relative shares
+    pub fn cycle_tile_height(&self, win: &Window, cfg: &ScrollCfg, back: bool) -> bool {
+        let Some((ci, ti)) = self.locate(win) else {
+            return false;
+        };
+        if cfg.preset_heights.is_empty() {
+            return false;
+        }
+        let mut cols = self.cols.borrow_mut();
+        let c = &mut cols[ci];
+        if c.tiles.len() < 2 {
+            return false;
+        }
+        let total: f64 = c.weights.iter().sum::<f64>().max(1e-9);
+        let cur = c.weights[ti] / total;
+        let eps = 0.01;
+        let n = cfg.preset_heights.len();
+        let next = if back {
+            cfg.preset_heights.iter().rposition(|h| *h < cur - eps).unwrap_or(n - 1)
+        } else {
+            cfg.preset_heights.iter().position(|h| *h > cur + eps).unwrap_or(0)
+        };
+        let p = cfg.preset_heights[next].clamp(0.05, 0.95);
+        let others = total - c.weights[ti];
+        c.weights[ti] = p / (1.0 - p) * others.max(1e-9);
+        true
+    }
+
+    /// every tile in the window's column back to an equal share
+    pub fn reset_tile_heights(&self, win: &Window) -> bool {
+        let Some((ci, _)) = self.locate(win) else {
+            return false;
+        };
+        let mut cols = self.cols.borrow_mut();
+        let c = &mut cols[ci];
+        if c.tiles.len() < 2 {
+            return false;
+        }
+        for w in c.weights.iter_mut() {
+            *w = 1.0;
+        }
+        true
+    }
+
     pub fn cycle_width(&self, win: &Window, cfg: &ScrollCfg, back: bool) -> bool {
         let Some((ci, _)) = self.locate(win) else {
+            crate::trace!("cycle-width: #{} not in this strip", win.ident);
             return false;
         };
         if cfg.preset_widths.is_empty() {
@@ -767,6 +987,107 @@ mod tests {
         // half a view wider than the output, pinned to its leading edge
         assert_eq!(r.width(), 1500);
         assert_eq!(r.x1, area().x1);
+    }
+
+    #[test]
+    fn panning_reveals_the_far_side_of_an_over_wide_column_and_sticks() {
+        let (_st, w) = setup(1);
+        let s = Strip::default();
+        let mut c = cfg();
+        c.preset_widths = vec![2.0];
+        s.insert(&w[0], &c);
+        assert!(s.cycle_width(&w[0], &c, false));
+        s.layout(area(), &c);
+        // half-view steps, clamped at the column's trailing edge
+        assert!(s.pan(false));
+        assert_eq!(s.layout(area(), &c)[0].1.x1, area().x1 - 500);
+        assert!(s.pan(false));
+        assert_eq!(s.layout(area(), &c)[0].1.x1, area().x1 - 1000);
+        assert!(!s.pan(false), "already at the trailing edge");
+        assert!(s.pan(true));
+        // a fitting column never pans
+        let mut fit = c.clone();
+        fit.preset_widths = vec![0.5];
+        assert!(s.cycle_width(&w[0], &fit, false));
+        s.layout(area(), &fit);
+        assert!(!s.pan(false));
+    }
+
+    #[test]
+    fn edge_jumps_and_column_carries() {
+        let (_st, w) = setup(3);
+        let s = Strip::default();
+        for win in &w {
+            s.insert(win, &cfg());
+        }
+        let first = s.focus_edge(false).unwrap();
+        assert!(Rc::ptr_eq(&first, &w[0]));
+        assert!(s.focus_edge(false).is_none(), "already first");
+        let last = s.focus_edge(true).unwrap();
+        assert!(Rc::ptr_eq(&last, &w[2]));
+        // carry the first column to the end of the strip
+        assert!(s.move_column_to_edge(&w[0], true));
+        let order: Vec<_> = s.layout(area(), &cfg()).iter().map(|(win, _)| win.clone()).collect();
+        assert!(Rc::ptr_eq(&order[2], &w[0]));
+    }
+
+    #[test]
+    fn consume_pulls_right_and_expel_pushes_right() {
+        let (_st, w) = setup(3);
+        let s = Strip::default();
+        for win in &w {
+            s.insert(win, &cfg());
+        }
+        s.note_focus(&w[0]);
+        // w1's column drains into w0's
+        assert!(s.consume_into(&w[0]));
+        assert_eq!(s.col_count(), 2);
+        assert!(s.consume_into(&w[0]));
+        assert_eq!(s.col_count(), 1);
+        assert!(!s.consume_into(&w[0]), "nothing right of the last column");
+        // bottom tile leaves into its own column; focus stays on w0
+        assert!(s.expel_from(&w[0]));
+        assert_eq!(s.col_count(), 2);
+        assert!(Rc::ptr_eq(&s.active_window().unwrap(), &w[0]));
+    }
+
+    #[test]
+    fn expand_takes_the_leftover_and_heights_cycle() {
+        let (_st, w) = setup(2);
+        let s = Strip::default();
+        let c = cfg();
+        for win in &w {
+            s.insert(win, &c);
+        }
+        s.layout(area(), &c);
+        // two half-width columns leave nothing; shrink one and expand it
+        let mut narrow = c.clone();
+        narrow.preset_widths = vec![0.25];
+        assert!(s.cycle_width(&w[1], &narrow, false));
+        s.layout(area(), &c);
+        assert!(s.expand_width(&w[1]));
+        let xs: i32 = s.layout(area(), &c).iter().map(|(_, r)| r.width()).sum();
+        assert_eq!(xs, 1000, "columns exactly fill the view");
+        // stack both into one column and walk a tile's height share
+        assert!(s.consume_into(&w[0]));
+        let mut hc = c.clone();
+        hc.preset_heights = vec![0.75];
+        assert!(s.cycle_tile_height(&w[0], &hc, false));
+        let r = s
+            .layout(area(), &hc)
+            .iter()
+            .find(|(win, _)| Rc::ptr_eq(win, &w[0]))
+            .unwrap()
+            .1;
+        assert_eq!(r.height(), 450, "three quarters of a 600 tall area");
+        assert!(s.reset_tile_heights(&w[0]));
+        let r = s
+            .layout(area(), &hc)
+            .iter()
+            .find(|(win, _)| Rc::ptr_eq(win, &w[0]))
+            .unwrap()
+            .1;
+        assert_eq!(r.height(), 300);
     }
 
     #[test]

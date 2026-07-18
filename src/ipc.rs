@@ -244,6 +244,14 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
             if let Some(win) = crate::tree::focused_window(state) {
                 let ws = crate::tree::workspace_of(state, &win)
                     .unwrap_or_else(|| crate::tree::active(state));
+                crate::trace!(
+                    "cycle-width: #{} ws_mode={:?} owned={} floating={} fs={}",
+                    win.ident,
+                    ws.tiling.mode(),
+                    crate::tree::workspace_of(state, &win).is_some(),
+                    win.floating.get(),
+                    win.fullscreen.get()
+                );
                 let scfg = state.config.borrow().layout.scrolling.clone();
                 if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
                     && !win.floating.get()
@@ -281,6 +289,103 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
                     .center_active(crate::tree::tiling_area_for(state, &ws));
                 crate::tree::relayout(state, &ws);
                 state.damage.trigger();
+            }
+        }
+        Action::FocusColumnFirst | Action::FocusColumnLast => {
+            let ws = crate::tree::active(state);
+            if ws.tiling.mode() == crate::config::LayoutMode::Scrolling {
+                if let Some(next) =
+                    ws.tiling.strip.focus_edge(matches!(action, Action::FocusColumnLast))
+                {
+                    crate::tree::relayout(state, &ws);
+                    crate::tree::focus_window(state, Some(&next));
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::MoveColumnToFirst | Action::MoveColumnToLast => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws
+                        .tiling
+                        .strip
+                        .move_column_to_edge(&win, matches!(action, Action::MoveColumnToLast))
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::ConsumeIntoColumn | Action::ExpelFromColumn => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                let hit = ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && if matches!(action, Action::ConsumeIntoColumn) {
+                        ws.tiling.strip.consume_into(&win)
+                    } else {
+                        ws.tiling.strip.expel_from(&win)
+                    };
+                if hit {
+                    crate::tree::relayout(state, &ws);
+                    if let Some(next) = ws.tiling.strip.active_window() {
+                        crate::tree::focus_window(state, Some(&next));
+                    }
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::ExpandColumn => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws.tiling.strip.expand_width(&win)
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::CycleWindowHeight | Action::CycleWindowHeightBack => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                let scfg = state.config.borrow().layout.scrolling.clone();
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws.tiling.strip.cycle_tile_height(
+                        &win,
+                        &scfg,
+                        matches!(action, Action::CycleWindowHeightBack),
+                    )
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
+            }
+        }
+        Action::ResetWindowHeight => {
+            if let Some(win) = crate::tree::focused_window(state) {
+                let ws = crate::tree::workspace_of(state, &win)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+                    && !win.floating.get()
+                    && !win.fullscreen.get()
+                    && ws.tiling.strip.reset_tile_heights(&win)
+                {
+                    crate::tree::relayout(state, &ws);
+                    state.damage.trigger();
+                }
             }
         }
         Action::SetLayout(arg) => {
@@ -340,6 +445,10 @@ fn spawn_cmd(state: &Rc<State>, mut c: std::process::Command, what: &str) {
     if let Some(xw) = state.xwayland.borrow().as_ref() {
         c.env("DISPLAY", format!(":{}", xw.display));
     }
+    // never hand clients the launch tty: setsid drops it as controlling
+    // terminal but the inherited fd still reads - a surviving child then
+    // steals the shell's keystrokes once the compositor is gone
+    c.stdin(std::process::Stdio::null());
     unsafe {
         c.pre_exec(|| {
             crate::sighand::unblock_all_in_child();

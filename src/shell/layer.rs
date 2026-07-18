@@ -956,7 +956,7 @@ pub fn apply_kb_lock(state: &Rc<State>) {
                 let (cx, cy) = crate::tree::cursor_pos(state);
                 let next = crate::tree::window_at(state, cx, cy)
                     .map(|(w, ..)| w)
-                    .or_else(|| ws.tiling.first())
+                    .or_else(|| ws.tiling.default_focus())
                     .or_else(|| ws.top_float());
                 crate::input::focus::set_keyboard_focus(
                     state,

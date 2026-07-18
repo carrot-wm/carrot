@@ -106,9 +106,13 @@ layout {
     //     // working area, and anything up to 10.0 makes a column wider
     //     // than the output that the strip scrolls across
     //     preset-widths 0.333 0.5 0.667 1.0
+    //     // the column shares cycle-window-height steps through
+    //     preset-heights 0.333 0.5 0.667
     //     default-width 0.5
     //     // "never", "always" or "on-overflow"
     //     center-focus "never"
+    //     // center a lone column even with center-focus off
+    //     center-single-column false
     // }
 }
 
@@ -287,6 +291,17 @@ binds {
     // Mod+Shift+R { cycle-column-width-back; }
     // Mod+W { toggle-full-width; }
     // Mod+C { center-column; }
+    // Mod+Home { focus-column-first; }
+    // Mod+End { focus-column-last; }
+    // Mod+Ctrl+Home { move-column-to-first; }
+    // Mod+Ctrl+End { move-column-to-last; }
+    // Mod+Comma { consume-window-into-column; }
+    // Mod+Period { expel-window-from-column; }
+    // Mod+Ctrl+F { expand-column-to-available-width; }
+    // Mod+Ctrl+R { cycle-window-height; }
+    // Mod+Ctrl+Shift+R { cycle-window-height-back; }
+    // focus-left/right with no neighbor pans an over-wide column instead,
+    // so the part past the output is reachable from the same keys.
 
     Mod+1 { focus-workspace 1; }
     Mod+2 { focus-workspace 2; }
