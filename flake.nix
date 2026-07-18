@@ -182,6 +182,51 @@
                 default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot;
                 defaultText = "inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot";
               };
+
+              # home-manager's way-displays module assigns systemd.variables to
+              # every wayland.windowManager.* entry (it mapAttrs over
+              # options.wayland.windowManager), and a definition for an
+              # undeclared option is fatal, so these must exist even though
+              # carrot does not implement session-target integration yet.
+              systemd = {
+                enable = mkOption {
+                  type = types.bool;
+                  default = false;
+                  example = true;
+                  description = ''
+                    Whether to enable systemd session integration for carrot.
+
+                    Currently inert: this option only exists so home-manager
+                    modules built on the `wayland.windowManager.<wm>.systemd`
+                    convention (e.g. way-displays) don't fail to evaluate. It
+                    will take effect once carrot gains session-target support.
+                  '';
+                };
+                variables = mkOption {
+                  type = types.listOf types.str;
+                  default = [ ];
+                  example = [ "XDG_SESSION_TYPE" ];
+                  description = ''
+                    Extra variables to import into the systemd and D-Bus user
+                    environment, on top of the {env}`WAYLAND_DISPLAY`,
+                    {env}`DISPLAY` and {env}`XDG_CURRENT_DESKTOP` that carrot
+                    already imports.
+
+                    Currently inert, pending session-target support in carrot.
+                  '';
+                };
+                extraCommands = mkOption {
+                  type = types.listOf types.str;
+                  default = [ ];
+                  example = [ "systemctl --user start carrot-session.target" ];
+                  description = ''
+                    Commands to run once the session target is started.
+
+                    Currently inert, pending session-target support in carrot.
+                  '';
+                };
+              };
+
               settings = mkOption {
                 type = types.nullOr (types.submodule {
                   options = {
