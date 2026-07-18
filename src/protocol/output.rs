@@ -248,7 +248,8 @@ pub fn resend_output_state(state: &Rc<crate::state::State>) {
             };
             out.client.event(|o| {
                 wl_output::geometry::send(o, out.id, x, y, 0, 0, 0, "carrot", &out.name, 0);
-                wl_output::mode::send(o, out.id, 3, w, h, hz as i32);
+                // refresh is millihertz on the wire, like the bind path sends
+                wl_output::mode::send(o, out.id, 3, w, h, (hz * 1000) as i32);
                 if out.version >= 2 {
                     wl_output::done::send(o, out.id);
                 }
