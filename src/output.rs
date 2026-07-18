@@ -2148,7 +2148,7 @@ fn scanout_candidate(
 fn shm_fast_candidate(
     state: &Rc<State>,
     out: &Rc<Output>,
-) -> Option<(Rc<WlSurface>, vk::Buffer, u64, u32)> {
+) -> Option<(Rc<WlSurface>, vk::Buffer, Rc<crate::clientmem::ClientMem>, u64, u32)> {
     macro_rules! veto {
         ($why:literal) => {{
             crate::trace!(concat!("fast veto: ", $why));
@@ -2178,7 +2178,7 @@ fn shm_fast_candidate(
     let Some(src) = out.renderer.host_buffer_for(off.pool()) else {
         veto!("host import unavailable");
     };
-    Some((surface, src, off.pool_offset() as u64, stride / 4))
+    Some((surface, src, off.pool().clone(), off.pool_offset() as u64, stride / 4))
 }
 
 /// commit-side mirror of the fast path: the commit-time texture upload is
@@ -2590,7 +2590,8 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         // fullscreen sealed shm becomes the frame with one copy into the
         // scanout buffer: the flip's fence covers just the copy, so an
         // async commit reaches the plane without paying a render pass
-        let frame = if let Some((surface, src, offset, row_texels)) = shm_fast_candidate(state, out)
+        let frame = if let Some((surface, src, pool, offset, row_texels)) =
+            shm_fast_candidate(state, out)
         {
             crate::trace!("fb-fast: surface #{} t={}", surface.uid, Time::now().nsec());
             out.present_fbs
@@ -2599,7 +2600,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             if !surface.shown.replace(true) {
                 state.shown_surfaces.borrow_mut().push(surface.clone());
             }
-            match out.renderer.copy_frame(src, offset, row_texels, &target, waits) {
+            match out.renderer.copy_frame(src, &pool, offset, row_texels, &target, waits) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("carrot: fullscreen copy failed: {e}");
@@ -2967,13 +2968,17 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
         }
         // sealed pools copy on the gpu straight out of the import; the
         // cpu only records a command buffer. everyone else fills staging
-        let res = if let Some((hbuf, poff)) = buf.shm_sealed_pool().and_then(|off| {
-            out.renderer
-                .host_buffer_for(off.pool())
-                .map(|b| (b, off.pool_offset()))
-        }) {
-            out.renderer
-                .upload_now_from(&entry.0, hbuf, poff as u64, (stride / 4) as u32)
+        let res = if let Some((hbuf, off)) = buf
+            .shm_sealed_pool()
+            .and_then(|off| out.renderer.host_buffer_for(off.pool()).map(|b| (b, off)))
+        {
+            out.renderer.upload_now_from(
+                &entry.0,
+                hbuf,
+                off.pool(),
+                off.pool_offset() as u64,
+                (stride / 4) as u32,
+            )
         } else {
             out.renderer
                 .upload_now(&entry.0, |dst| fill_from_shm(&access, dst, bh, row, stride))
@@ -3665,15 +3670,15 @@ fn draw_buffer(
         if entry.1 != cur {
             // sealed pools sample in place: the gpu copies straight out of
             // the imported client pages, no cpu byte ever moves
-            if let Some((hbuf, poff)) = buf.shm_sealed_pool().and_then(|off| {
-                out.renderer
-                    .host_buffer_for(off.pool())
-                    .map(|b| (b, off.pool_offset()))
-            }) {
+            if let Some((hbuf, off)) = buf
+                .shm_sealed_pool()
+                .and_then(|off| out.renderer.host_buffer_for(off.pool()).map(|b| (b, off)))
+            {
                 let up = out.renderer.external_pre_upload(
                     &entry.0,
                     hbuf,
-                    poff as u64,
+                    off.pool(),
+                    off.pool_offset() as u64,
                     (buf.stride / 4) as u32,
                 );
                 out.preuploads.borrow_mut().push(up);

@@ -258,6 +258,8 @@ pub struct PreUpload {
     row_texels: u32,
     /// owned staging is freed with the frame; imports belong to the pool
     owned: bool,
+    /// the pool an import reads; the Rc pins it until the frame retires
+    pool: Option<Rc<crate::clientmem::ClientMem>>,
 }
 
 /// a commit-time upload in flight: its staging survives until the fence
@@ -269,6 +271,8 @@ struct UploadSlot {
     mem: vk::DeviceMemory,
     cap: u64,
     ptr: *mut u8,
+    /// pool a from-import copy reads; held until the fence says done
+    pool: Option<Rc<crate::clientmem::ClientMem>>,
 }
 
 impl UploadSlot {
@@ -291,6 +295,7 @@ impl UploadSlot {
             mem: vk::DeviceMemory::null(),
             cap: 0,
             ptr: std::ptr::null_mut(),
+            pool: None,
         })
     }
 }
@@ -325,6 +330,8 @@ pub struct Frame {
     fence: vk::Fence,
     waits: Vec<vk::Semaphore>,
     staging: Vec<PreUpload>,
+    /// the pool a fast-path copy reads; pinned until the frame retires
+    pool: Option<Rc<crate::clientmem::ClientMem>>,
 }
 
 impl Frame {
@@ -646,7 +653,7 @@ impl Renderer {
             );
         self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
         unsafe { dev.end_command_buffer(cb) }?;
-        self.submit_frame(cb, waits, uploads)
+        self.submit_frame(cb, waits, uploads, None)
     }
 
     /// a fullscreen client buffer becomes the whole frame: one
@@ -655,6 +662,7 @@ impl Renderer {
     pub fn copy_frame(
         &self,
         src: vk::Buffer,
+        pool: &Rc<crate::clientmem::ClientMem>,
         offset: u64,
         row_texels: u32,
         target: &FrameTarget,
@@ -709,7 +717,7 @@ impl Renderer {
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
         barrier2(dev, cb, &release);
         unsafe { dev.end_command_buffer(cb) }?;
-        self.submit_frame(cb, waits, Vec::new())
+        self.submit_frame(cb, waits, Vec::new(), Some(pool.clone()))
     }
 
     /// staging copies, then the offscreen pre-passes in list order
@@ -806,6 +814,7 @@ impl Renderer {
         cb: vk::CommandBuffer,
         waits: Vec<vk::Semaphore>,
         staging: Vec<PreUpload>,
+        pool: Option<Rc<crate::clientmem::ClientMem>>,
     ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
         let mut export = vk::ExportFenceCreateInfo::default()
@@ -833,14 +842,16 @@ impl Renderer {
                     dev.destroy_semaphore(*s, None);
                 }
                 for u in &staging {
-                    dev.destroy_buffer(u.buffer, None);
-                    dev.free_memory(u.memory, None);
+                    if u.owned {
+                        dev.destroy_buffer(u.buffer, None);
+                        dev.free_memory(u.memory, None);
+                    }
                 }
             }
             self.free_cbs.borrow_mut().push(cb);
             return Err(e.into());
         }
-        Ok(Frame { cb, fence, waits, staging })
+        Ok(Frame { cb, fence, waits, staging, pool })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1732,7 +1743,7 @@ impl Renderer {
             );
             dev.end_command_buffer(cb)?;
         }
-        let frame = self.submit_frame(cb, waits, uploads)?;
+        let frame = self.submit_frame(cb, waits, uploads, None)?;
         frame.wait(self)?;
 
         let size = (w as u64) * (h as u64) * 4;
@@ -1823,17 +1834,20 @@ impl Renderer {
             offset: 0,
             row_texels: 0,
             owned: true,
+            pool: None,
         };
         tex.undefined.set(false);
         Ok(up)
     }
 
     /// a copy straight out of an imported client pool: no staging, no cpu
-    /// bytes moved. the pool import outlives the frame on its own
+    /// bytes moved. the held Rc keeps the import alive past a client that
+    /// dies while the frame is still in flight
     pub fn external_pre_upload(
         &self,
         tex: &Texture,
         buffer: vk::Buffer,
+        pool: &Rc<crate::clientmem::ClientMem>,
         offset: u64,
         row_texels: u32,
     ) -> PreUpload {
@@ -1847,6 +1861,7 @@ impl Renderer {
             offset,
             row_texels,
             owned: false,
+            pool: Some(pool.clone()),
         };
         tex.undefined.set(false);
         up
@@ -2049,10 +2064,16 @@ impl Renderer {
         Some((buf, vmem))
     }
 
-    /// drop imports whose pool object nobody else holds anymore. call
-    /// between frames - never while a submitted frame may still read them
+    /// drop imports whose pool nobody holds anymore. in-flight gpu work
+    /// pins its pool (frame staging, fast-path copies, slot uploads), so
+    /// the count only reaches one once the last reader retired
     pub fn prune_host_imports(&self) {
         let dev = &self.core.device;
+        for s in self.upload_slots.borrow_mut().iter_mut() {
+            if s.pool.is_some() && unsafe { dev.get_fence_status(s.fence) }.unwrap_or(false) {
+                s.pool = None;
+            }
+        }
         self.host_imports.borrow_mut().retain(|_, e| {
             if Rc::strong_count(&e.mem) > 1 {
                 return true;
@@ -2130,6 +2151,7 @@ impl Renderer {
             slot.cap = size;
         }
         fill(unsafe { std::slice::from_raw_parts_mut(slot.ptr, size as usize) });
+        slot.pool = None;
         let (cb, fence, buf) = (slot.cb, slot.fence, slot.buf);
         drop(slots);
         self.record_and_submit_upload(cb, fence, tex, buf, 0, 0)?;
@@ -2143,6 +2165,7 @@ impl Renderer {
         &self,
         tex: &Texture,
         src: vk::Buffer,
+        src_pool: &Rc<crate::clientmem::ClientMem>,
         offset: u64,
         row_texels: u32,
     ) -> Result<bool, RenderError> {
@@ -2163,6 +2186,7 @@ impl Renderer {
             }
             None => return Ok(false),
         };
+        slots[idx].pool = Some(src_pool.clone());
         let (cb, fence) = (slots[idx].cb, slots[idx].fence);
         drop(slots);
         self.record_and_submit_upload(cb, fence, tex, src, offset, row_texels)?;
