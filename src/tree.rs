@@ -754,6 +754,9 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
     target
         .tiling
         .insert(&win, (area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2, &scfg);
+    // the target lays out now: the window must not keep the rect it wore
+    // on the source, invisible until something else touches the workspace
+    relayout(state, &target);
     if ws.output.get() != target.output.get() {
         send_surface_output(state, &win.surface(), ws.output.get(), false);
         send_surface_output(state, &win.surface(), target.output.get(), true);
@@ -1153,13 +1156,14 @@ fn float_into(
 ) {
     ws.tiling.remove(win);
     win.floating.set(true);
-    let (sw, sh) = output_extent(state);
-    let (w, h) = size.unwrap_or((sw / 2, sh / 2));
+    // sized and centered on the workspace's output, never the union
+    let r = workspace_output_rect(state, ws);
+    let (w, h) = size.unwrap_or((r.width() / 2, r.height() / 2));
     let (w, h) = (w.max(1), h.max(1));
     let (x, y) = if center || size.is_none() {
-        ((sw - w) / 2, (sh - h) / 2)
+        (r.x1 + (r.width() - w) / 2, r.y1 + (r.height() - h) / 2)
     } else {
-        (sw / 4, sh / 4)
+        (r.x1 + r.width() / 4, r.y1 + r.height() / 4)
     };
     win.set_rect_animated(state, Rect::new_sized_saturating(x, y, w, h));
     ws.floats.borrow_mut().push(win.clone());
@@ -1703,6 +1707,27 @@ mod tests {
         assert_eq!(win.visual_rect(&state).x1, 200);
         assert!(!win.anims_live(state.anim_clock.now()));
         assert!(win.anims.borrow().move_.is_none());
+    }
+
+    #[test]
+    fn send_to_workspace_lays_the_target_out() {
+        let (state, client) = crate::client::test_utils::test_client();
+        state.output_size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat);
+        let base = crate::shell::xdg::tests::mk_base(&client, 90);
+        // two tiled windows split the source workspace
+        let (s1, x1, _t1) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 91, 92, 93);
+        crate::shell::xdg::tests::map(&state, &client, &s1, &x1, 30);
+        let (s2, x2, _t2) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 94, 95, 96);
+        crate::shell::xdg::tests::map(&state, &client, &s2, &x2, 31);
+        let win = window_for_surface(&state, &s2).unwrap();
+        let half = win.rect.get();
+        assert!(half.width() < 800, "the source split leaves half-width rects");
+        // sent without following, the hidden target lays out immediately
+        send_to_workspace(&state, 1, false);
+        let area = tiling_area_for(&state, &state.workspaces.borrow()[1]);
+        assert_eq!(win.rect.get(), area, "the moved window wears the target layout");
     }
 
     #[test]

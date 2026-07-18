@@ -14,11 +14,18 @@ pub fn toggle_floating(state: &Rc<State>, win: &Rc<Window>) {
     if !win.floating.get() {
         ws.tiling.remove(win);
         win.floating.set(true);
-        let (sw, sh) = super::output_extent(state);
-        let (w, h) = (sw / 2, sh / 2);
+        // the workspace's own output, not the union of every monitor -
+        // a union-based rect straddles the seam on multi-head
+        let r = super::workspace_output_rect(state, &ws);
+        let (w, h) = (r.width() / 2, r.height() / 2);
         win.set_rect_animated(
             state,
-            Rect::new_sized_saturating(sw / 4, sh / 4, w.max(1), h.max(1)),
+            Rect::new_sized_saturating(
+                r.x1 + r.width() / 4,
+                r.y1 + r.height() / 4,
+                w.max(1),
+                h.max(1),
+            ),
         );
         ws.floats.borrow_mut().push(win.clone());
         win.configure_rect();
