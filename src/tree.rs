@@ -594,20 +594,28 @@ pub fn active(state: &Rc<State>) -> Rc<Workspace> {
 
 /// grow the workspace list until `idx` exists; demand sites are switching,
 /// window moves, and workspace shares. new ones land on the focused output
-pub fn ensure_workspace(state: &Rc<State>, idx: usize) {
+/// workspace indices are user input (binds, ipc, the share picker); the
+/// cap keeps one garbage index from driving the grow loop through
+/// billions of allocations on the thread everything shares
+pub const MAX_WORKSPACES: usize = 256;
+
+/// grows the list to reach idx, capped; returns the index actually used
+pub fn ensure_workspace(state: &Rc<State>, idx: usize) -> usize {
+    let idx = idx.min(MAX_WORKSPACES - 1);
     let mut list = state.workspaces.borrow_mut();
     while list.len() <= idx {
         let w = new_workspace(state);
         w.output.set(state.focused_output.get());
         list.push(w);
     }
+    idx
 }
 
 pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     if state.active_ws.get() == idx && !state.workspaces.borrow().is_empty() {
         return;
     }
-    ensure_workspace(state, idx);
+    let idx = ensure_workspace(state, idx);
     let prev_out = state.focused_output.get();
     state.active_ws.set(idx);
     let ws = active(state);
@@ -739,7 +747,7 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
         ws.tiling.remove(&win);
     }
     relayout(state, &ws);
-    ensure_workspace(state, n);
+    let n = ensure_workspace(state, n);
     let target = state.workspaces.borrow()[n].clone();
     let area = tiling_area_for(state, &target);
     let scfg = state.config.borrow().layout.scrolling.clone();
@@ -1660,6 +1668,15 @@ mod tests {
         *state.config.borrow_mut() = Rc::new(c);
         let w = new_workspace(&state);
         assert_eq!(w.tiling.mode(), crate::config::LayoutMode::Scrolling);
+    }
+
+    #[test]
+    fn workspace_indices_are_capped() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        // a garbage index lands on the cap instead of allocating forever
+        switch_workspace(&state, usize::MAX);
+        assert_eq!(state.active_ws.get(), MAX_WORKSPACES - 1);
+        assert_eq!(state.workspaces.borrow().len(), MAX_WORKSPACES);
     }
 
     #[test]

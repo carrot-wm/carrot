@@ -99,6 +99,7 @@ fn parse_choice(line: &str) -> Option<Choice> {
             .parse::<usize>()
             .ok()
             .and_then(|n| n.checked_sub(1))
+            .filter(|n| *n < crate::tree::MAX_WORKSPACES)
             .map(Choice::Workspace);
     }
     None
@@ -192,6 +193,7 @@ fn bind_reach(state: &Rc<State>) -> usize {
         })
         .max()
         .unwrap_or(0)
+        .min(crate::tree::MAX_WORKSPACES)
 }
 
 #[cfg(test)]
@@ -228,5 +230,11 @@ mod tests {
         assert!(parse_choice("w:pigeon").is_none());
         assert!(parse_choice("ws:0").is_none());
         assert!(parse_choice("everything").is_none());
+        // a buggy picker printing a giant index must not reach the tree
+        assert!(parse_choice("ws:9999999999").is_none());
+        assert!(
+            parse_choice(&format!("ws:{}", crate::tree::MAX_WORKSPACES + 1)).is_none(),
+            "past the cap is rejected"
+        );
     }
 }

@@ -332,6 +332,10 @@ fn workspace_source(
     state: &Rc<State>,
     index: usize,
 ) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
+    // picker stdout and restore data are external input
+    if index >= crate::tree::MAX_WORKSPACES {
+        return Err(PwError::Env("no such workspace"));
+    }
     // sharing is a demand site like switching: a workspace the session
     // never visited exists from the moment someone streams it
     crate::tree::ensure_workspace(state, index);
