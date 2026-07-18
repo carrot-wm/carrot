@@ -32,6 +32,15 @@ const REL_HWHEEL_HI_RES: u16 = 0x0c;
 
 const KEY_ESC: u16 = 1;
 const BTN_MOUSE: u16 = 0x110;
+
+/// a drained edge releases as what it was: buttons stay buttons
+fn synth_release(key: u32) -> InputEvent {
+    if key >= BTN_MOUSE as u32 {
+        InputEvent::Button { time_usec: 0, button: key, pressed: false }
+    } else {
+        InputEvent::Key { time_usec: 0, key, pressed: false }
+    }
+}
 const BTN_LEFT: u16 = 0x110;
 const BTN_JOYSTICK: u16 = 0x120;
 const KEY_MAX: usize = 0x2ff;
@@ -293,14 +302,7 @@ impl Manager {
                     // clients must not see keys stuck across the vt
                     let held: Vec<u32> = d.pressed.borrow_mut().drain().collect();
                     for key in held {
-                        sink.push((
-                            d.devnum,
-                            InputEvent::Key {
-                                time_usec: 0,
-                                key,
-                                pressed: false,
-                            },
-                        ));
+                        sink.push((d.devnum, synth_release(key)));
                     }
                 }
                 DeviceEvent::Gone { .. } => {
@@ -336,14 +338,7 @@ impl Manager {
         // removal can beat the pause that would have synthesized these
         let held: Vec<u32> = dev.pressed.borrow_mut().drain().collect();
         for key in held {
-            self.sink.push((
-                devnum,
-                InputEvent::Key {
-                    time_usec: 0,
-                    key,
-                    pressed: false,
-                },
-            ));
+            self.sink.push((devnum, synth_release(key)));
         }
         Some(dev)
     }
@@ -551,28 +546,32 @@ mod tests {
             devices: RefCell::new(Vec::new()),
             sink: Rc::new(AsyncQueue::default()),
         };
-        mgr.devices.borrow_mut().push(fake_device(42));
+        let fake = fake_device(42);
+        // a held mouse button drains alongside the key
+        fake.pressed.borrow_mut().insert(0x110);
+        mgr.devices.borrow_mut().push(fake);
 
         let dev = mgr.detach_device(42).expect("device was listed");
         assert!(mgr.devices.borrow().is_empty());
         assert!(!dev.active.get());
         assert!(dev.pressed.borrow().is_empty());
 
-        // the held key was synthesized as a release
+        // both edges were synthesized as releases of their own kind
         let mut cx = Context::from_waker(Waker::noop());
-        let mut pop = mgr.sink.pop();
-        let Poll::Ready((devnum, ev)) = std::pin::Pin::new(&mut pop).poll(&mut cx) else {
-            panic!("no synthesized release in the sink");
-        };
-        assert_eq!(devnum, 42);
-        assert!(matches!(
-            ev,
-            InputEvent::Key {
-                key: 30,
-                pressed: false,
-                ..
+        let (mut key_up, mut btn_up) = (false, false);
+        for _ in 0..2 {
+            let mut pop = mgr.sink.pop();
+            let Poll::Ready((devnum, ev)) = std::pin::Pin::new(&mut pop).poll(&mut cx) else {
+                panic!("missing a synthesized release in the sink");
+            };
+            assert_eq!(devnum, 42);
+            match ev {
+                InputEvent::Key { key: 30, pressed: false, .. } => key_up = true,
+                InputEvent::Button { button: 0x110, pressed: false, .. } => btn_up = true,
+                other => panic!("unexpected event {other:?}"),
             }
-        ));
+        }
+        assert!(key_up && btn_up, "key released as key, button as button");
 
         // second detach is a no-op
         assert!(mgr.detach_device(42).is_none());

@@ -11,7 +11,7 @@ use crate::input::seat::{KeyAction, SeatGlobal};
 use crate::state::State;
 use wire::MsgBuilder;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -124,17 +124,18 @@ async fn conn(state: Rc<State>, fd: Rc<OwnedFd>) {
     loop {
         let buf = vec![0u8; 4096];
         let Ok((buf, n)) = state.ring.read(&fd, buf).await else {
-            return;
+            break;
         };
         if n == 0 {
-            return;
+            break;
         }
         pending.extend_from_slice(&buf[..n]);
         let open = c.drain(&mut pending);
         if c.flush().await.is_err() || !open {
-            return;
+            break;
         }
     }
+    c.release_held();
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -197,6 +198,9 @@ struct Conn {
     device_id: Cell<u64>,
     /// capability mask advertised on the seat; bind must stay inside it
     caps: Cell<u64>,
+    /// injected edges still down; a dead sender must not leave them pressed
+    held_keys: RefCell<HashSet<u32>>,
+    held_buttons: RefCell<HashSet<u32>>,
 }
 
 impl Conn {
@@ -217,6 +221,8 @@ impl Conn {
             seat_id: Cell::new(0),
             device_id: Cell::new(0),
             caps: Cell::new(0),
+            held_keys: RefCell::new(HashSet::new()),
+            held_buttons: RefCell::new(HashSet::new()),
         }
     }
 
@@ -609,6 +615,11 @@ impl Conn {
             (Iface::Button, 1) => {
                 let button = a.u32()?;
                 let pressed = a.u32()? != 0;
+                if pressed {
+                    self.held_buttons.borrow_mut().insert(button);
+                } else {
+                    self.held_buttons.borrow_mut().remove(&button);
+                }
                 if let Some(seat) = &seat {
                     seat.pointer_button(&self.state, now, button, pressed);
                 }
@@ -645,6 +656,11 @@ impl Conn {
             (Iface::Keyboard, 1) => {
                 let key = a.u32()?;
                 let pressed = a.u32()? != 0;
+                if pressed {
+                    self.held_keys.borrow_mut().insert(key);
+                } else {
+                    self.held_keys.borrow_mut().remove(&key);
+                }
                 if let Some(seat) = &seat {
                     self.key(seat, now, key, pressed);
                 }
@@ -680,6 +696,23 @@ impl Conn {
             d.move_cursor(&self.state, seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
         }
     }
+
+    /// evdev synthesizes releases on pause and detach; the injected side
+    /// owes the same when its sender dies mid-hold
+    fn release_held(&self) {
+        let Some(seat) = self.state.seat.borrow().clone() else {
+            return;
+        };
+        let now = crate::util::Time::now().nsec() / 1_000;
+        let keys: Vec<u32> = self.held_keys.borrow_mut().drain().collect();
+        for key in keys {
+            self.key(&seat, now, key, false);
+        }
+        let buttons: Vec<u32> = self.held_buttons.borrow_mut().drain().collect();
+        for b in buttons {
+            seat.pointer_button(&self.state, now, b, false);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -702,6 +735,23 @@ mod tests {
         )
         .unwrap();
         Conn::new(state, Rc::new(a))
+    }
+
+    #[test]
+    fn a_dead_sender_releases_its_held_edges() {
+        let c = test_conn();
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *c.state.seat.borrow_mut() = Some(seat.clone());
+        // a sender injects a key and a button, then dies mid-hold
+        seat.key(&c.state, 0, 30, true);
+        seat.pointer_button(&c.state, 0, 0x110, true);
+        c.held_keys.borrow_mut().insert(30);
+        c.held_buttons.borrow_mut().insert(0x110);
+        assert!(seat.pressed.borrow().contains(&30));
+        c.release_held();
+        assert!(seat.pressed.borrow().is_empty(), "the key came back up");
+        assert!(c.held_keys.borrow().is_empty());
+        assert!(c.held_buttons.borrow().is_empty());
     }
 
     fn events(c: &Conn) -> Vec<(u64, u32)> {

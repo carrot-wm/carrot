@@ -532,6 +532,14 @@ impl wl_keyboard::Handler for WlKeyboard {
         &self,
         _req: wl_keyboard::release::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // unlist first or the dead id keeps receiving key events
+        if let Some(seat) = self.client.state.seat.borrow().clone() {
+            if let Some(seats) = seat.bindings.borrow().get(&self.client.id) {
+                for s in seats {
+                    s.keyboards.borrow_mut().retain(|k| k.id != self.id);
+                }
+            }
+        }
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -883,6 +891,14 @@ impl wl_pointer::Handler for WlPointer {
         &self,
         _req: wl_pointer::release::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // unlist first or the dead id keeps receiving pointer events
+        if let Some(seat) = self.client.state.seat.borrow().clone() {
+            if let Some(seats) = seat.bindings.borrow().get(&self.client.id) {
+                for s in seats {
+                    s.pointers.borrow_mut().retain(|p| p.id != self.id);
+                }
+            }
+        }
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -1773,6 +1789,31 @@ mod tests {
             region: ObjectId(0),
             lifetime,
         })
+    }
+
+    #[test]
+    fn released_pointers_and_keyboards_stop_receiving() {
+        use wl_keyboard::Handler as _;
+        let (state, client, seat, _s) = setup();
+        let _ = &state;
+        let bind = Rc::new(WlSeat {
+            id: ObjectId(80),
+            client: client.clone(),
+            version: 9,
+            global: seat.clone(),
+            keyboards: RefCell::new(Vec::new()),
+            pointers: RefCell::new(Vec::new()),
+        });
+        client.add_client_obj(bind.clone()).unwrap();
+        seat.bindings.borrow_mut().entry(client.id).or_default().push(bind.clone());
+        bind.get_pointer(wl_seat::get_pointer::Request { id: ObjectId(81) }).unwrap();
+        bind.get_keyboard(wl_seat::get_keyboard::Request { id: ObjectId(82) }).unwrap();
+        let ptr = bind.pointers.borrow()[0].clone();
+        let kb = bind.keyboards.borrow()[0].clone();
+        ptr.release(wl_pointer::release::Request {}).unwrap();
+        kb.release(wl_keyboard::release::Request {}).unwrap();
+        assert!(bind.pointers.borrow().is_empty(), "released pointer unlisted");
+        assert!(bind.keyboards.borrow().is_empty(), "released keyboard unlisted");
     }
 
     #[test]
