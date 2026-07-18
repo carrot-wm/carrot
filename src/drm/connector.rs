@@ -32,6 +32,9 @@ pub struct Connector {
     /// desired vs programmed VRR_ENABLED; flips converge them
     pub vrr_want: Cell<bool>,
     vrr_cur: Cell<bool>,
+    /// the driver called a flip-time vrr toggle a modeset; stop retrying
+    /// every frame - the next real modeset applies it and clears this
+    vrr_flip_denied: Cell<bool>,
     pub modes: RefCell<Vec<ModeInfo>>,
     pub pipe: RefCell<Option<Pipe>>,
     pub flip_pending: Cell<bool>,
@@ -95,6 +98,7 @@ impl Connector {
             vrr_capable: props.value("vrr_capable") == Some(1),
             vrr_want: Cell::new(false),
             vrr_cur: Cell::new(false),
+            vrr_flip_denied: Cell::new(false),
             modes: RefCell::new(info.modes),
             pipe: RefCell::new(None),
             flip_pending: Cell::new(false),
@@ -207,6 +211,8 @@ impl Connector {
             cur.commit_done();
         }
         self.vrr_cur.set(self.vrr_want.get());
+        // the modeset carried the vrr state; flip-time toggles may retry
+        self.vrr_flip_denied.set(false);
         pipe.active.set(true);
     }
 
@@ -379,6 +385,7 @@ impl Connector {
             res = ch.commit(dev.fd.as_fd(), atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT, 0);
             vrr_applied = None;
             if res.is_ok() {
+                self.vrr_flip_denied.set(true);
                 eprintln!("carrot: {}: vrr change needs a modeset on this driver", self.name);
             }
         }
@@ -406,7 +413,9 @@ impl Connector {
         let Some(pipe) = pipe.as_ref() else {
             return false;
         };
-        pipe.crtc.props.vrr_enabled.is_some() && self.vrr_want.get() != self.vrr_cur.get()
+        pipe.crtc.props.vrr_enabled.is_some()
+            && self.vrr_want.get() != self.vrr_cur.get()
+            && !self.vrr_flip_denied.get()
     }
 
     /// tearing flip. the kernel only takes an async commit when FB_ID is the

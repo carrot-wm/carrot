@@ -3044,7 +3044,9 @@ pub fn dpms(state: &Rc<State>, on: bool) {
             o.paused.set(true);
         }
         if let Some(o) = outs.first() {
-            if let Err(e) = o.dev.modeset_heads(&[]) {
+            // modeset_heads(&[]) is a no-op by design; off needs the
+            // dedicated disable commit or the panels keep scanning
+            if let Err(e) = o.dev.disable_all_heads() {
                 eprintln!("carrot: dpms off: {e}");
             }
         }

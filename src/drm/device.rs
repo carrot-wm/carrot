@@ -291,6 +291,31 @@ impl DrmDevice {
         Ok(())
     }
 
+    /// dpms-off: one commit takes every driven head dark. reserved joiner
+    /// slaves stay untouched - the kernel folds them with their master
+    pub fn disable_all_heads(&self) -> Result<(), DrmError> {
+        let mut ch = crate::drm::atomic::Change::default();
+        let mut any = false;
+        for conn in self.connectors.borrow().iter() {
+            let pipe = conn.pipe.borrow();
+            let Some(p) = pipe.as_ref() else { continue };
+            any = true;
+            conn.clear_routing(&mut ch);
+            ch.set(p.crtc.id, p.crtc.props.active, 0);
+            ch.set(p.crtc.id, p.crtc.props.mode_id, 0);
+            ch.set(p.primary.id, p.primary.props.fb_id, 0);
+            ch.set(p.primary.id, p.primary.props.crtc_id, 0);
+            if let Some(cur) = &p.cursor {
+                cur.clear_routing(&mut ch);
+            }
+        }
+        if !any {
+            return Ok(());
+        }
+        ch.commit(self.fd.as_fd(), crate::drm::atomic::ALLOW_MODESET, 0)
+            .map_err(|e| DrmError::Op("disable commit", e))
+    }
+
     /// bring every staged head up in ONE commit so the driver validates the
     /// combined bandwidth; on rejection, walk refresh rates down on the
     /// newest heads until it fits (the dual-head FIFO-underrun fix)
