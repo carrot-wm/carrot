@@ -394,6 +394,34 @@ struct CleanupJob {
     /// when the frame was submitted; the fence-signal instant closes the
     /// gpu-tail sample for the latch scheduler
     submit_ns: u64,
+    flight: FlightGuard,
+}
+
+/// one submitted frame's slot in the global in-flight count. drop-driven
+/// so cancellation can't wedge it: an unplugged output's cleanup task
+/// dies mid-await with jobs queued, and a count that never reaches zero
+/// would park every replaced dmabuf attachment for the session
+struct FlightGuard {
+    state: Rc<State>,
+}
+
+impl FlightGuard {
+    fn new(state: &Rc<State>) -> FlightGuard {
+        state.frames_in_flight.set(state.frames_in_flight.get() + 1);
+        FlightGuard { state: state.clone() }
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let inflight = self.state.frames_in_flight.get().saturating_sub(1);
+        self.state.frames_in_flight.set(inflight);
+        // parked attachments release once NO output still has a frame in
+        // flight that might sample them
+        if inflight == 0 {
+            self.state.retired.borrow_mut().clear();
+        }
+    }
 }
 
 /// the timing model behind late latching: how long a frame costs on the
@@ -544,6 +572,20 @@ mod sched_tests {
     use super::*;
 
     const P: u64 = 2_083_381;
+
+    #[test]
+    fn dropped_flight_guards_never_wedge_the_count() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        let a = FlightGuard::new(&state);
+        let b = FlightGuard::new(&state);
+        assert_eq!(state.frames_in_flight.get(), 2);
+        // guards decrement by drop alone - a cancelled cleanup task takes
+        // this same path, so the count can never wedge above zero
+        drop(a);
+        assert_eq!(state.frames_in_flight.get(), 1);
+        drop(b);
+        assert_eq!(state.frames_in_flight.get(), 0);
+    }
 
     #[test]
     fn score_lands_where_it_aims() {
@@ -959,18 +1001,23 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
             });
         }
         // one consumer per AsyncEvent: mirror global damage into each output.
-        // the boot set covers the window before the display lands in state;
-        // after that the live list picks up hotplugged outputs.
-        let fan_outs = outputs.clone();
+        // the boot set only covers the window before the display lands in
+        // state; from then on the live list is the sole authority - it
+        // shrinks and grows with hotplug, so any fixed prefix assumption
+        // strands an output added after a removal
+        let mut fan_outs = outputs.clone();
         let st = state.clone();
         let fanout = state.eng.spawn("damage fanout", async move {
             loop {
                 st.damage.triggered().await;
-                for o in &fan_outs {
-                    o.damage.trigger();
-                }
                 if let Some(d) = st.display.borrow().as_ref() {
-                    for o in d.outputs.borrow().iter().skip(fan_outs.len()) {
+                    // the boot pins drop with the handoff
+                    fan_outs.clear();
+                    for o in d.outputs.borrow().iter() {
+                        o.damage.trigger();
+                    }
+                } else {
+                    for o in &fan_outs {
                         o.damage.trigger();
                     }
                 }
@@ -1503,6 +1550,10 @@ fn rescan(state: &Rc<State>) {
         // it, outside the borrow in case teardown lands back here
         let present = d._presents.borrow_mut().remove(i);
         drop(present);
+        // the plane's buffer bookkeeping dies with the present loop: retire
+        // cur/prev now or their uids stay listed and every later replaced
+        // attachment with those uids parks in scanout_hold unreleased
+        scanout_reset(state, &out);
         state.globals.remove(out.global_name.get());
         crate::protocol::image_copy_capture::output_removed(state, &out.conn.name);
         crate::protocol::session_lock::output_removed(state, &out.conn.name);
@@ -1531,6 +1582,7 @@ fn rescan(state: &Rc<State>) {
                     c.connector.set(crate::drm::ObjId(0));
                 }
             }
+            out.conn.pipe_torn_down();
         }
         for (_, (t, _)) in out.textures.borrow_mut().drain() {
             out.renderer.destroy_texture(&t);
@@ -2590,7 +2642,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             out.live_scratch.replace(live);
             f
         };
-        state.frames_in_flight.set(state.frames_in_flight.get() + 1);
+        let flight = FlightGuard::new(state);
         buf.undefined.set(false);
         let submit_ns = Time::now().nsec();
 
@@ -2679,7 +2731,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             // no fence to wait: keep them for the next round, like before
             Vec::new()
         };
-        out.gpu_done.push(CleanupJob { frame, sync, retired, submit_ns });
+        out.gpu_done.push(CleanupJob { frame, sync, retired, submit_ns, flight });
     }
 }
 
@@ -2941,28 +2993,24 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
 /// here, off the present loop
 async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
     loop {
-        let job = out.gpu_done.pop().await;
-        let completed = job.sync.is_some();
-        if let Some(fd) = &job.sync {
+        let CleanupJob { frame, sync, retired, submit_ns, flight } = out.gpu_done.pop().await;
+        let completed = sync.is_some();
+        if let Some(fd) = &sync {
             let _ = state.ring.readable(fd).await;
             // the gpu-tail sample for the latch scheduler; capped so a
             // stalled queue can't poison the estimate for seconds
-            let tail = Time::now().nsec().saturating_sub(job.submit_ns);
+            let tail = Time::now().nsec().saturating_sub(submit_ns);
             Sched::ewma(&out.sched.ewma_gpu, tail.min(50_000_000));
         }
         if completed {
-            for t in &job.retired {
+            for t in &retired {
                 out.renderer.destroy_texture(t);
             }
         }
-        // frame done: parked dmabuf attachments release once NO output still
-        // has a frame in flight that might sample them
-        let inflight = state.frames_in_flight.get().saturating_sub(1);
-        state.frames_in_flight.set(inflight);
-        if inflight == 0 {
-            state.retired.borrow_mut().clear();
-        }
-        out.renderer.recycle_frame(job.frame);
+        // frame done: the guard's drop decrements and, at zero, releases
+        // the parked attachments
+        drop(flight);
+        out.renderer.recycle_frame(frame);
         // pending output captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
         crate::protocol::session_lock::output_presented(state, &out.conn.name);

@@ -215,6 +215,15 @@ impl Connector {
         ch.set(self.id, self.prop_crtc_id, 0);
     }
 
+    /// the pipe is gone: any in-flight flip was retired by the disable
+    /// commit, but its event routes by crtc.connector and that mapping is
+    /// being severed - it will never reach flip_done. reset here or the
+    /// flag gates every present of the next output built on this connector
+    pub fn pipe_torn_down(&self) {
+        self.flip_pending.set(false);
+        self.vblank.trigger();
+    }
+
     pub fn assign_pipe(
         self: &Rc<Self>,
         dev: &DrmDevice,
