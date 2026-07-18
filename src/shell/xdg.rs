@@ -24,6 +24,7 @@ use std::rc::{Rc, Weak};
 // xdg_wm_base errors
 pub const ROLE: u32 = 0;
 pub const DEFUNCT_SURFACES: u32 = 1;
+pub const INVALID_POPUP_PARENT: u32 = 3;
 pub const INVALID_POSITIONER: u32 = 5;
 // xdg_surface errors
 pub const ALREADY_CONSTRUCTED: u32 = 2;
@@ -649,7 +650,18 @@ impl xdg_surface::Handler for XdgSurface {
         } else {
             let p = self.base.surfaces.borrow().get(&req.parent).cloned();
             match p {
-                Some(p) => Some(p),
+                Some(p) => {
+                    // rules out self-parenting and parent cycles outright
+                    if !matches!(&*p.ext.borrow(), XdgExt::Toplevel(_) | XdgExt::Popup(_)) {
+                        c.protocol_error(
+                            self.id,
+                            INVALID_POPUP_PARENT,
+                            "the parent has no toplevel or popup role",
+                        );
+                        return Ok(());
+                    }
+                    Some(p)
+                }
                 None => {
                     c.invalid_object(req.parent);
                     return Ok(());
@@ -2229,6 +2241,47 @@ pub(crate) mod tests {
         let mut n = 0;
         ls.for_each_popup(|_| n += 1);
         assert_eq!(n, 1, "the popup was adopted exactly once");
+    }
+
+    #[test]
+    fn get_popup_rejects_a_roleless_parent() {
+        let (_state, client) = test_client();
+        let base = mk_base(&client, 30);
+        let s = WlSurface::new(ObjectId(10), &client, 6);
+        client.add_client_obj(s.clone()).unwrap();
+        client.objects.track_surface(s.clone());
+        base.get_xdg_surface(xdg_wm_base::get_xdg_surface::Request {
+            id: ObjectId(40),
+            surface: ObjectId(10),
+        })
+        .unwrap();
+        let xdg = base.surfaces.borrow().get(&ObjectId(40)).cloned().unwrap();
+        base.create_positioner(xdg_wm_base::create_positioner::Request { id: ObjectId(45) })
+            .unwrap();
+        {
+            let pos = client.objects.positioner(ObjectId(45)).unwrap();
+            use xdg_positioner::Handler as _;
+            pos.set_size(xdg_positioner::set_size::Request { width: 50, height: 30 })
+                .unwrap();
+            pos.set_anchor_rect(xdg_positioner::set_anchor_rect::Request {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            })
+            .unwrap();
+        }
+        // the parent is the popup's own unconstructed xdg_surface - before the
+        // guard this built a surface that was its own parent and the position
+        // solve recursed to a stack overflow
+        xdg.get_popup(xdg_surface::get_popup::Request {
+            id: ObjectId(51),
+            parent: ObjectId(40),
+            positioner: ObjectId(45),
+        })
+        .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+        assert!(matches!(&*xdg.ext.borrow(), XdgExt::None), "no popup was constructed");
     }
 
     #[test]

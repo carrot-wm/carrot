@@ -18,7 +18,7 @@ pub const BAD_PARENT: u32 = 1;
 /// wl_subsurface's own error space
 pub const SUB_BAD_SURFACE: u32 = 0;
 
-const MAX_DEPTH: u32 = 100;
+pub(super) const MAX_DEPTH: u32 = 100;
 
 fn next_uid() -> u64 {
     thread_local! {
@@ -99,7 +99,8 @@ impl wl_subcompositor::Handler for WlSubcompositor {
             c.protocol_error(self.id, BAD_PARENT, "circular subsurface relationship");
             return Ok(());
         }
-        if parent.depth() + 1 > MAX_DEPTH {
+        // the surface may root a tree of its own; bound the grafted total
+        if parent.depth() + 1 + surface.height() > MAX_DEPTH {
             c.protocol_error(self.id, BAD_PARENT, "subsurfaces nested too deeply");
             return Ok(());
         }

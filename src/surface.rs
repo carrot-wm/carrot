@@ -206,6 +206,17 @@ impl WlSurface {
         }
     }
 
+    /// deepest subsurface nesting below this surface; 0 for a leaf
+    pub(crate) fn height(&self) -> u32 {
+        let mut h = 0;
+        if let Some(ch) = &*self.children.borrow() {
+            for sub in ch.subs.values() {
+                h = h.max(1 + sub.surface.height());
+            }
+        }
+        h
+    }
+
     pub fn accepts_input_at(&self, x: i32, y: i32) -> bool {
         let (w, h) = self.size.get();
         if x < 0 || y < 0 || x >= w || y >= h {
@@ -964,6 +975,45 @@ mod tests {
         s.commit(wl_surface::commit::Request {}).unwrap();
         let (hit, ..) = s.find_surface_at(50, 50).unwrap();
         assert!(Rc::ptr_eq(&hit, &s));
+    }
+
+    #[test]
+    fn regrafted_trees_respect_the_depth_bound() {
+        use wl_subcompositor::Handler as _;
+        let (_st, client, s) = setup();
+        let sc = WlSubcompositor {
+            id: ObjectId(90),
+            client: client.clone(),
+        };
+        // grow one level per graft: a fresh root adopts the old tree - the
+        // parent's own depth is always 0, only the grafted height climbs
+        let mut root = s;
+        for i in 0..super::subsurface::MAX_DEPTH {
+            let p = WlSurface::new(ObjectId(1000 + i * 2), &client, 6);
+            client.add_client_obj(p.clone()).unwrap();
+            client.objects.track_surface(p.clone());
+            sc.get_subsurface(wl_subcompositor::get_subsurface::Request {
+                id: ObjectId(1001 + i * 2),
+                surface: root.id,
+                parent: p.id,
+            })
+            .unwrap();
+            root = p;
+        }
+        let errs = count_events(&client.queued_out_bytes(), crate::protocol::WL_DISPLAY_ID, 0);
+        assert_eq!(errs, 0, "grafting up to the bound is fine");
+        let p = WlSurface::new(ObjectId(3000), &client, 6);
+        client.add_client_obj(p.clone()).unwrap();
+        client.objects.track_surface(p.clone());
+        sc.get_subsurface(wl_subcompositor::get_subsurface::Request {
+            id: ObjectId(3001),
+            surface: root.id,
+            parent: p.id,
+        })
+        .unwrap();
+        let errs = count_events(&client.queued_out_bytes(), crate::protocol::WL_DISPLAY_ID, 0);
+        assert_eq!(errs, 1, "one more level is refused");
+        assert!(p.children.borrow().is_none(), "the rejected graft did not link");
     }
 
     #[test]
