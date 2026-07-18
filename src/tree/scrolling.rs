@@ -150,6 +150,9 @@ impl Strip {
             let c = &mut cols[ci];
             c.tiles.remove(ti);
             c.weights.remove(ti);
+            if ti < c.active_tile {
+                c.active_tile -= 1;
+            }
             if c.active_tile >= c.tiles.len() {
                 c.active_tile = c.tiles.len() - 1;
             }
@@ -158,10 +161,27 @@ impl Strip {
             }
             return true;
         }
+        let area_w = self.last_area.get().width().max(1);
+        let removed_x: i32 = cols[..ci].iter().map(|c| Self::col_w(c, area_w)).sum();
+        let removed_w = Self::col_w(&cols[ci], area_w);
         cols.remove(ci);
         let active = self.active.get();
         if ci < active {
             self.active.set(active - 1);
+            // keep the pending restore aimed at the column it meant; the
+            // stored view only shifts if it had scrolled past the dead one
+            match self.restore.get() {
+                Some((prev, view)) if ci < prev => {
+                    let view = if view > removed_x as f64 {
+                        (view - removed_w as f64).max(removed_x as f64)
+                    } else {
+                        view
+                    };
+                    self.restore.set(Some((prev - 1, view)));
+                }
+                Some((prev, _)) if ci == prev => self.restore.set(None),
+                _ => {}
+            }
         } else if ci == active {
             // closing the fresh column goes back where we were
             match self.restore.take() {
@@ -171,6 +191,10 @@ impl Strip {
                 }
                 _ => self.active.set(active.min(cols.len().saturating_sub(1))),
             }
+        }
+        let pa = self.prev_active.get();
+        if ci < pa {
+            self.prev_active.set(pa - 1);
         }
         if self.prev_active.get() >= cols.len() {
             self.prev_active.set(0);
@@ -483,6 +507,9 @@ impl Strip {
             let c = &mut cols[ci];
             let tile = c.tiles.remove(ti);
             c.weights.remove(ti);
+            if ti < c.active_tile {
+                c.active_tile -= 1;
+            }
             if c.active_tile >= c.tiles.len() {
                 c.active_tile = c.tiles.len() - 1;
             }
@@ -583,8 +610,9 @@ impl Strip {
             let src = &mut cols[ci + 1];
             let t = src.tiles.remove(0);
             src.weights.remove(0);
-            if src.active_tile >= src.tiles.len() && !src.tiles.is_empty() {
-                src.active_tile = src.tiles.len() - 1;
+            src.active_tile = src.active_tile.saturating_sub(1);
+            if src.tiles.len() == 1 {
+                src.weights[0] = 1.0;
             }
             (t, src.tiles.is_empty())
         };
@@ -615,6 +643,9 @@ impl Strip {
         c.weights.pop();
         if c.active_tile >= c.tiles.len() {
             c.active_tile = c.tiles.len() - 1;
+        }
+        if c.tiles.len() == 1 {
+            c.weights[0] = 1.0;
         }
         let (width, preset_idx) = (c.width, c.preset_idx);
         cols.insert(
@@ -840,7 +871,17 @@ impl Strip {
     pub fn animate_view(&self, state: &crate::state::State, old_view: f64) {
         let new_view = self.view.get();
         if (new_view - old_view).abs() < 0.5 {
-            return;
+            // the target sat still, but a live glide may head somewhere
+            // the strip no longer goes (mid-anim close restore, pan,
+            // centering write straight to view); pull it back here
+            let now = state.anim_clock.now();
+            let stale = matches!(
+                &*self.view_anim.borrow(),
+                Some(a) if !a.is_done(now) && (a.to() - new_view).abs() >= 0.5
+            );
+            if !stale {
+                return;
+            }
         }
         let cfg = state.config.borrow().clone();
         let Some(motion) = cfg.animations.motion(crate::config::AnimKind::ViewMovement) else {
@@ -1158,6 +1199,85 @@ mod tests {
         assert_eq!(r0.x1, r2.x1, "the neighbor took the stacked slot");
         assert!(r1.x1 > r0.x1, "the mover stands alone on the right");
         assert!(Rc::ptr_eq(&s.first().unwrap(), &w[1]), "active follows the mover");
+    }
+
+    #[test]
+    fn background_close_above_keeps_the_remembered_tile() {
+        let (_st, w) = setup(4);
+        let s = Strip::default();
+        s.insert(&w[0], &cfg());
+        s.insert(&w[1], &cfg());
+        s.insert(&w[2], &cfg());
+        s.note_focus(&w[0]);
+        assert!(s.consume_into(&w[0]));
+        assert!(s.consume_into(&w[0])); // one column: [w0, w1, w2]
+        s.insert(&w[3], &cfg());
+        s.note_focus(&w[1]); // remember the middle tile
+        s.focus_dir(Dir::Right);
+        assert!(s.remove(&w[0])); // the tile above it closes unfocused
+        let f = s.focus_dir(Dir::Left).unwrap();
+        assert!(Rc::ptr_eq(&f, &w[1]), "focus returns to the remembered tile");
+    }
+
+    #[test]
+    fn expel_and_consume_reset_the_lone_survivors_weight() {
+        let (_st, w) = setup(2);
+        let s = Strip::default();
+        s.insert(&w[0], &cfg());
+        s.insert(&w[1], &cfg());
+        assert!(s.consume_or_expel(&w[1], true)); // one column: [w0, w1]
+        let mut hc = cfg();
+        hc.preset_heights = vec![0.75];
+        assert!(s.cycle_tile_height(&w[0], &hc, false));
+        assert!(s.expel_from(&w[0])); // w1 leaves, w0 alone
+        assert!(s.consume_into(&w[0])); // w1 comes back
+        let rects = s.layout(area(), &hc);
+        let r0 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[0])).unwrap().1;
+        assert_eq!(r0.height(), 300, "the survivor forgot its old share");
+    }
+
+    #[test]
+    fn closing_the_fresh_column_survives_an_unrelated_close() {
+        let (_st, w) = setup(4);
+        let s = Strip::default();
+        s.insert(&w[0], &cfg());
+        s.insert(&w[1], &cfg());
+        s.insert(&w[2], &cfg());
+        s.note_focus(&w[1]);
+        s.layout(area(), &cfg());
+        s.insert(&w[3], &cfg()); // fresh column, restore armed at w1
+        s.layout(area(), &cfg());
+        assert!(s.remove(&w[0])); // an unrelated column dies on its own
+        assert!(s.remove(&w[3])); // closing the fresh one goes back
+        assert!(Rc::ptr_eq(&s.first().unwrap(), &w[1]), "restore lands on the remembered column");
+        s.layout(area(), &cfg());
+        assert_eq!(s.view_px(), 0.0, "the restored view dropped the dead column's width");
+    }
+
+    #[test]
+    fn a_dead_targets_view_glide_gets_retargeted() {
+        let (st, w) = setup(3);
+        let s = Strip::default();
+        for win in &w {
+            s.insert(win, &cfg());
+        }
+        let old = s.view_px();
+        s.layout(area(), &cfg());
+        s.animate_view(&st, old); // glide toward the scrolled view
+        assert!(s.view_anim.borrow().is_some());
+        assert!(s.remove(&w[2])); // its target column closes mid-glide
+        let old = s.view_px();
+        s.layout(area(), &cfg());
+        s.animate_view(&st, old);
+        let now = st.anim_clock.now();
+        if let Some(a) = &*s.view_anim.borrow() {
+            if !a.is_done(now) {
+                assert!(
+                    (a.to() - s.view_px()).abs() < 0.5,
+                    "a live glide must head at the live view"
+                );
+            }
+        }
     }
 
     #[test]
