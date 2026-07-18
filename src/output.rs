@@ -2798,7 +2798,7 @@ fn schedule_callbacks(state: &Rc<State>, out: &Rc<Output>) {
         fire_callback_sweep(state);
         return;
     }
-    let content = state
+    let mut content = state
         .workspaces
         .borrow()
         .get(out.ws.get())
@@ -2809,6 +2809,13 @@ fn schedule_callbacks(state: &Rc<State>, out: &Rc<Output>) {
             dmabuf.map(|d| if d { FsContent::Dmabuf } else { FsContent::Shm })
         })
         .unwrap_or(FsContent::Windowed);
+    // "fullscreen dmabuf" only earns the scanout price if the plane will
+    // actually take it: under any standing veto (alpha format, rejected
+    // modifier, cursor or overlay in the scene) the frame composes, and a
+    // wake priced for the plane misses the latch by a whole vblank
+    if content == FsContent::Dmabuf && scanout_candidate(state, out).is_none() {
+        content = FsContent::Windowed;
+    }
     let floor_ns = floor_us.map(|us| us as u64 * 1000).unwrap_or(150_000);
     let grace = grace_us.map(|us| us as u64 * 1000).unwrap_or(600_000);
     // scanout frames never touch the gpu: pricing them with the compose
