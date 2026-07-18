@@ -50,12 +50,12 @@ impl ScreencopyManager {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let c = &self.client;
         let name = c.objects.output(output).map(|o| o.name.clone());
-        let geo = name.and_then(|n| crate::output::output_geometry(&c.state, &n));
+        let geo = name.as_deref().and_then(|n| crate::output::output_geometry(&c.state, n));
         let frame = Rc::new(ScreencopyFrame {
             id,
             client: c.clone(),
             version: self.version,
-            slot: geo.map(|(i, ..)| i),
+            output: name,
             rect: Cell::new(Rect::default()),
             used: Cell::new(false),
             overlay_cursor,
@@ -140,8 +140,10 @@ pub struct ScreencopyFrame {
     pub id: ObjectId,
     pub client: Rc<Client>,
     pub version: u32,
-    /// output slot at creation; None means the frame is dead on arrival
-    slot: Option<usize>,
+    /// output name at creation; the slot resolves fresh at copy time -
+    /// indexes shift under hotplug and a frozen one would land the copy
+    /// on whatever output holds it now. None = dead on arrival
+    output: Option<String>,
     rect: Cell<Rect>,
     used: Cell<bool>,
     /// compose the pointer into the copy (the wlr overlay_cursor flag)
@@ -156,7 +158,14 @@ impl ScreencopyFrame {
             c.protocol_error(self.id, 0, "the frame was already used");
             return Ok(());
         }
-        let Some(slot) = self.slot else {
+        let Some(name) = &self.output else {
+            c.event(|o| zwlr_screencopy_frame_v1::failed::send(o, self.id));
+            return Ok(());
+        };
+        // the output may be gone or replaced since the frame was made;
+        // a rect the live output can't satisfy fails, per the protocol,
+        // instead of copying another output's pixels
+        let Some((slot, ow, oh)) = crate::output::output_geometry(&c.state, name) else {
             c.event(|o| zwlr_screencopy_frame_v1::failed::send(o, self.id));
             return Ok(());
         };
@@ -165,6 +174,10 @@ impl ScreencopyFrame {
             return Ok(());
         };
         let rect = self.rect.get();
+        if rect.x2 > ow as i32 || rect.y2 > oh as i32 {
+            c.event(|o| zwlr_screencopy_frame_v1::failed::send(o, self.id));
+            return Ok(());
+        }
         let (w, h) = (rect.width() as u32, rect.height() as u32);
         let wl_format = if buf.format.has_alpha() {
             WL_SHM_ARGB8888

@@ -1097,12 +1097,17 @@ pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: boo
         }
     };
     let (rw, rh) = (region.width() as usize, region.height() as usize);
-    let (ox, oy) = (region.x1 as usize, region.y1 as usize);
     let src_stride = out.width as usize * 4;
     let mut px = vec![0u8; rw * rh * 4];
-    for row in 0..rh {
-        let s0 = (oy + row) * src_stride + ox * 4;
-        px[row * rw * 4..][..rw * 4].copy_from_slice(&full[s0..s0 + rw * 4]);
+    // the region may predate a topology change and outsize the output now
+    // in the slot; rows past the live extent stay black instead of
+    // slicing past the readback
+    let vis = region.intersect(Rect::new_sized_saturating(0, 0, out.width as i32, out.height as i32));
+    let n = vis.width() as usize * 4;
+    for row in vis.y1..vis.y2 {
+        let s0 = row as usize * src_stride + vis.x1 as usize * 4;
+        let d0 = (row - region.y1) as usize * rw * 4 + (vis.x1 - region.x1) as usize * 4;
+        px[d0..d0 + n].copy_from_slice(&full[s0..s0 + n]);
     }
     Some(px)
 }
