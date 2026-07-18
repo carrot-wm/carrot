@@ -817,6 +817,10 @@ pub(crate) fn color(s: &str) -> Result<[f32; 4], String> {
     let Some(hex) = s.strip_prefix('#') else {
         return Err(format!("color \"{s}\" needs a leading #"));
     };
+    // byte-offset slicing below; a multibyte char must error, not panic
+    if !hex.is_ascii() {
+        return Err(format!("color \"{s}\" is #rgb, #rgba, #rrggbb or #rrggbbaa"));
+    }
     let expand = |c: u8| -> String {
         let ch = c as char;
         format!("{ch}{ch}")
@@ -1175,6 +1179,14 @@ pub fn resolve_remap(
 mod tests {
     use super::kdl::parse;
     use super::*;
+
+    #[test]
+    fn colors_reject_multibyte_instead_of_panicking() {
+        // a mid-pair multibyte char used to hit a byte-offset slice panic
+        assert!(color("#a\u{e9}123").is_err());
+        assert!(color("#\u{e9}\u{e9}\u{e9}\u{e9}").is_err());
+        assert_eq!(color("#ff0000").unwrap(), [1.0, 0.0, 0.0, 1.0]);
+    }
 
     #[test]
     fn first_run_writes_and_fallback_survives() {

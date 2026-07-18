@@ -113,6 +113,10 @@ pub fn start(state: &Rc<State>, sock: EiSocket) -> Ei {
 
 // -- the connection --
 
+fn finite(v: f32) -> Result<f32, &'static str> {
+    if v.is_finite() { Ok(v) } else { Err("non-finite coordinate") }
+}
+
 async fn conn(state: Rc<State>, fd: Rc<OwnedFd>) {
     let c = Conn::new(state.clone(), fd.clone());
     // server speaks first
@@ -597,16 +601,18 @@ impl Conn {
         let seat = self.state.seat.borrow().clone();
         match (iface, opcode) {
             (Iface::Pointer, 1) => {
-                let dx = a.f32()? as f64;
-                let dy = a.f32()? as f64;
+                // clamp preserves NaN, so one poisoned delta would stick
+                // to ptr_x forever; a sender speaking non-finite is broken
+                let dx = finite(a.f32()?)? as f64;
+                let dy = finite(a.f32()?)? as f64;
                 if let Some(seat) = &seat {
                     seat.pointer_motion(&self.state, now, dx, dy, dx, dy);
                     self.move_cursor(seat);
                 }
             }
             (Iface::PointerAbs, 1) => {
-                let x = a.f32()? as f64;
-                let y = a.f32()? as f64;
+                let x = finite(a.f32()?)? as f64;
+                let y = finite(a.f32()?)? as f64;
                 if let Some(seat) = &seat {
                     seat.warp(&self.state, x, y);
                     self.move_cursor(seat);
@@ -626,8 +632,8 @@ impl Conn {
             }
             (Iface::Scroll, 1) => {
                 // px into detent units: carrot speaks 15 px per 120
-                let x = a.f32()? as f64;
-                let y = a.f32()? as f64;
+                let x = finite(a.f32()?)? as f64;
+                let y = finite(a.f32()?)? as f64;
                 if let Some(seat) = &seat {
                     for (horizontal, v) in [(true, x), (false, y)] {
                         if v != 0.0 {

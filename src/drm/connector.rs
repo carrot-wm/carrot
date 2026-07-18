@@ -670,16 +670,22 @@ impl CursorPlane {
 
     /// cleared first so a smaller cursor never leaves stale edges behind
     pub fn write(&self, pixels: &[u8], w: u32, h: u32) {
-        let w = w.min(self.width);
-        let h = h.min(self.height);
+        // the source rows keep the image's own stride: clamping only the
+        // copy extent, or a too-wide cursor shears diagonally
+        let src_stride = (w as usize) * 4;
+        let copy_w = w.min(self.width);
+        let copy_h = h.min(self.height);
+        let copy = (copy_w * 4) as usize;
+        if src_stride == 0 || pixels.len() < copy_h as usize * src_stride {
+            return;
+        }
         let buf = &self.bufs[self.back.get()];
-        let src_stride = (w * 4) as usize;
         unsafe {
             std::ptr::write_bytes(buf.map, 0, buf.size as usize);
-            for row in 0..h as usize {
-                let src = &pixels[row * src_stride..][..src_stride];
+            for row in 0..copy_h as usize {
+                let src = &pixels[row * src_stride..][..copy];
                 let dst = buf.map.add(row * buf.pitch as usize);
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src_stride);
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, copy);
             }
         }
         self.swap.set(true);

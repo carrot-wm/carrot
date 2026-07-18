@@ -137,6 +137,11 @@ fn parse_xcursor(data: &[u8], target_size: u32) -> Option<CursorImage> {
     }
     let width = u32_at(pos + 16);
     let height = u32_at(pos + 20);
+    // the format caps dimensions at 0x7fff; declared sizes past that are
+    // garbage and the byte product below must never wrap small
+    if width == 0 || height == 0 || width > 0x7fff || height > 0x7fff {
+        return None;
+    }
     let hotspot = (u32_at(pos + 24) as i32, u32_at(pos + 28) as i32);
     let start = pos + 36;
     let bytes = (width as usize) * (height as usize) * 4;
@@ -149,4 +154,38 @@ fn parse_xcursor(data: &[u8], target_size: u32) -> Option<CursorImage> {
         height,
         hotspot,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xcur(width: u32, height: u32, payload: usize) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0x7275_6358u32.to_le_bytes());
+        d.extend_from_slice(&16u32.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes()); // ntoc
+        d.extend_from_slice(&0xFFFD_0002u32.to_le_bytes());
+        d.extend_from_slice(&24u32.to_le_bytes()); // nominal size
+        d.extend_from_slice(&28u32.to_le_bytes()); // chunk position
+        d.resize(28 + 16, 0);
+        d.extend_from_slice(&width.to_le_bytes());
+        d.extend_from_slice(&height.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.resize(28 + 36, 0);
+        d.resize(28 + 36 + payload, 0xab);
+        d
+    }
+
+    #[test]
+    fn absurd_declared_dimensions_are_rejected() {
+        // 2^31 x 2^31: the byte product wraps to zero and the old check
+        // passed an empty pixel vec with huge dims up to the plane writer
+        assert!(parse_xcursor(&xcur(0x8000_0000, 0x8000_0000, 4), 24).is_none());
+        assert!(parse_xcursor(&xcur(0, 4, 64), 24).is_none());
+        let img = parse_xcursor(&xcur(2, 2, 16), 24).expect("a sane image parses");
+        assert_eq!((img.width, img.height, img.pixels.len()), (2, 2, 16));
+    }
 }
