@@ -104,6 +104,18 @@ async fn seat_pick(state: &Rc<State>, types: u32) -> Option<cast::RestoreData> {
         result: RefCell::new(None),
     });
     *state.cast_pick.borrow_mut() = Some(pending.clone());
+    // this task dies with its session (Close mid-await drops it); the
+    // armed pick must go too, or the seat eats a later click as consent
+    let disarm = crate::util::OnDrop({
+        let state = state.clone();
+        let p = pending.clone();
+        move || {
+            let mut slot = state.cast_pick.borrow_mut();
+            if slot.as_ref().is_some_and(|cur| Rc::ptr_eq(cur, &p)) {
+                *slot = None;
+            }
+        }
+    });
     let watchdog = state.eng.spawn("pick watchdog", {
         let p = pending.clone();
         let ring = state.ring.clone();
@@ -118,7 +130,7 @@ async fn seat_pick(state: &Rc<State>, types: u32) -> Option<cast::RestoreData> {
     });
     pending.done.triggered().await;
     drop(watchdog);
-    *state.cast_pick.borrow_mut() = None;
+    drop(disarm);
     pending.result.borrow_mut().take()
 }
 

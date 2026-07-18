@@ -21,7 +21,6 @@ pub enum Choice {
 }
 
 pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
-    use std::io::Write;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     // reap strays first, like every other spawn site
@@ -43,14 +42,12 @@ pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
             return None;
         }
     };
-    // the list is tiny; the pipe buffer swallows it whole, and dropping
-    // the handle is the EOF the picker waits for
-    if let Some(mut sin) = child.stdin.take() {
-        let _ = sin.write_all(list.as_bytes());
-    }
+    let sin = child.stdin.take();
     let out: Rc<OwnedFd> = Rc::new(child.stdout.take()?.into());
     let pid = child.id();
     let child = Rc::new(RefCell::new(child));
+    // armed before the list goes out: a picker that never reads its
+    // stdin must not pin the session on a full pipe
     let watchdog = state.eng.spawn("picker watchdog", {
         let ring = state.ring.clone();
         async move {
@@ -67,6 +64,20 @@ pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
             }
         }
     });
+    if let Some(sin) = sin {
+        let fd: Rc<OwnedFd> = Rc::new(sin.into());
+        let mut buf = list.into_bytes();
+        while !buf.is_empty() {
+            match state.ring.write(&fd, buf).await {
+                Ok((b, n)) if n > 0 => {
+                    buf = b;
+                    buf.drain(..n);
+                }
+                _ => break,
+            }
+        }
+        // dropping the handle is the EOF the picker waits for
+    }
     let mut acc = Vec::new();
     let mut buf = vec![0u8; 1024];
     loop {
