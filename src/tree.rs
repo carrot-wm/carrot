@@ -1283,7 +1283,9 @@ fn fullscreen_rect(state: &State, win: &Window) -> Rect {
 }
 
 pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
-    let ws = active(state);
+    // the request may come from a client whose window sits on a hidden
+    // workspace; the slot belongs to the window's own, never the active
+    let ws = workspace_of(state, win).unwrap_or_else(|| active(state));
     if on {
         let mut slot = ws.fullscreen.borrow_mut();
         if slot.is_some() {
@@ -1701,6 +1703,31 @@ mod tests {
         assert_eq!(win.visual_rect(&state).x1, 200);
         assert!(!win.anims_live(state.anim_clock.now()));
         assert!(win.anims.borrow().move_.is_none());
+    }
+
+    #[test]
+    fn fullscreen_lands_on_the_windows_own_workspace() {
+        let (state, client) = crate::client::test_utils::test_client();
+        state.output_size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat);
+        let base = crate::shell::xdg::tests::mk_base(&client, 90);
+        let (s, x, _tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 91, 92, 93);
+        crate::shell::xdg::tests::map(&state, &client, &s, &x, 30);
+        let win = window_for_surface(&state, &s).unwrap();
+        // the window moves to a hidden workspace; the request follows it
+        send_to_workspace(&state, 1, false);
+        assert_eq!(state.active_ws.get(), 0);
+        set_fullscreen(&state, &win, true);
+        let list = state.workspaces.borrow().clone();
+        assert!(list[0].fullscreen.borrow().is_none(), "the active slot stays empty");
+        assert!(
+            list[1].fullscreen.borrow().as_ref().is_some_and(|w| Rc::ptr_eq(w, &win)),
+            "the window's own workspace holds the slot"
+        );
+        set_fullscreen(&state, &win, false);
+        assert!(list[1].fullscreen.borrow().is_none(), "unset clears the same slot");
+        assert!(!win.fullscreen.get());
     }
 
     #[test]
