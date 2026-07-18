@@ -522,7 +522,11 @@ impl Connector {
     }
 
     pub fn flip_done(&self, ev: &FlipComplete) {
-        self.flip_pending.set(false);
+        // a stale event queued for this crtc's previous owner must not
+        // conclude a flip this connector never submitted
+        if !self.flip_pending.replace(false) {
+            return;
+        }
         self.sequence.set(ev.sequence);
         self.flip_time.set((ev.tv_sec, ev.tv_usec));
         let prev = self.seq64.get();

@@ -95,6 +95,9 @@ pub struct State {
     /// an interactive move/resize grab is live; targets track 1:1 and no
     /// animation may spawn or retarget from its relayouts
     pub grab_active: std::cell::Cell<bool>,
+    /// children the spawn sites own; only these ever get reaped, other
+    /// waiters (xwayland) keep their exit statuses
+    pub reap_pids: RefCell<Vec<rustix::process::Pid>>,
     serial: NumCell<u64>,
     /// identity for cache keys: wire ids get reused, uids never do
     obj_uid: NumCell<u64>,
@@ -148,6 +151,7 @@ impl State {
             anim_clock: crate::anim::AnimClock::new(),
             retire_tex: RefCell::new(Vec::new()),
             grab_active: std::cell::Cell::new(false),
+            reap_pids: RefCell::new(Vec::new()),
             serial: NumCell::new(0),
             obj_uid: NumCell::new(0),
         })

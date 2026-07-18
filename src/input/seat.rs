@@ -413,6 +413,24 @@ impl wl_seat::Handler for WlSeat {
             version: self.version,
         });
         self.client.add_client_obj(ptr.clone())?;
+        // late enter: the cursor may already rest on us, and motion or
+        // button must never reach a pointer that was not entered first
+        let focus = self.global.ptr_focus.borrow().clone();
+        if let Some(surface) = focus {
+            if surface.client.id == self.client.id && !surface.destroyed.get() {
+                let serial = self.client.state.next_serial(Some(&self.client)) as u32;
+                self.global.ptr_enter_serial.set(serial);
+                let (ox, oy) = self.global.ptr_origin.get();
+                let fx = Fixed::from_int(self.global.ptr_x.get() as i32 - ox);
+                let fy = Fixed::from_int(self.global.ptr_y.get() as i32 - oy);
+                self.client.event(|o| {
+                    wl_pointer::enter::send(o, ptr.id, serial, surface.id, fx, fy);
+                    if self.version >= wl_pointer::frame::SINCE {
+                        wl_pointer::frame::send(o, ptr.id);
+                    }
+                });
+            }
+        }
         self.pointers.borrow_mut().push(ptr);
         Ok(())
     }

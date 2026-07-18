@@ -33,12 +33,12 @@ const REL_HWHEEL_HI_RES: u16 = 0x0c;
 const KEY_ESC: u16 = 1;
 const BTN_MOUSE: u16 = 0x110;
 
-/// a drained edge releases as what it was: buttons stay buttons
-fn synth_release(key: u32) -> InputEvent {
+/// a synthesized edge keeps its type: buttons stay buttons
+fn synth_edge(key: u32, pressed: bool) -> InputEvent {
     if key >= BTN_MOUSE as u32 {
-        InputEvent::Button { time_usec: 0, button: key, pressed: false }
+        InputEvent::Button { time_usec: 0, button: key, pressed }
     } else {
-        InputEvent::Key { time_usec: 0, key, pressed: false }
+        InputEvent::Key { time_usec: 0, key, pressed }
     }
 }
 const BTN_LEFT: u16 = 0x110;
@@ -302,7 +302,7 @@ impl Manager {
                     // clients must not see keys stuck across the vt
                     let held: Vec<u32> = d.pressed.borrow_mut().drain().collect();
                     for key in held {
-                        sink.push((d.devnum, synth_release(key)));
+                        sink.push((d.devnum, synth_edge(key, false)));
                     }
                 }
                 DeviceEvent::Gone { .. } => {
@@ -338,7 +338,7 @@ impl Manager {
         // removal can beat the pause that would have synthesized these
         let held: Vec<u32> = dev.pressed.borrow_mut().drain().collect();
         for key in held {
-            self.sink.push((devnum, synth_release(key)));
+            self.sink.push((devnum, synth_edge(key, false)));
         }
         Some(dev)
     }
@@ -370,6 +370,7 @@ impl Device {
             let mut wheel_h = 0i32;
             let mut hires_v = false;
             let mut hires_h = false;
+            let mut dropped = false;
             loop {
                 let fd = dev.fd.borrow().clone();
                 let (b, n) = match ring.read(&fd, buf).await {
@@ -390,6 +391,29 @@ impl Device {
                     let ty = u16::from_ne_bytes(ev[16..18].try_into().unwrap());
                     let code = u16::from_ne_bytes(ev[18..20].try_into().unwrap());
                     let value = i32::from_ne_bytes(ev[20..24].try_into().unwrap());
+                    // everything after an overrun is garbage through the
+                    // next SYN_REPORT; then the kernel bitmask is truth
+                    // and the edges it swallowed synthesize, like resume
+                    if dropped {
+                        if ty == EV_SYN && code == SYN_REPORT {
+                            dropped = false;
+                            let held: HashSet<u32> =
+                                held_keys(dev.fd.borrow().as_fd()).into_iter().collect();
+                            let mut ours = dev.pressed.borrow_mut();
+                            let lost: Vec<u32> =
+                                ours.iter().copied().filter(|k| !held.contains(k)).collect();
+                            for key in lost {
+                                ours.remove(&key);
+                                sink.push((dev.devnum, synth_edge(key, false)));
+                            }
+                            for key in held {
+                                if ours.insert(key) {
+                                    sink.push((dev.devnum, synth_edge(key, true)));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     match ty {
                         EV_KEY => {
                             // 2 = kernel autorepeat; ours is server-side
@@ -459,6 +483,9 @@ impl Device {
                             dy = 0.0;
                             wheel_v = 0;
                             wheel_h = 0;
+                            hires_v = false;
+                            hires_h = false;
+                            dropped = true;
                         }
                         EV_SYN if code == SYN_REPORT => {
                             let mut any = false;

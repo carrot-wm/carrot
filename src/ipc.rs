@@ -426,11 +426,21 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
     }
 }
 
+/// reap only the children the spawn sites own; a blanket wait(-1) here
+/// once stole the xwayland child's exit status out from under its waiter,
+/// leaving a raw-pid kill aimed at a number the kernel could reuse
+pub(crate) fn reap_spawned(state: &Rc<State>) {
+    use rustix::process::{WaitOptions, waitpid};
+    state
+        .reap_pids
+        .borrow_mut()
+        .retain(|pid| matches!(waitpid(Some(*pid), WaitOptions::NOHANG), Ok(None)));
+}
+
 // reap first so dead children never pile up as zombies, then detach the
 // new one into its own session
 fn spawn_cmd(state: &Rc<State>, mut c: std::process::Command, what: &str) {
-    use rustix::process::{WaitOptions, wait};
-    while let Ok(Some(_)) = wait(WaitOptions::NOHANG) {}
+    reap_spawned(state);
     use std::os::unix::process::CommandExt;
     for (name, val) in state.config.borrow().environment.iter() {
         match val {
@@ -457,7 +467,11 @@ fn spawn_cmd(state: &Rc<State>, mut c: std::process::Command, what: &str) {
         });
     }
     match c.spawn() {
-        Ok(_) => {}
+        Ok(child) => {
+            if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+                state.reap_pids.borrow_mut().push(pid);
+            }
+        }
         Err(e) => eprintln!("carrot: spawn \"{what}\": {e}"),
     }
 }

@@ -24,7 +24,7 @@ pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     // reap strays first, like every other spawn site
-    while let Ok(Some(_)) = rustix::process::wait(rustix::process::WaitOptions::NOHANG) {}
+    crate::ipc::reap_spawned(state);
     let list = candidates(state, types);
     let mut c = Command::new("/bin/sh");
     c.arg("-c").arg(cmd).stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -93,7 +93,12 @@ pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
         }
     }
     drop(watchdog);
-    let _ = child.borrow_mut().try_wait();
+    if child.borrow_mut().try_wait().ok().flatten().is_none() {
+        // still running (or already stolen): the scoped reaper collects it
+        if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+            state.reap_pids.borrow_mut().push(pid);
+        }
+    }
     let end = acc.iter().position(|&c| c == b'\n').unwrap_or(acc.len());
     parse_choice(String::from_utf8_lossy(&acc[..end]).trim())
 }

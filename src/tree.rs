@@ -1185,6 +1185,9 @@ pub(crate) fn workspace_of(state: &Rc<State>, win: &Rc<Window>) -> Option<Rc<Wor
 
 pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
     let ws = workspace_of(state, win).unwrap_or_else(|| active(state));
+    // remembered past the clear below: the close-anim skip and the rules
+    // judge the window as it stood, not as the teardown left it
+    let was_fullscreen = win.fullscreen.get();
     if win.fullscreen.get() {
         win.fullscreen.set(false);
         let mut slot = ws.fullscreen.borrow_mut();
@@ -1202,9 +1205,9 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
             &win.app_id(),
             &win.title(),
             win.x11_opt().is_some(),
-            false,
+            was_fullscreen,
         );
-        if !fx.no_anim && !win.fullscreen.get() {
+        if !fx.no_anim && !was_fullscreen {
             if let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowClose) {
                 let out = state
                     .display

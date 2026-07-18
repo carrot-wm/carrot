@@ -4483,8 +4483,10 @@ fn draw_window(
     }
     let send = ops.len();
     // captured before dim and the open transform, minus the blur backdrop:
-    // close anims and resize snapshots replay clean, untransformed content
-    if !xfaded {
+    // close anims and resize snapshots replay clean, untransformed content.
+    // presents only: a capture composing mid-anim draws at anim-derived
+    // rects, and a snapshot baked from those replays displaced
+    if !xfaded && mode == DrawMode::Present {
         *win.last_batch.borrow_mut() = (
             ops[cmark..].to_vec(),
             live[lmark..].to_vec(),
