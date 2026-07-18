@@ -132,7 +132,7 @@ pub struct DataDevices {
 }
 
 impl DataDevices {
-    pub fn drop_client(&self, id: ClientId) {
+    pub fn drop_client(&self, state: &Rc<State>, id: ClientId) {
         if let Some(drag) = self.drag() {
             if drag.client.id == id {
                 self.dnd_teardown(false);
@@ -150,7 +150,9 @@ impl DataDevices {
         };
         self.sources.borrow_mut().retain(|k, _| k.0 != id);
         if owned {
-            *self.selection.borrow_mut() = None;
+            // the dead owner's clipboard clears loudly: the focus holder
+            // gets selection(nil) and watchers see the change
+            self.set_selection_source(state, None);
         }
     }
 
@@ -529,11 +531,9 @@ impl wl_data_source::Handler for WlDataSource {
                 _ => false,
             };
             if is_selection {
-                *seat.data.selection.borrow_mut() = None;
-                let focused = seat.kb_focus.borrow().clone();
-                if let Some(surface) = focused {
-                    seat.data.offer_to(&surface.client);
-                }
+                // the full clear path: focus holder gets selection(nil)
+                // and windowless watchers hear about it too
+                seat.data.set_selection_source(&self.client.state, None);
             }
         }
         self.client.remove_obj(self.id)?;
@@ -936,6 +936,43 @@ mod tests {
         assert_eq!(count_events(&bytes, dev.id, 0), 1, "data_offer");
         assert_eq!(count_events(&bytes, offer_id, 0), 1, "offer(mime)");
         assert_eq!(count_events(&bytes, dev.id, 5), 1, "selection");
+    }
+
+    #[test]
+    fn a_dead_owners_selection_clears_for_the_survivor() {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        let (state, client, seat, dev, _src) = setup();
+        dev.set_selection(wl_data_device::set_selection::Request {
+            source: ObjectId(62),
+            serial: 1,
+        })
+        .unwrap();
+        // a second client holds the focus when the owner goes away
+        let (a, _keep) =
+            socketpair(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)
+                .unwrap();
+        let survivor = state.clients.spawn(&state, a).unwrap();
+        let mgr = Rc::new(WlDataDeviceManager {
+            id: ObjectId(60),
+            client: survivor.clone(),
+            version: 3,
+        });
+        survivor.add_client_obj(mgr.clone()).unwrap();
+        mgr.get_data_device(wl_data_device_manager::get_data_device::Request {
+            id: ObjectId(61),
+            seat: ObjectId(9),
+        })
+        .unwrap();
+        let dev2 = seat.data.devices.borrow()[&survivor.id][0].clone();
+        let s2 = WlSurface::new(ObjectId(10), &survivor, 6);
+        survivor.add_client_obj(s2.clone()).unwrap();
+        survivor.objects.track_surface(s2.clone());
+        *seat.kb_focus.borrow_mut() = Some(s2);
+        let before = count_events(&survivor.queued_out_bytes(), dev2.id, 5);
+        seat.drop_client(&state, client.id);
+        let after = count_events(&survivor.queued_out_bytes(), dev2.id, 5);
+        assert_eq!(after - before, 1, "the survivor heard selection(nil)");
+        assert!(seat.data.current_source().is_none());
     }
 
     #[test]

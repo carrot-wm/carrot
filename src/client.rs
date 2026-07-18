@@ -175,7 +175,7 @@ impl Drop for ClientHolder {
         // seat state can outlive every wl_seat object, so the client's
         // devices and sources go here, not in a break_loops
         if let Some(seat) = self.data.state.seat.borrow().clone() {
-            seat.drop_client(self.data.id);
+            seat.drop_client(&self.data.state, self.data.id);
         }
         // ditto for layer surfaces: their exclusive zones must be handed
         // back even though the client never said destroy

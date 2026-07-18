@@ -251,10 +251,10 @@ impl SeatGlobal {
         });
     }
 
-    pub fn drop_client(&self, id: ClientId) {
+    pub fn drop_client(&self, state: &Rc<State>, id: ClientId) {
         self.bindings.borrow_mut().remove(&id);
-        self.data.drop_client(id);
-        self.primary.drop_client(id);
+        self.data.drop_client(state, id);
+        self.primary.drop_client(state, id);
         self.data_control.drop_client(id);
         self.popup_grab
             .borrow_mut()
@@ -496,7 +496,7 @@ impl Object for WlSeat {
     }
 
     fn break_loops(&self) {
-        self.global.drop_client(self.client.id);
+        self.global.drop_client(&self.client.state, self.client.id);
         self.keyboards.borrow_mut().clear();
         self.pointers.borrow_mut().clear();
     }

@@ -26,7 +26,7 @@ pub struct PrimaryDevices {
 }
 
 impl PrimaryDevices {
-    pub fn drop_client(&self, id: ClientId) {
+    pub fn drop_client(&self, state: &Rc<State>, id: ClientId) {
         self.devices.borrow_mut().remove(&id);
         let owned = {
             let sources = self.sources.borrow();
@@ -36,7 +36,8 @@ impl PrimaryDevices {
         };
         self.sources.borrow_mut().retain(|k, _| k.0 != id);
         if owned {
-            *self.selection.borrow_mut() = None;
+            // clear through the loud path so focus and watchers both hear
+            self.set_selection_source(state, None);
         }
     }
 
@@ -245,11 +246,8 @@ impl source::Handler for PrimarySource {
                 _ => false,
             };
             if is_selection {
-                *seat.primary.selection.borrow_mut() = None;
-                let focused = seat.kb_focus.borrow().clone();
-                if let Some(surface) = focused {
-                    seat.primary.offer_to(&surface.client);
-                }
+                // the full clear path notifies watchers, not just the focus
+                seat.primary.set_selection_source(&self.client.state, None);
             }
         }
         self.client.remove_obj(self.id)?;
