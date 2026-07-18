@@ -37,7 +37,8 @@ pub struct SeatGlobal {
     pub mods: Cell<Mods>,
     /// server-side repeat, v10+ keyboards only. the version counter
     /// invalidates any timer already in flight
-    repeat_key: Cell<Option<u32>>,
+    /// key and the bind-mods it was armed under; a repeat keeps its chord
+    repeat_key: Cell<Option<(u32, u32)>>,
     repeat_version: crate::util::NumCell<u64>,
     pub repeat_armed: crate::util::AsyncEvent,
     /// pointer position and the surface under it, pinned while a button is
@@ -174,8 +175,8 @@ impl SeatGlobal {
         self.repeat_version.fetch_add(1);
     }
 
-    fn arm_repeat(&self, key: u32) {
-        self.repeat_key.set(Some(key));
+    fn arm_repeat(&self, key: u32, mods: u32) {
+        self.repeat_key.set(Some((key, mods)));
         self.repeat_version.fetch_add(1);
         self.repeat_armed.trigger();
     }
@@ -188,7 +189,7 @@ impl SeatGlobal {
             let mut first = true;
             loop {
                 let version = self.repeat_version.get();
-                let Some(key) = self.repeat_key.get() else {
+                let Some((key, mods)) = self.repeat_key.get() else {
                     break;
                 };
                 let (rate, delay) = {
@@ -206,28 +207,34 @@ impl SeatGlobal {
                     return;
                 }
                 // superseded or cancelled while we slept
-                if self.repeat_version.get() != version || self.repeat_key.get() != Some(key) {
+                if self.repeat_version.get() != version
+                    || self.repeat_key.get() != Some((key, mods))
+                {
                     break;
                 }
-                self.repeat_fire(&state, key);
+                self.repeat_fire(&state, key, mods);
             }
         }
     }
 
     /// v10+ got rate=0 and rely on us for Repeated; v4-9 repeat client-side
-    fn repeat_fire(&self, state: &Rc<State>, key: u32) {
+    fn repeat_fire(&self, state: &Rc<State>, key: u32, armed_mods: u32) {
         const REPEATED: u32 = 2;
         {
             const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
             let held_mods = self.mods.get().depressed & MASK;
-            let cfg = state.config.borrow().clone();
-            let hit = cfg
-                .binds
-                .iter()
-                .find(|b| b.repeat && b.mods == held_mods && b.key == key);
-            if let Some(b) = hit {
-                crate::ipc::dispatch_action(state, &b.action);
-                return;
+            // the chord that armed the repeat must still be down; mods
+            // pressed since must not re-aim it at some other bind
+            if held_mods == armed_mods {
+                let cfg = state.config.borrow().clone();
+                let hit = cfg
+                    .binds
+                    .iter()
+                    .find(|b| b.repeat && b.mods == armed_mods && b.key == key);
+                if let Some(b) = hit {
+                    crate::ipc::dispatch_action(state, &b.action);
+                    return;
+                }
             }
         }
         let focus = self.kb_focus.borrow().clone();
@@ -999,6 +1006,9 @@ impl SeatGlobal {
 
         // binds exact-match the depressed set masked to shift|ctrl|alt|super
         if pressed {
+            // any press disarms a waiting release bind, even one that
+            // matches another bind and returns early below
+            self.armed_release.borrow_mut().take();
             const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
             const CTRL_ALT: u32 = (1 << 2) | (1 << 3);
             let held_mods = self.mods.get().depressed & MASK;
@@ -1019,7 +1029,6 @@ impl SeatGlobal {
             let cfg = state.config.borrow().clone();
             // a locked session only honors binds that opted in
             let locked = crate::protocol::session_lock::locked(state);
-            // a press of anything else disarms a waiting release bind
             let mut armed = None;
             for b in cfg.binds.iter() {
                 if held_mods == b.mods && key == b.key {
@@ -1042,7 +1051,7 @@ impl SeatGlobal {
                     }
                     if b.repeat {
                         // re-fires from the repeat loop while held
-                        self.arm_repeat(key);
+                        self.arm_repeat(key, held_mods);
                         return KeyAction::Act(b.action.clone());
                     }
                     self.cancel_repeat();
@@ -1104,8 +1113,9 @@ impl SeatGlobal {
             client.flush_eager();
             let group = self.mods.get().group;
             if pressed && map.repeats(key, group) {
-                self.arm_repeat(key);
-            } else if !pressed && self.repeat_key.get() == Some(key) {
+                const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
+                self.arm_repeat(key, self.mods.get().depressed & MASK);
+            } else if !pressed && self.repeat_key.get().is_some_and(|(k, _)| k == key) {
                 self.cancel_repeat();
             }
         }
@@ -1789,6 +1799,70 @@ mod tests {
             region: ObjectId(0),
             lifetime,
         })
+    }
+
+    #[test]
+    fn repeat_fires_only_the_chord_that_armed_it() {
+        let (state, _client, seat, s) = setup();
+        *seat.kb_focus.borrow_mut() = Some(s.clone());
+        let mut cfg = (**state.config.borrow()).clone();
+        cfg.binds.push(crate::config::Bind {
+            mods: 1 << 6,
+            key: 12,
+            action: crate::config::Action::FocusWorkspace(5),
+            on_release: false,
+            repeat: true,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
+        });
+        *state.config.borrow_mut() = Rc::new(cfg);
+        // '-' held plain arms a client repeat under no mods
+        seat.key(&state, 0, 12, true);
+        assert_eq!(seat.repeat_key.get(), Some((12, 0)), "armed with its chord");
+        // super pressed mid-hold must not re-aim the repeat at mod+minus
+        seat.key(&state, 1000, 125, true);
+        seat.repeat_fire(&state, 12, 0);
+        assert_eq!(state.active_ws.get(), 0, "the repeat kept its armed chord");
+        // the real chord re-arms with its mods and fires its bind
+        seat.key(&state, 2000, 12, false);
+        seat.key(&state, 3000, 12, true);
+        assert_eq!(seat.repeat_key.get(), Some((12, 1 << 6)));
+        seat.repeat_fire(&state, 12, 1 << 6);
+        assert_eq!(state.active_ws.get(), 5, "the armed chord fires its bind");
+    }
+
+    #[test]
+    fn an_interleaved_bind_press_disarms_a_release_bind() {
+        let (state, _client, seat, _s) = setup();
+        let mut cfg = (**state.config.borrow()).clone();
+        let bind = crate::config::Bind {
+            mods: 1 << 6,
+            key: 45,
+            action: crate::config::Action::FocusWorkspace(7),
+            on_release: true,
+            repeat: false,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
+        };
+        cfg.binds.push(bind.clone());
+        cfg.binds.push(crate::config::Bind {
+            key: 28,
+            on_release: false,
+            action: crate::config::Action::FocusWorkspace(3),
+            ..bind
+        });
+        *state.config.borrow_mut() = Rc::new(cfg);
+        seat.key(&state, 0, 125, true);
+        seat.key(&state, 1000, 45, true);
+        assert!(seat.armed_release.borrow().is_some(), "the release bind armed");
+        // an interleaved normal bind returns early - it must still disarm
+        let r = seat.key(&state, 2000, 28, true);
+        assert!(matches!(r, KeyAction::Act(_)));
+        assert!(seat.armed_release.borrow().is_none(), "the chord disarmed it");
+        let r = seat.key(&state, 3000, 45, false);
+        assert!(matches!(r, KeyAction::Handled), "the stale release stays quiet");
     }
 
     #[test]
