@@ -4094,6 +4094,11 @@ fn ws_scene(
     }
     if fs.is_none() || cfg.layout.float_above_fullscreen {
         for win in ws.floats.borrow().iter() {
+            // a fullscreened float stays in the float list; its body
+            // already drew from the slot and must not blend over itself
+            if fs.as_ref().is_some_and(|f| Rc::ptr_eq(f, win)) {
+                continue;
+            }
             if let Some(r) = draw_window(state, out, focused, cfg, win, ops, live, mode) {
                 above.push((win.clone(), r));
             }
