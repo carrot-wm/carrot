@@ -235,7 +235,7 @@ impl XWindow {
 
 // -- the display socket --
 
-struct DisplayClaim {
+pub(crate) struct DisplayClaim {
     n: u32,
     sock: Rc<OwnedFd>,
     lock_path: std::path::PathBuf,
@@ -289,11 +289,25 @@ fn claim_display() -> Option<DisplayClaim> {
 
 // -- the manager --
 
-pub async fn run(state: Rc<State>) {
+/// claim the display socket before any thread or child process exists:
+/// the DISPLAY export is only sound single-threaded, and the startup
+/// spawns must inherit it even though xwayland itself starts lazily -
+/// a launcher spawned without DISPLAY passes the hole to everything it
+/// ever starts
+pub fn claim() -> Option<DisplayClaim> {
     let Some(claim) = claim_display() else {
         eprintln!("carrot: xwayland: no free display number, x11 disabled");
-        return;
+        return None;
     };
+    // sound: main calls this before any thread exists
+    unsafe {
+        std::env::set_var("DISPLAY", format!(":{}", claim.n));
+    }
+    println!("carrot: xwayland on :{} (lazy)", claim.n);
+    Some(claim)
+}
+
+pub async fn run(state: Rc<State>, claim: DisplayClaim) {
     let xw = Rc::new(Xwayland {
         display: claim.n,
         parsnip: RefCell::new(None),
@@ -303,7 +317,6 @@ pub async fn run(state: Rc<State>) {
         atoms: RefCell::new(None),
     });
     *state.xwayland.borrow_mut() = Some(xw.clone());
-    println!("carrot: xwayland on :{} (lazy)", claim.n);
     loop {
         // lazy: nothing runs until someone knocks
         if state.ring.readable(&claim.sock).await.is_err() {

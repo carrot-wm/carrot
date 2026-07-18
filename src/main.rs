@@ -253,6 +253,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // WAYLAND_DISPLAY is only sound single-threaded
     let sock = socket::WaylandSocket::new()?;
     println!("listening on {}", sock.name);
+    // same window: DISPLAY must be exported here, before any thread exists
+    // and before run_spawn hands the environment to startup children
+    let xclaim = xwayland::claim();
     // input injection is optional; the session runs fine without it
     let ei_sock = match ei::bind_socket() {
         Ok(s) => Some(s),
@@ -426,9 +429,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    let st = state.clone();
-    let xwayland_task = engine.spawn("xwayland", async move {
-        xwayland::run(st).await;
+    let xwayland_task = xclaim.map(|claim| {
+        let st = state.clone();
+        engine.spawn("xwayland", async move {
+            xwayland::run(st, claim).await;
+        })
     });
     let st = state.clone();
     let _portal_env = engine.spawn(
