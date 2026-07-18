@@ -1373,9 +1373,12 @@ impl SeatGlobal {
             const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
             let held_mods = self.mods.get().depressed & MASK;
             let cfg = state.config.borrow().clone();
+            // a locked session only honors binds that opted in, same as keys
+            let locked = crate::protocol::session_lock::locked(state);
             let hit = cfg
                 .binds
                 .iter()
+                .filter(|b| !locked || b.allow_when_locked)
                 .find(|b| b.mods == held_mods && b.key == button);
             if let Some(b) = hit {
                 if !self.cooldown_clear(b) {
@@ -1770,6 +1773,35 @@ mod tests {
             region: ObjectId(0),
             lifetime,
         })
+    }
+
+    #[test]
+    fn mouse_binds_respect_the_session_lock() {
+        use crate::protocol::interfaces::ext_session_lock_manager_v1::{self, Handler as _};
+        let (state, client, seat, _s) = setup();
+        let mut cfg = (**state.config.borrow()).clone();
+        cfg.binds.push(crate::config::Bind {
+            mods: 0,
+            key: 0x110,
+            action: crate::config::Action::FocusWorkspace(3),
+            on_release: false,
+            repeat: false,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
+        });
+        *state.config.borrow_mut() = Rc::new(cfg);
+        let mgr = crate::protocol::session_lock::SessionLockManager {
+            id: ObjectId(60),
+            client: client.clone(),
+            version: 1,
+        };
+        mgr.lock(ext_session_lock_manager_v1::lock::Request { id: ObjectId(61) }).unwrap();
+        seat.pointer_button(&state, 1000, 0x110, true);
+        assert_eq!(state.active_ws.get(), 0, "a locked session ignores the bind");
+        *state.lock.borrow_mut() = None;
+        seat.pointer_button(&state, 2000, 0x110, true);
+        assert_eq!(state.active_ws.get(), 3, "unlocked, the same click acts");
     }
 
     #[test]
