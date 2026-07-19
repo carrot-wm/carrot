@@ -56,11 +56,28 @@ pub(crate) fn taproot_lib(name: &str, env: &str) -> Result<PathBuf, String> {
 const SURPLUS_SIZE: usize = 1024;
 const SURPLUS_ALIGN: usize = 64;
 
+// served from a const-init std::thread_local!: for a non-Drop type this
+// lowers to a native .tbss "awT" entry at a link-time-constant tp offset
+// (verified on stable 1.96.1), which is exactly what #[thread_local] gave
+// us without the nightly gate. fallback if std ever changes the lowering:
+// a global_asm .tbss symbol + lea sym@TPOFF accessor, see the design spec.
+// UnsafeCell because drivers write through the donated block.
 #[repr(align(64))]
-struct TlsSurplus([u8; SURPLUS_SIZE]);
+struct TlsSurplus(std::cell::UnsafeCell<[u8; SURPLUS_SIZE]>);
 
-#[thread_local]
-static TLS_SURPLUS: TlsSurplus = TlsSurplus([0; SURPLUS_SIZE]);
+std::thread_local! {
+    static TLS_SURPLUS: TlsSurplus =
+        const { TlsSurplus(std::cell::UnsafeCell::new([0; SURPLUS_SIZE])) };
+}
+
+/// this thread's copy locates the block; the tp-relative offset is the
+/// same in every thread, static tls being exactly that
+fn surplus_tp_offset() -> isize {
+    let tp: usize;
+    unsafe { std::arch::asm!("mov {}, fs:0", out(reg) tp) };
+    let base = TLS_SURPLUS.with(|t| t.0.get() as usize);
+    base as isize - tp as isize
+}
 
 static SURPLUS_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -82,12 +99,7 @@ fn alloc_static_tls(size: usize, align: usize) -> Option<isize> {
             break start;
         }
     };
-    // this thread's copy locates the block; the tp-relative offset is
-    // the same in every thread, static tls being exactly that
-    let tp: usize;
-    unsafe { std::arch::asm!("mov {}, fs:0", out(reg) tp) };
-    let base = std::ptr::addr_of!(TLS_SURPLUS) as usize;
-    Some((base + start) as isize - tp as isize)
+    Some(surplus_tp_offset() + start as isize)
 }
 
 /// the legacy sonames an icd closure may name; each staged file is an
@@ -403,6 +415,25 @@ mod tests {
         assert_eq!(seen, 0x5eed, "worker's thread-local round trip");
         eprintln!("cdylib thread ok");
         std::mem::forget(lib);
+    }
+
+    #[test]
+    fn surplus_offset_is_thread_invariant() {
+        // the tp-relative offset must be a link-time constant (x86_64 TLS
+        // variant II): identical in every thread, 64-aligned, zero image
+        let here = surplus_tp_offset();
+        let there = std::thread::spawn(surplus_tp_offset).join().unwrap();
+        assert_eq!(here, there);
+        assert_eq!(here.rem_euclid(64), 0);
+        let fresh_sum: u64 = std::thread::spawn(|| {
+            TLS_SURPLUS.with(|t| {
+                let bytes = unsafe { &*t.0.get() };
+                bytes.iter().map(|&b| b as u64).sum()
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(fresh_sum, 0);
     }
 
     /// gpu-free by construction: an icd only opens the device node at
