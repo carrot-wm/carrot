@@ -900,7 +900,22 @@
           };
 
           carrot = craneLib.buildPackage (commonArgs // {
-            cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+            # crane's dummy crate must link like the real one: libc arrives
+            # via `extern crate eyra`, so the stub mains get the same line
+            # (and the real build.rs, for its link args) or every libc
+            # symbol dangles at the deps-only link
+            cargoArtifacts = craneLib.buildDepsOnly (builtins.removeAttrs commonArgs [ "src" ] // {
+              dummySrc = craneLib.mkDummySrc {
+                inherit src;
+                dummyBuildrs = ./build.rs;
+                extraDummyScript = ''
+                  for f in $out/src/main.rs $out/src/bin/burrow.rs; do
+                    chmod +w "$f"
+                    printf '\nextern crate eyra;\n' >> "$f"
+                  done
+                '';
+              };
+            });
 
             postInstall = ''
               wrapProgram $out/bin/carrot \
