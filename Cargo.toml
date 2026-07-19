@@ -11,7 +11,7 @@ repository = "https://github.com/carrot-wm/carrot"
 # --export-dynamic (a dlopened lib's libc imports resolve against us).
 # the taproot fork of eyra's libc stack, straight from crates.io; flip to
 # path = "../taproot/eyra" while hacking on the fork itself
-eyra = { package = "taproot-eyra", version = "0.22.3", features = ["experimental-relocate"] }
+eyra = { package = "taproot-eyra", version = "0.22.4", features = ["experimental-relocate"] }
 
 # no default features: no `loaded`/libloading (pulls dl* nothing defines);
 # the entry comes from the icd via dlopen-rs + Entry::from_static_fn
