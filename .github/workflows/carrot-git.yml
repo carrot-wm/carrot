@@ -1,0 +1,52 @@
+name: carrot-git
+
+# the aur carrot-git package builds latest main of carrot + taproot on
+# stable rust; this job is that exact build, run on every commit, plus
+# the gates that make the artifact trustworthy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: deps
+        run: pacman -Syu --noconfirm rust gcc git binutils xkeyboard-config
+
+      - uses: actions/checkout@v4
+
+      - name: taproot at main
+        run: git clone --depth 1 https://github.com/carrot-wm/taproot ../taproot
+
+      - name: build carrot
+        run: cargo build --release --locked
+
+      - name: build the libc family
+        run: |
+          cd ../taproot
+          cargo build --release --locked -p taproot -p taproot-stub
+          bin="$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release"
+          cp target/release/libtaproot.so "$bin/libc.so.6"
+          cp target/release/libtaproot.so "$bin/libm.so.6"
+          for s in libpthread.so.0 libdl.so.2 librt.so.1 libutil.so.1 libresolv.so.2 ld-linux-x86-64.so.2; do
+            cp target/release/libtaproot_stub.so "$bin/$s"
+          done
+
+      - name: gates
+        run: |
+          b=target/x86_64-unknown-linux-gnu/release/carrot
+          readelf -h "$b" | grep -q DYN
+          ! readelf -l "$b" | grep -q INTERP
+          test "$(strings -a "$b" | grep -c GLIBC_2)" = 0
+          for sym in memcpy memset memmove malloc free ceil sqrt getauxval _start snprintf; do
+            nm -D --defined-only target/x86_64-unknown-linux-gnu/release/libc.so.6 | grep -qw "$sym"
+          done
+
+      # the suite runs panic = "unwind" here (no build-std), which the
+      # zero-C stack can't unwind to completion; compile it to catch
+      # breakage and leave the behavioral run to the dev lane
+      - name: tests compile
+        run: cargo test --release --locked --no-run

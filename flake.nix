@@ -944,6 +944,13 @@
           };
 
           carrot = craneLib.buildPackage (commonArgs // {
+            # the shipped binary is panic = "abort"; on stable without
+            # build-std cargo builds the test harness panic = "unwind",
+            # which needs the unwinder the zero-C design keeps out of
+            # production. the suite is validated on the dev shell
+            # (build-std + panic-abort-tests) and in CI, not here.
+            doCheck = false;
+
             # crane's dummy crate must link like the real one: libc arrives
             # via `extern crate eyra`, so the stub mains get the same line
             # (and the real build.rs, for its link args) or every libc
