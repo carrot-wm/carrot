@@ -1,13 +1,6 @@
 [build]
 target = "x86_64-unknown-linux-gnu"
 
-[unstable]
-# "test" from source too: the precompiled sysroot libtest carries its own core
-# (E0152 duplicate lang items); panic-abort-tests keeps the whole graph on the
-# abort runtime - no unwinder, matching the project-wide panic = "abort"
-build-std = ["std", "panic_abort", "test"]
-panic-abort-tests = true
-
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
     # fully static, but keep PIE: eyra's experimental-relocate self-relocates,

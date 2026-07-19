@@ -867,22 +867,17 @@
         let
           craneLib = crane.mkLib pkgs;
 
-          # nightly is mandatory: -Z build-std + eyra. rust-src for build-std.
-          # pinned to rust-toolchain.toml (same date as taproot's) so every
-          # build path and the libc share one compiler.
+          # stable: eyra links the precompiled std against taproot's libc
+          # symbols (build.rs emits --allow-multiple-definition), so no
+          # -Z build-std and no rust-src.
           toolchain =
-            (inputs'.fenix.packages.toolchainOf {
-              channel = "nightly";
-              date = "2026-06-11";
-              sha256 = "sha256-L59udwZx36niu4S6j9huMpLBWL4m/Flt61nbXfXk/wk=";
-            }).withComponents
-              [
-                "cargo"
-                "rustc"
-                "rust-src"
-                "clippy"
-                "rustfmt"
-              ];
+            inputs'.fenix.packages.stable.withComponents [
+              "cargo"
+              "rustc"
+              "rust-std"
+              "clippy"
+              "rustfmt"
+            ];
 
           # Only include source files that are actually relevant to the build
           src = lib.cleanSourceWith {
