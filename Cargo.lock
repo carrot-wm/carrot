@@ -239,7 +239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -697,7 +697,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -871,9 +871,9 @@ dependencies = [
 
 [[package]]
 name = "taproot-c-gull"
-version = "0.22.3"
+version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "081e9d3440e663d92965ea25b946f4bb9332260ad00c9e94a2aefe7c7f620ad5"
+checksum = "aa89e05d9309e1d6d8c52442305e6a88ee400b48703cc7645faf94ec5c8ebea4"
 dependencies = [
  "errno",
  "libc",
@@ -884,9 +884,9 @@ dependencies = [
 
 [[package]]
 name = "taproot-c-scape"
-version = "0.22.4"
+version = "0.22.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e10483bdc00ce8f41162d4a010f4da9832bc5ed9956d333e464bbe0a51e8b2a"
+checksum = "52a3c6b4e9b80c2577306baa5b90c4956b6d44cb7118447b564ec859fb318c75"
 dependencies = [
  "bitflags 2.13.0",
  "errno",
@@ -910,18 +910,18 @@ dependencies = [
 
 [[package]]
 name = "taproot-eyra"
-version = "0.22.3"
+version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65a831d6cb392cbfe7d63c6bb8b74271e657ea57f23238db70aa56ff361ec777"
+checksum = "31797e18808e6ed6e612f3843c84f2cd77294262a9a967f81acc06433bf57501"
 dependencies = [
  "taproot-c-gull",
 ]
 
 [[package]]
 name = "taproot-origin"
-version = "0.26.4"
+version = "0.26.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a56ddf3eb4a64402dc156cb1d035fbb67ee1c9fdc25f18d19f55951bbb1333d5"
+checksum = "8251a3004f654d2a462fb1e80f6626d132dd7e9032ed38220075f67343583647"
 dependencies = [
  "bitflags 2.13.0",
  "linux-raw-sys 0.9.4",

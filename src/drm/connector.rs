@@ -279,11 +279,11 @@ impl Connector {
         let primary = take_plane(PlaneType::Primary, XRGB8888.drm)
             .ok_or(DrmError::NoPrimaryPlane(self.id))?;
         primary.crtc.set(crtc.id);
-        // joined modes on xe: the kernel gangs two pipes and any cursor prop
-        // we stage arms phantom doubled cursor state (the 1px smudge).
-        // amdgpu joins internally and its cursor plane stays sane, so only
-        // xe composites the cursor.
-        let cursor = if mode_needs_joiner(&mode) && dev.driver == "xe" {
+        // joined modes: the kernel gangs two pipes and the cursor plane
+        // misbehaves per driver (xe: phantom doubled state, the 1px smudge;
+        // amdgpu: the plane lands offset). composite the cursor on every
+        // joined mode.
+        let cursor = if mode_needs_joiner(&mode) {
             eprintln!(
                 "carrot: {}: joined mode, hardware cursor off (composited instead)",
                 self.name
