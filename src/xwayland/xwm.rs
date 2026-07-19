@@ -47,6 +47,10 @@ const PRIMARY: u32 = 1;
 const SEL_EVENTS: u32 = 7;
 // a paste bigger than this gets refused rather than incr-streamed
 const MAX_TRANSFER: usize = 4 << 20;
+// a wm property (title, class, hints, atom lists) bigger than this
+// reads as absent; every PropertyNotify re-reads from scratch, so this
+// also bounds what one notify can cost
+const MAX_PROP: usize = 64 << 10;
 // a single x request tops out at 256k; append properties in 64k slices
 const PROP_SLICE: usize = 64 << 10;
 const FETCH_TIMEOUT_NS: u64 = 5_000_000_000;
@@ -573,7 +577,9 @@ impl Xwm {
         } else {
             let Some(fetch) = sel.fetch.borrow_mut().take() else { return };
             if property != 0 {
-                if let Ok(r) = self.c.get_property_full(self.selwin, sel.prop_data, 0).await {
+                if let Ok(r) =
+                    self.c.get_property_full(self.selwin, sel.prop_data, 0, MAX_TRANSFER).await
+                {
                     // incr means a streamed transfer we don't do
                     if r.ty != self.sel_atoms.incr {
                         self.spawn_fd_write(fetch.fd, r.data);
@@ -1108,16 +1114,16 @@ impl Xwm {
     }
 
     // AnyPropertyType reads: asking with a wrong type would return an
-    // empty value with bytes_after set and stall the chunk loop
+    // empty value with bytes_after set and lose the data
     async fn prop_bytes(&self, window: u32, prop: u32) -> (u32, Vec<u8>) {
-        match self.c.get_property_full(window, prop, 0).await {
+        match self.c.get_property_full(window, prop, 0, MAX_PROP).await {
             Ok(r) => (r.ty, r.data),
             Err(_) => (0, Vec::new()),
         }
     }
 
     async fn prop_words(&self, window: u32, prop: u32) -> Vec<u32> {
-        match self.c.get_property_full(window, prop, 0).await {
+        match self.c.get_property_full(window, prop, 0, MAX_PROP).await {
             Ok(r) if r.format == 32 => r
                 .data
                 .chunks_exact(4)

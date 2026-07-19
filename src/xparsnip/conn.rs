@@ -20,6 +20,7 @@ pub enum ParsnipError {
     Dead,
     Setup(String),
     Error(u8, u8),
+    Oversized,
 }
 
 impl fmt::Display for ParsnipError {
@@ -30,6 +31,7 @@ impl fmt::Display for ParsnipError {
             ParsnipError::Error(code, major) => {
                 write!(f, "x error Bad{} from request {major}", wire::error_name(*code))
             }
+            ParsnipError::Oversized => write!(f, "property too large or unreadable"),
         }
     }
 }
@@ -354,12 +356,15 @@ impl Parsnip {
         Ok(atom)
     }
 
-    // the whole property, chunked; format and type come from the first round
+    // the whole property, chunked; format and type come from the first
+    // round. anything past max_bytes is refused whole, never truncated,
+    // and the refusal leaves the connection alive
     pub async fn get_property_full(
         &self,
         window: u32,
         property: u32,
         ty: u32,
+        max_bytes: usize,
     ) -> Result<wire::GetPropertyReply, ParsnipError> {
         let mut acc: Option<wire::GetPropertyReply> = None;
         let mut offset = 0u32;
@@ -369,10 +374,19 @@ impl Parsnip {
                 .await?;
             let part = wire::parse_get_property(&reply).ok_or(ParsnipError::Dead)?;
             let after = part.bytes_after;
+            // a typed request against a property of another type returns
+            // an empty value with bytes_after set; no progress, no retry
+            if part.data.is_empty() && after != 0 {
+                return Err(ParsnipError::Oversized);
+            }
             offset += part.data.len() as u32 / 4;
             match &mut acc {
                 None => acc = Some(part),
                 Some(a) => a.data.extend_from_slice(&part.data),
+            }
+            let total = acc.as_ref().unwrap().data.len();
+            if total > max_bytes || total + after as usize > max_bytes {
+                return Err(ParsnipError::Oversized);
             }
             if after == 0 {
                 return Ok(acc.unwrap());
@@ -456,4 +470,194 @@ async fn read_exact(ring: &Rc<Ring>, fd: &Rc<OwnedFd>, want: usize) -> Result<Ve
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::pin::Pin;
+
+    // NOTE: no asserts inside spawned tasks - a panicking poll aborts the
+    // whole test binary. stash results, assert after run() returns.
+
+    const ROOT: u32 = 0x123;
+    const BIG_PROP: u32 = 100;
+    const SMALL_PROP: u32 = 101;
+
+    // minimal successful setup: one screen, no vendor, no formats, no depths
+    fn setup_reply() -> Vec<u8> {
+        let mut f = vec![0u8; 80];
+        f[0] = 1;
+        f[2..4].copy_from_slice(&11u16.to_ne_bytes());
+        f[6..8].copy_from_slice(&18u16.to_ne_bytes()); // (80 - 8) / 4 units
+        f[12..16].copy_from_slice(&0x0040_0000u32.to_ne_bytes()); // id base
+        f[16..20].copy_from_slice(&0x001f_ffffu32.to_ne_bytes()); // id mask
+        f[26..28].copy_from_slice(&0xffffu16.to_ne_bytes()); // max request len
+        f[28] = 1; // one screen
+        f[40..44].copy_from_slice(&ROOT.to_ne_bytes());
+        f[60..62].copy_from_slice(&800u16.to_ne_bytes());
+        f[62..64].copy_from_slice(&600u16.to_ne_bytes());
+        f[78] = 24; // root depth
+        f
+    }
+
+    fn query_extension_reply(seq: u16) -> Vec<u8> {
+        let mut f = vec![0u8; 32];
+        f[0] = 1;
+        f[2..4].copy_from_slice(&seq.to_ne_bytes());
+        f[8] = 1; // present
+        f[9] = 140; // major opcode
+        f[10] = 90; // first event
+        f
+    }
+
+    fn empty_reply(seq: u16) -> Vec<u8> {
+        let mut f = vec![0u8; 32];
+        f[0] = 1;
+        f[2..4].copy_from_slice(&seq.to_ne_bytes());
+        f
+    }
+
+    fn get_property_reply(seq: u16, ty: u32, bytes_after: u32, data: &[u8]) -> Vec<u8> {
+        let padded = data.len().div_ceil(4) * 4;
+        let mut f = vec![0u8; 32 + padded];
+        f[0] = 1;
+        f[1] = 8; // format
+        f[2..4].copy_from_slice(&seq.to_ne_bytes());
+        f[4..8].copy_from_slice(&((padded / 4) as u32).to_ne_bytes());
+        f[8..12].copy_from_slice(&ty.to_ne_bytes());
+        f[12..16].copy_from_slice(&bytes_after.to_ne_bytes());
+        f[16..20].copy_from_slice(&(data.len() as u32).to_ne_bytes());
+        f[32..32 + data.len()].copy_from_slice(data);
+        f
+    }
+
+    // a scripted x server on a blocking socket: answers the setup and the
+    // extension binds, then hands GetProperty to the script. returns how
+    // many GetProperty requests it saw once the client hangs up.
+    fn serve(
+        mut sock: UnixStream,
+        mut script: impl FnMut(u64, &[u8]) -> (u32, u32, Vec<u8>),
+    ) -> u64 {
+        let mut hello = [0u8; 12]; // setup request with empty auth
+        sock.read_exact(&mut hello).unwrap();
+        sock.write_all(&setup_reply()).unwrap();
+        let mut seq = 0u16;
+        let mut props = 0u64;
+        loop {
+            let mut head = [0u8; 4];
+            if sock.read_exact(&mut head).is_err() {
+                return props;
+            }
+            let len = u16::from_ne_bytes([head[2], head[3]]) as usize * 4;
+            let mut req = vec![0u8; len];
+            req[..4].copy_from_slice(&head);
+            sock.read_exact(&mut req[4..]).unwrap();
+            seq = seq.wrapping_add(1);
+            match head[0] {
+                98 => sock.write_all(&query_extension_reply(seq)).unwrap(),
+                43 => sock.write_all(&empty_reply(seq)).unwrap(),
+                20 => {
+                    props += 1;
+                    let (ty, after, data) = script(props, &req);
+                    sock.write_all(&get_property_reply(seq, ty, after, &data)).unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn request_u32(req: &[u8], at: usize) -> u32 {
+        u32::from_ne_bytes(req[at..at + 4].try_into().unwrap())
+    }
+
+    // connect over the socketpair, run the body, tear everything down
+    fn with_conn<R: 'static>(
+        sock: UnixStream,
+        body: impl FnOnce(Rc<Parsnip>) -> Pin<Box<dyn Future<Output = R>>> + 'static,
+    ) -> R {
+        let eng = Engine::new();
+        let ring = Ring::new(&eng, 32).unwrap();
+        let out: Rc<RefCell<Option<R>>> = Rc::new(RefCell::new(None));
+        let o = out.clone();
+        let e = eng.clone();
+        let r = ring.clone();
+        let task = eng.spawn("test", async move {
+            if let Ok(conn) = Parsnip::connect(&e, &r, OwnedFd::from(sock), b"", b"").await {
+                *o.borrow_mut() = Some(body(conn.clone()).await);
+                conn.clear();
+            }
+            r.stop();
+        });
+        ring.run().unwrap();
+        drop(task);
+        eng.clear();
+        let res = out.borrow_mut().take();
+        res.expect("connect failed")
+    }
+
+    #[test]
+    fn a_property_over_the_cap_is_refused_and_the_connection_survives() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let big = vec![7u8; 96 << 10];
+        let fake = std::thread::spawn(move || {
+            serve(server, move |_, req| {
+                if request_u32(req, 8) == BIG_PROP {
+                    let from = request_u32(req, 16) as usize * 4;
+                    let to = (from + request_u32(req, 20) as usize * 4).min(big.len());
+                    (31, (big.len() - to) as u32, big[from..to].to_vec())
+                } else {
+                    (31, 0, b"tiny".to_vec())
+                }
+            })
+        });
+        let (first, second) = with_conn(client, |c| {
+            Box::pin(async move {
+                let first = c.get_property_full(ROOT, BIG_PROP, 0, 64 << 10).await;
+                let second = c.get_property_full(ROOT, SMALL_PROP, 0, 64 << 10).await;
+                (first, second)
+            })
+        });
+        assert!(matches!(first, Err(ParsnipError::Oversized)));
+        assert_eq!(second.unwrap().data, b"tiny");
+        fake.join().unwrap();
+    }
+
+    #[test]
+    fn an_oversized_property_costs_a_single_round_trip() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let total = (1 << 20) + 2048usize;
+        let fake = std::thread::spawn(move || {
+            serve(server, move |_, req| {
+                let from = request_u32(req, 16) as usize * 4;
+                let to = (from + request_u32(req, 20) as usize * 4).min(total);
+                (31, (total - to) as u32, vec![7u8; to - from])
+            })
+        });
+        let res = with_conn(client, |c| {
+            Box::pin(async move { c.get_property_full(ROOT, BIG_PROP, 0, 64 << 10).await })
+        });
+        assert!(matches!(res, Err(ParsnipError::Oversized)));
+        assert_eq!(fake.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_stalled_typed_read_errors_instead_of_looping() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let fake = std::thread::spawn(move || {
+            serve(server, |n, _| {
+                // empty value with bytes_after set, as a typed request
+                // against a property of another type keeps answering
+                if n <= 3 { (31, 4096, Vec::new()) } else { (31, 0, b"late".to_vec()) }
+            })
+        });
+        let res = with_conn(client, |c| {
+            Box::pin(async move { c.get_property_full(ROOT, BIG_PROP, 4, 64 << 10).await })
+        });
+        assert!(matches!(res, Err(ParsnipError::Oversized)));
+        fake.join().unwrap();
+    }
 }

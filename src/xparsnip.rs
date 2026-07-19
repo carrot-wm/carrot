@@ -86,7 +86,7 @@ pub fn probe() -> i32 {
             let supported = c.intern("_NET_SUPPORTED").await.map_err(|e| e.to_string())?;
             println!("-> atoms: WM_S0={wm_s0} _NET_SUPPORTED={supported}");
             let prop = c
-                .get_property_full(c.root, supported, 4)
+                .get_property_full(c.root, supported, 4, 64 << 10)
                 .await
                 .map_err(|e| format!("get_property: {e}"))?;
             println!(
