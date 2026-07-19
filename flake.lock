@@ -94,7 +94,8 @@
         "fenix": "fenix",
         "flake-compat": "flake-compat",
         "flake-parts": "flake-parts",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "taproot": "taproot"
       }
     },
     "rust-analyzer-src": {
@@ -111,6 +112,22 @@
         "owner": "rust-lang",
         "ref": "nightly",
         "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "taproot": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784483908,
+        "narHash": "sha256-hMaBGlwW/lVEn8DPqR/zl8LAYyUFLYe3kxAQXTNSQaY=",
+        "owner": "carrot-wm",
+        "repo": "taproot",
+        "rev": "c99bfd77e54f02c8a39c2991f0e35fb10a1b06a1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "carrot-wm",
+        "repo": "taproot",
         "type": "github"
       }
     }

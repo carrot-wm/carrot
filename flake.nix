@@ -20,6 +20,14 @@
       url = "github:NixOS/flake-compat";
       flake = false;
     };
+
+    # the libc family the gpu driver binds at runtime; built from the
+    # workspace, never the registry: the cdylib's export set depends on
+    # the link shim and profile pin that only live in the repo
+    taproot = {
+      url = "github:carrot-wm/taproot";
+      flake = false;
+    };
   };
 
   outputs =
@@ -899,6 +907,42 @@
             XKB_CONFIG_ROOT = "${pkgs.xkeyboard-config}/share/X11/xkb";
           };
 
+          # taproot's libc.so.6/libm.so.6 (full copies of the cdylib) and
+          # the legacy-soname stubs a driver closure may name
+          taproot-libs = craneLib.buildPackage {
+            src = inputs.taproot;
+            pname = "taproot-libs";
+            version = "0.22.5";
+            strictDeps = true;
+            # the c-ward workspace root is a targetless hybrid manifest
+            # crane's dummy crate can't model; build in one derivation
+            cargoArtifacts = null;
+            # the linker shim's env-bash shebang resolves nowhere in the
+            # sandbox; point it at the build's own bash
+            postPatch = ''
+              patchShebangs tools/link-shim.sh
+            '';
+            cargoExtraArgs = "-p taproot -p taproot-stub";
+            doCheck = false;
+            nativeBuildInputs = [ pkgs.binutils ];
+            installPhaseCommand = ''
+              mkdir -p $out/lib
+              cp target/release/libtaproot.so $out/lib/libc.so.6
+              cp target/release/libtaproot.so $out/lib/libm.so.6
+              for s in libpthread.so.0 libdl.so.2 librt.so.1 libutil.so.1 libresolv.so.2 ld-linux-x86-64.so.2; do
+                cp target/release/libtaproot_stub.so $out/lib/$s
+              done
+              # the exports the link shim exists to keep; a miss means it
+              # did not run and the session would die at gpu preload
+              for sym in memcpy memset memmove malloc free ceil sqrt getauxval _start; do
+                nm -D --defined-only $out/lib/libc.so.6 | grep -qw $sym || {
+                  echo "libc.so.6 is missing $sym" >&2
+                  exit 1
+                }
+              done
+            '';
+          };
+
           carrot = craneLib.buildPackage (commonArgs // {
             # crane's dummy crate must link like the real one: libc arrives
             # via `extern crate eyra`, so the stub mains get the same line
@@ -918,6 +962,10 @@
             });
 
             postInstall = ''
+              # the loader looks next to the binary, then ../lib/carrot
+              mkdir -p $out/lib/carrot
+              cp ${taproot-libs}/lib/* $out/lib/carrot/
+
               wrapProgram $out/bin/carrot \
                 --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.vulkan-loader ]} \
                 --set-default XKB_CONFIG_ROOT ${pkgs.xkeyboard-config}/share/X11/xkb
@@ -965,6 +1013,7 @@
           packages = {
             default = self'.packages.carrot;
             carrot = carrot;
+            taproot-libs = taproot-libs;
           };
 
           devShells.default = pkgs.mkShell {
