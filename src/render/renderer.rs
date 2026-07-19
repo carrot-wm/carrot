@@ -1540,6 +1540,12 @@ impl Renderer {
             )
         }?;
         let reqs = unsafe { dev.get_image_memory_requirements(image) };
+        if reqs.size > size {
+            return Err(RenderError::Load(format!(
+                "dmabuf too small: image needs {}, fd holds {}",
+                reqs.size, size
+            )));
+        }
         let mem_type = self.core.find_memory_type(
             reqs.memory_type_bits & fd_props.memory_type_bits,
             vk::MemoryPropertyFlags::empty(),

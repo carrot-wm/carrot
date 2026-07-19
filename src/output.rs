@@ -980,16 +980,16 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
             let mut formats = Vec::new();
             match core.sample_modifiers(vk::Format::B8G8R8A8_UNORM) {
                 Ok(mods) => {
-                    for &m in &mods {
-                        formats.push((crate::format::XRGB8888.drm, m));
-                        formats.push((crate::format::ARGB8888.drm, m));
+                    for &(m, pc) in &mods {
+                        formats.push((crate::format::XRGB8888.drm, m, pc));
+                        formats.push((crate::format::ARGB8888.drm, m, pc));
                     }
                 }
                 Err(e) => eprintln!("carrot: dmabuf modifier probe failed: {e}"),
             }
             if formats.is_empty() {
-                formats.push((crate::format::XRGB8888.drm, 0));
-                formats.push((crate::format::ARGB8888.drm, 0));
+                formats.push((crate::format::XRGB8888.drm, 0, 1));
+                formats.push((crate::format::ARGB8888.drm, 0, 1));
             }
             eprintln!(
                 "carrot: dmabuf: {} format+modifier pairs, main device {rdev:#x}",

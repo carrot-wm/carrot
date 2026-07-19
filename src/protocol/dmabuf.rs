@@ -1,6 +1,6 @@
 // zwp-linux-dmabuf-v1, version 3. gpu clients hand over dmabufs and the
-// renderer samples them in place - no shm round trip. only single-plane
-// linear xrgb/argb is advertised, so that's all that can arrive.
+// renderer samples them in place - no shm round trip. only xrgb/argb is
+// advertised; modifiers and their plane counts come from the driver.
 
 use crate::client::{Client, ClientError, Object};
 use crate::format::{ARGB8888, Format, XRGB8888};
@@ -33,12 +33,13 @@ const MAX_PLANES: usize = 4;
 pub struct DmabufInfo {
     /// primary node dev_t; clients resolve it to the matching render node
     pub main_device: u64,
-    /// (fourcc, modifier) pairs, table order = feedback tranche indices
-    pub formats: Vec<(u32, u64)>,
+    /// (fourcc, modifier, plane count) triples, table order = feedback
+    /// tranche indices
+    pub formats: Vec<(u32, u64, u32)>,
 }
 
-fn linear_fallback() -> Vec<(u32, u64)> {
-    vec![(XRGB8888.drm, MOD_LINEAR), (ARGB8888.drm, MOD_LINEAR)]
+fn linear_fallback() -> Vec<(u32, u64, u32)> {
+    vec![(XRGB8888.drm, MOD_LINEAR, 1), (ARGB8888.drm, MOD_LINEAR, 1)]
 }
 
 fn fourcc(format: u32) -> Option<&'static Format> {
@@ -79,17 +80,17 @@ impl Global for DmabufGlobal {
         };
         drop(info);
         client.event(|o| {
-            for (fourcc, modifier) in &formats {
+            for &(fourcc, modifier, _) in &formats {
                 if version >= 3 {
                     zwp_linux_dmabuf_v1::modifier::send(
                         o,
                         id,
-                        *fourcc,
-                        (*modifier >> 32) as u32,
-                        *modifier as u32,
+                        fourcc,
+                        (modifier >> 32) as u32,
+                        modifier as u32,
                     );
                 } else {
-                    zwp_linux_dmabuf_v1::format::send(o, id, *fourcc);
+                    zwp_linux_dmabuf_v1::format::send(o, id, fourcc);
                 }
             }
         });
@@ -154,7 +155,7 @@ fn feedback(c: &Rc<Client>, id: ObjectId) -> Result<(), Box<dyn std::error::Erro
         None => (None, linear_fallback()),
     };
     let mut table = Vec::with_capacity(formats.len() * 16);
-    for (fourcc, modifier) in &formats {
+    for &(fourcc, modifier, _) in &formats {
         table.extend_from_slice(&fourcc.to_ne_bytes());
         table.extend_from_slice(&0u32.to_ne_bytes());
         table.extend_from_slice(&modifier.to_ne_bytes());
@@ -253,7 +254,6 @@ impl BufferParams {
         width: i32,
         height: i32,
         format: u32,
-        flags: u32,
     ) -> Option<(&'static Format, DmabufImage)> {
         let c = &self.client;
         if self.used.replace(true) {
@@ -278,25 +278,26 @@ impl BufferParams {
             c.protocol_error(self.id, ERR_INVALID_DIMENSIONS, "bad buffer dimensions");
             return None;
         }
-        if flags != 0 {
-            c.protocol_error(self.id, ERR_INVALID_WL_BUFFER, "buffer flags are unsupported");
-            return None;
-        }
         // the pair must be one we advertised; implicit falls back to linear
         let modifier = if modifier == MOD_INVALID { MOD_LINEAR } else { modifier };
-        let advertised = match c.state.dmabuf_info.borrow().as_ref() {
+        let expected = match c.state.dmabuf_info.borrow().as_ref() {
             Some(i) => i
                 .formats
                 .iter()
-                .any(|&(f, m)| f == format.drm && m == modifier),
-            None => modifier == MOD_LINEAR,
+                .find(|&&(f, m, _)| f == format.drm && m == modifier)
+                .map(|&(_, _, n)| n as usize),
+            None => (modifier == MOD_LINEAR).then_some(1),
         };
-        if !advertised {
+        let Some(expected) = expected else {
             c.protocol_error(
                 self.id,
-                ERR_INVALID_WL_BUFFER,
+                ERR_INVALID_FORMAT,
                 &format!("modifier {modifier:#x} is not advertised for this format"),
             );
+            return None;
+        };
+        if planes.len() != expected {
+            c.protocol_error(self.id, ERR_INCOMPLETE, "plane count does not match the modifier");
             return None;
         }
         // only linear layouts are transparent enough to bounds-check; the
@@ -313,6 +314,21 @@ impl BufferParams {
             }
         }
         Some((format, DmabufImage { planes, modifier }))
+    }
+
+    /// one bo backs the whole image: the import reads memory only from
+    /// plane 0, so disjoint buffers can never bind correctly
+    fn single_bo(img: &DmabufImage) -> bool {
+        let Some((first, rest)) = img.planes.split_first() else {
+            return true;
+        };
+        let Ok(base) = rustix::fs::fstat(&first.fd) else {
+            return false;
+        };
+        rest.iter().all(|p| {
+            rustix::fs::fstat(&p.fd)
+                .is_ok_and(|st| (st.st_dev, st.st_ino) == (base.st_dev, base.st_ino))
+        })
     }
 
     fn buffer(
@@ -385,10 +401,15 @@ impl zwp_linux_buffer_params_v1::Handler for BufferParams {
         req: zwp_linux_buffer_params_v1::create::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let c = &self.client;
-        let Some((format, img)) = self.build(req.width, req.height, req.format, req.flags)
-        else {
+        let Some((format, img)) = self.build(req.width, req.height, req.format) else {
             return Ok(());
         };
+        if req.flags != 0 || !Self::single_bo(&img) {
+            // import failures on the async path answer with failed, not
+            // a protocol violation; the client falls back
+            c.event(|o| zwp_linux_buffer_params_v1::failed::send(o, self.id));
+            return Ok(());
+        }
         let id = c.objects.alloc_server_id();
         let buf = self.buffer(id, req.width, req.height, format, img);
         c.add_server_obj(buf.clone());
@@ -402,10 +423,17 @@ impl zwp_linux_buffer_params_v1::Handler for BufferParams {
         req: zwp_linux_buffer_params_v1::create_immed::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let c = &self.client;
-        let Some((format, img)) = self.build(req.width, req.height, req.format, req.flags)
-        else {
+        let Some((format, img)) = self.build(req.width, req.height, req.format) else {
             return Ok(());
         };
+        if req.flags != 0 {
+            c.protocol_error(self.id, ERR_INVALID_WL_BUFFER, "buffer flags are unsupported");
+            return Ok(());
+        }
+        if !Self::single_bo(&img) {
+            c.protocol_error(self.id, ERR_INVALID_WL_BUFFER, "planes span multiple buffers");
+            return Ok(());
+        }
         let buf = self.buffer(req.buffer_id, req.width, req.height, format, img);
         c.add_client_obj(buf.clone())?;
         c.objects.track_buffer(buf);
@@ -529,7 +557,11 @@ mod tests {
         let (state, client) = test_client();
         *state.dmabuf_info.borrow_mut() = Some(DmabufInfo {
             main_device: 0xe280,
-            formats: vec![(XRGB8888.drm, 0), (XRGB8888.drm, 42), (ARGB8888.drm, 42)],
+            formats: vec![
+                (XRGB8888.drm, 0, 1),
+                (XRGB8888.drm, 42, 1),
+                (ARGB8888.drm, 42, 1),
+            ],
         });
         feedback(&client, ObjectId(90)).unwrap();
         let bytes = client.queued_out_bytes();
@@ -546,7 +578,7 @@ mod tests {
         let (state, client) = test_client();
         *state.dmabuf_info.borrow_mut() = Some(DmabufInfo {
             main_device: 0,
-            formats: vec![(XRGB8888.drm, 42)],
+            formats: vec![(XRGB8888.drm, 42, 1)],
         });
         let p = params(&client);
         p.add(zwp_linux_buffer_params_v1::add::Request {
@@ -587,6 +619,180 @@ mod tests {
             stride: 64,
             modifier_hi: 0,
             modifier_lo: 7,
+        })
+        .unwrap();
+        p2.create_immed(zwp_linux_buffer_params_v1::create_immed::Request {
+            buffer_id: ObjectId(83),
+            width: 8,
+            height: 8,
+            format: XRGB8888.drm,
+            flags: 0,
+        })
+        .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 1);
+    }
+
+    #[test]
+    fn create_with_unsupported_flags_sends_failed() {
+        let (_state, client) = test_client();
+        let p = params(&client);
+        p.add(zwp_linux_buffer_params_v1::add::Request {
+            fd: fake_dmabuf(64 * 64 * 4),
+            plane_idx: 0,
+            offset: 0,
+            stride: 64 * 4,
+            modifier_hi: 0,
+            modifier_lo: 0,
+        })
+        .unwrap();
+        p.create(zwp_linux_buffer_params_v1::create::Request {
+            width: 64,
+            height: 64,
+            format: XRGB8888.drm,
+            flags: 1,
+        })
+        .unwrap();
+        let bytes = client.queued_out_bytes();
+        // the client survives and gets failed, not created
+        assert_eq!(count_events(&bytes, ObjectId(1), 0), 0);
+        assert_eq!(count_events(&bytes, ObjectId(81), 1), 1, "failed");
+        assert_eq!(count_events(&bytes, ObjectId(81), 0), 0, "created");
+    }
+
+    #[test]
+    fn create_immed_with_unsupported_flags_is_fatal() {
+        let (_state, client) = test_client();
+        let p = params(&client);
+        p.add(zwp_linux_buffer_params_v1::add::Request {
+            fd: fake_dmabuf(64 * 64 * 4),
+            plane_idx: 0,
+            offset: 0,
+            stride: 64 * 4,
+            modifier_hi: 0,
+            modifier_lo: 0,
+        })
+        .unwrap();
+        p.create_immed(zwp_linux_buffer_params_v1::create_immed::Request {
+            buffer_id: ObjectId(82),
+            width: 64,
+            height: 64,
+            format: XRGB8888.drm,
+            flags: 1,
+        })
+        .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 1);
+    }
+
+    #[test]
+    fn disjoint_plane_buffers_fail_without_killing_the_async_client() {
+        let (state, client) = test_client();
+        *state.dmabuf_info.borrow_mut() = Some(DmabufInfo {
+            main_device: 0,
+            formats: vec![(XRGB8888.drm, 42, 2)],
+        });
+        let p = params(&client);
+        // two planes, two unrelated buffers: the import reads only one
+        for idx in 0..2u32 {
+            p.add(zwp_linux_buffer_params_v1::add::Request {
+                fd: fake_dmabuf(4096),
+                plane_idx: idx,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 42,
+            })
+            .unwrap();
+        }
+        p.create(zwp_linux_buffer_params_v1::create::Request {
+            width: 8,
+            height: 8,
+            format: XRGB8888.drm,
+            flags: 0,
+        })
+        .unwrap();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, ObjectId(1), 0), 0, "client survives");
+        assert_eq!(count_events(&bytes, ObjectId(81), 1), 1, "failed");
+        assert_eq!(count_events(&bytes, ObjectId(81), 0), 0, "created");
+    }
+
+    #[test]
+    fn plane_count_must_match_the_modifier() {
+        let (_state, client) = test_client();
+        let p = params(&client);
+        for idx in 0..2u32 {
+            p.add(zwp_linux_buffer_params_v1::add::Request {
+                fd: fake_dmabuf(64 * 64 * 4),
+                plane_idx: idx,
+                offset: 0,
+                stride: 64 * 4,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            })
+            .unwrap();
+        }
+        p.create_immed(zwp_linux_buffer_params_v1::create_immed::Request {
+            buffer_id: ObjectId(82),
+            width: 64,
+            height: 64,
+            format: XRGB8888.drm,
+            flags: 0,
+        })
+        .unwrap();
+        // linear is single-plane; two planes die before touching the driver
+        assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 1);
+    }
+
+    #[test]
+    fn multi_plane_modifier_accepts_only_the_driver_count() {
+        let (state, client) = test_client();
+        *state.dmabuf_info.borrow_mut() = Some(DmabufInfo {
+            main_device: 0,
+            formats: vec![(XRGB8888.drm, 42, 2)],
+        });
+        let p = params(&client);
+        // both planes ride the same bo, like a real tiled allocation
+        let bo = fake_dmabuf(4096);
+        for idx in 0..2u32 {
+            p.add(zwp_linux_buffer_params_v1::add::Request {
+                fd: bo.try_clone().unwrap(),
+                plane_idx: idx,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 42,
+            })
+            .unwrap();
+        }
+        p.create_immed(zwp_linux_buffer_params_v1::create_immed::Request {
+            buffer_id: ObjectId(82),
+            width: 8,
+            height: 8,
+            format: XRGB8888.drm,
+            flags: 0,
+        })
+        .unwrap();
+        // the driver-reported count lands as-is
+        let buf = client.objects.buffer(ObjectId(82)).unwrap();
+        assert_eq!(buf.dmabuf().unwrap().planes.len(), 2);
+        assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 0);
+
+        // a single plane under the same modifier is short
+        let p2 = Rc::new(BufferParams {
+            id: ObjectId(84),
+            client: client.clone(),
+            version: 4,
+            planes: RefCell::new(Vec::new()),
+            modifier: Cell::new(None),
+            used: Cell::new(false),
+        });
+        p2.add(zwp_linux_buffer_params_v1::add::Request {
+            fd: fake_dmabuf(4096),
+            plane_idx: 0,
+            offset: 0,
+            stride: 64,
+            modifier_hi: 0,
+            modifier_lo: 42,
         })
         .unwrap();
         p2.create_immed(zwp_linux_buffer_params_v1::create_immed::Request {

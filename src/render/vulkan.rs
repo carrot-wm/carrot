@@ -265,9 +265,9 @@ impl VkCore {
         Ok(out)
     }
 
-    /// modifiers this device can import + sample for `format` - what the
-    /// dmabuf global advertises to gpu clients
-    pub fn sample_modifiers(&self, format: vk::Format) -> Result<Vec<u64>, RenderError> {
+    /// modifiers this device can import + sample for `format`, with plane
+    /// counts - what the dmabuf global advertises to gpu clients
+    pub fn sample_modifiers(&self, format: vk::Format) -> Result<Vec<(u64, u32)>, RenderError> {
         let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
         let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
         unsafe {
@@ -318,7 +318,10 @@ impl VkCore {
                     .external_memory_features
                     .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
             {
-                out.push(p.drm_format_modifier);
+                out.push((
+                    p.drm_format_modifier,
+                    p.drm_format_modifier_plane_count,
+                ));
             }
         }
         Ok(out)
