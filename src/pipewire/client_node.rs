@@ -95,7 +95,16 @@ const DATA_MEM_FD: u32 = 2;
 /// MemFd into the pool (AddMem) and rewrites the data as a pool id
 const DATA_MEM_ID: u32 = 4;
 const IO_BUFFERS: u32 = 1;
+pub const STATUS_NEED_DATA: u32 = 1 << 0;
 pub const STATUS_HAVE_DATA: u32 = 1 << 1;
+
+/// demand signal from the io area: anything but a standing HAVE_DATA
+/// means the graph took our last frame (or never had one) and rendering
+/// a new one is paid for. the consumer's dequeue rate paces us, no
+/// configured cap anywhere
+pub fn graph_wants(status: u32) -> bool {
+    status != STATUS_HAVE_DATA
+}
 const ACTIVATION_TRIGGERED: u32 = 1;
 const ACTIVATION_NOT_TRIGGERED: u32 = 0;
 const CHUNK_BYTES: usize = 16;
@@ -498,6 +507,14 @@ impl SourceNode {
         self.io.is_some() && !self.buffers.is_empty() && self.format_set
     }
 
+    /// true when the graph can take a new frame; false while the last
+    /// one sits unconsumed. pairs with produce()'s Release store
+    pub fn wants_frame(&self) -> bool {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let Some((_, io)) = &self.io else { return false };
+        graph_wants(unsafe { (*((*io) as *const AtomicU32)).load(Ordering::Acquire) })
+    }
+
     /// re-advertise the port at a new size: stale buffers drop and the
     /// daemon renegotiates format and buffers. the node borrow releases
     /// before the await, so the pump stays free to handle events
@@ -592,5 +609,16 @@ mod tests {
             !keys.contains(&FMT_VIDEO_FRAMERATE),
             "EnumFormat must not constrain the framerate"
         );
+    }
+
+    #[test]
+    fn production_paces_on_consumption() {
+        // spa_io_buffers: { status, buffer_id }; a fresh mapping is zeroed
+        assert!(graph_wants(0), "fresh io produces the priming frame");
+        // the follower consumed and flipped the status back
+        assert!(graph_wants(STATUS_NEED_DATA), "need-data produces");
+        // our own last frame still sits unconsumed: a render now is pure
+        // waste, and at present cadence it is the compositor-wide stall
+        assert!(!graph_wants(STATUS_HAVE_DATA), "have-data skips the render");
     }
 }

@@ -551,6 +551,12 @@ impl Cast {
                 crate::trace!("cast: node not ready");
                 return false;
             }
+            // the consumer still holds the last frame: a render now is
+            // work nobody dequeues, and at present cadence that work is
+            // the whole-session stall. its dequeue rate paces us
+            if !n.wants_frame() {
+                return true;
+            }
         }
         let now = Time::now().nsec();
         if now.saturating_sub(self.last.get()) < self.frame_ns - self.frame_ns / 10 {
