@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 rust-version = "1.93.0"
-name = "dlopen-rs"
+name = "taproot-dlopen-rs"
 version = "0.8.0"
 authors = ["wzhao <1207410841@qq.com>"]
 build = false
@@ -26,7 +26,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "A dynamic linker fully implemented in Rust."
+description = "A dynamic linker fully implemented in Rust. The taproot fork: ld.so-style dl* export semantics for the carrot compositor."
 readme = "README.md"
 keywords = [
     "dlopen",
@@ -40,7 +40,7 @@ categories = [
     "embedded",
 ]
 license = "Apache-2.0"
-repository = "https://github.com/weizhiao/dlopen-rs"
+repository = "https://github.com/carrot-wm/carrot"
 resolver = "2"
 
 [features]
@@ -53,59 +53,6 @@ version = ["elf_loader/version"]
 name = "dlopen_rs"
 path = "src/lib.rs"
 
-[[example]]
-name = "dlopen"
-path = "examples/dlopen.rs"
-required-features = []
-
-[[example]]
-name = "dlopen_from_binary"
-path = "examples/dlopen_from_binary.rs"
-
-[[example]]
-name = "preload"
-path = "examples/preload.rs"
-
-[[example]]
-name = "symbol_info"
-path = "examples/symbol_info.rs"
-
-[[test]]
-name = "all"
-path = "tests/all.rs"
-
-[[test]]
-name = "dlsym"
-path = "tests/dlsym.rs"
-
-[[test]]
-name = "ldcache"
-path = "tests/ldcache.rs"
-
-[[bench]]
-name = "dl_iterate_phdr"
-path = "benches/dl_iterate_phdr.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "dlopen"
-path = "benches/dlopen.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "dlopen_llvm"
-path = "benches/dlopen_llvm.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "dlsym"
-path = "benches/dlsym.rs"
-harness = false
-required-features = []
-
 [dependencies.bitflags]
 version = "2.6.0"
 
@@ -117,6 +64,7 @@ version = "0.6.3"
 
 [dependencies.elf_loader]
 version = "=0.14.0"
+package = "taproot-elf-loader"
 features = ["log"]
 default-features = false
 

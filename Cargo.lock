@@ -81,8 +81,6 @@ name = "carrot"
 version = "0.1.0"
 dependencies = [
  "ash",
- "dlopen-rs",
- "elf_loader",
  "gc-arena",
  "kbvm",
  "kdl",
@@ -92,6 +90,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "taproot-dlopen-rs",
+ "taproot-elf-loader",
  "taproot-eyra",
 ]
 
@@ -169,21 +169,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dlopen-rs"
-version = "0.8.0"
-dependencies = [
- "bitflags 2.13.0",
- "cfg-if",
- "ctor",
- "elf_loader",
- "indexmap",
- "libc",
- "log",
- "spin",
- "syscalls",
-]
-
-[[package]]
 name = "dtor"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -209,22 +194,6 @@ name = "elf"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
-
-[[package]]
-name = "elf_loader"
-version = "0.14.0"
-dependencies = [
- "bitflags 2.13.0",
- "cc",
- "cfg-if",
- "elf",
- "foldhash 0.2.0",
- "hashbrown 0.16.1",
- "libc",
- "log",
- "spin",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "equivalent"
@@ -906,6 +875,41 @@ dependencies = [
  "rustix-openpty",
  "taproot-origin",
  "unwinding",
+]
+
+[[package]]
+name = "taproot-dlopen-rs"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f26aa7d70b80700ecf4ac8f767d29ef9016148894a9e429243158d9a65f01c5"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "ctor",
+ "indexmap",
+ "libc",
+ "log",
+ "spin",
+ "syscalls",
+ "taproot-elf-loader",
+]
+
+[[package]]
+name = "taproot-elf-loader"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72397de8dbb1154f367616d497d016f5284eb12cc5bb7f15cc1e05ad4cf3c62f"
+dependencies = [
+ "bitflags 2.13.0",
+ "cc",
+ "cfg-if",
+ "elf",
+ "foldhash 0.2.0",
+ "hashbrown 0.16.1",
+ "libc",
+ "log",
+ "spin",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 rust-version = "1.93.0"
-name = "elf_loader"
+name = "taproot-elf-loader"
 version = "0.14.0"
 authors = ["wzhao <1207410841@qq.com>"]
 build = "build.rs"
@@ -28,8 +28,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "A high-performance, no_std compliant ELF loader and JIT linker for Rust."
-readme = "README.md"
+description = "A high-performance, no_std compliant ELF loader and JIT linker for Rust. The taproot fork: tlsdesc entry alignment and a static-TLS surplus allocator, for the carrot compositor."
 keywords = [
     "elf",
     "loader",
@@ -45,7 +44,7 @@ categories = [
     "development-tools",
 ]
 license = "MIT/Apache-2.0"
-repository = "https://github.com/weizhiao/elf_loader"
+repository = "https://github.com/carrot-wm/carrot"
 
 [features]
 default = []
@@ -61,11 +60,6 @@ version = []
 [lib]
 name = "elf_loader"
 path = "src/lib.rs"
-
-[[bench]]
-name = "benchmark"
-path = "benches/benchmark.rs"
-harness = false
 
 [dependencies.bitflags]
 version = "2.9.0"

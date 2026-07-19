@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/carrot-wm/carrot"
+description = "A pure Rust tiling Wayland compositor with zero linked C, all the way down to the kernel"
+# vendor/ holds the fork sources of the taproot-* linker crates below;
+# registry users never need it
+exclude = ["vendor"]
 
 [dependencies]
 # origin startup + c-gull libc linked in: zero linked C. experimental-relocate
@@ -16,9 +20,12 @@ eyra = { package = "taproot-eyra", version = "0.22.4", features = ["experimental
 # no default features: no `loaded`/libloading (pulls dl* nothing defines);
 # the entry comes from the icd via dlopen-rs + Entry::from_static_fn
 ash = { version = "0.38", default-features = false }
-# pure-rust dynamic linker: loads the mesa icd + its closure against taproot
-dlopen-rs = "0.8"
-elf_loader = "0.14.0"
+# pure-rust dynamic linker: loads the mesa icd + its closure against
+# taproot. the taproot forks carry the tlsdesc entry alignment fix, the
+# static-TLS surplus allocator and ld.so-style dl* exports; sources live
+# in vendor/, flip to path = "vendor/..." while hacking on them
+dlopen-rs = { package = "taproot-dlopen-rs", version = "0.8.0" }
+elf_loader = { package = "taproot-elf-loader", version = "0.14.0" }
 rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "pipe", "time", "process"] }
 kbvm = "0.1.6"
 
@@ -52,12 +59,3 @@ overflow-checks = false
 
 [profile.release]
 panic = "abort"
-
-# vendored with one fix: the tlsdesc dynamic resolver called its rust
-# half on a misaligned stack (entry rsp is 8 mod 16, and its saves kept
-# it there), faulting release builds of any dlopened closure with
-# dynamic tls - libLLVM in radv's. drop the vendor once upstream ships
-# the alignment fix.
-[patch.crates-io]
-elf_loader = { path = "vendor/elf_loader" }
-dlopen-rs = { path = "vendor/dlopen-rs" }
