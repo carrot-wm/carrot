@@ -432,7 +432,13 @@ impl Xwm {
                 if ty == self.wl_surface_serial {
                     let serial = data[0] as u64 | (data[1] as u64) << 32;
                     if let Some(xwin) = self.win(window) {
-                        xwin.serial.set(serial);
+                        let old = xwin.serial.replace(serial);
+                        if old != 0 && old != serial {
+                            // the previous map cycle's surface died with
+                            // its serial; the entries must not outlive it
+                            self.by_serial.borrow_mut().remove(&old);
+                            self.xw.serials.borrow_mut().remove(&old);
+                        }
                         self.by_serial.borrow_mut().insert(serial, window);
                         self.try_pair(&xwin);
                         self.gate(&xwin);
@@ -927,15 +933,25 @@ impl Xwm {
     }
 
     fn try_pair(&self, xwin: &Rc<XWindow>) {
-        if xwin.surface.borrow().is_some() {
-            return;
-        }
         let serial = xwin.serial.get();
         if serial == 0 {
             return;
         }
-        if let Some(s) = self.xw.serials.borrow().get(&serial) {
-            *xwin.surface.borrow_mut() = Some(s.clone());
+        let Some(s) = self.xw.serials.borrow().get(&serial).cloned() else {
+            return;
+        };
+        // the serial names the window's CURRENT surface: every re-map
+        // mints a fresh one, and a pairing pinned to the previous map
+        // cycle's corpse kept the gate closed until the app restarted
+        // (electron's hide-to-tray cycle). the legacy WL_SURFACE_ID path
+        // always replaced; the serial path replaces too
+        let stale = xwin
+            .surface
+            .borrow()
+            .as_ref()
+            .is_none_or(|cur| !Rc::ptr_eq(cur, &s));
+        if stale {
+            *xwin.surface.borrow_mut() = Some(s);
         }
     }
 
