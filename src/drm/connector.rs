@@ -35,6 +35,9 @@ pub struct Connector {
     /// the driver called a flip-time vrr toggle a modeset; stop retrying
     /// every frame - the next real modeset applies it and clears this
     vrr_flip_denied: Cell<bool>,
+    /// a flip had to drop the cursor carrier to land; the present loop
+    /// consumes this and switches to software compositing
+    cursor_fault: Cell<bool>,
     pub modes: RefCell<Vec<ModeInfo>>,
     pub pipe: RefCell<Option<Pipe>>,
     pub flip_pending: Cell<bool>,
@@ -99,6 +102,7 @@ impl Connector {
             vrr_want: Cell::new(false),
             vrr_cur: Cell::new(false),
             vrr_flip_denied: Cell::new(false),
+            cursor_fault: Cell::new(false),
             modes: RefCell::new(info.modes),
             pipe: RefCell::new(None),
             flip_pending: Cell::new(false),
@@ -194,7 +198,15 @@ impl Connector {
         }
         set_plane(ch, &pipe.primary, pipe.crtc.id, fb, &pipe.mode);
         if let Some(cur) = &pipe.cursor {
-            cur.apply(ch, pipe.crtc.id);
+            if cur.is_overlay() {
+                // an overlay enable never rides a modeset: a driver that
+                // rejects the plane would read as a bandwidth failure and
+                // step the mode down. the first flip carries it instead,
+                // where a rejection demotes to compositing
+                cur.clear_routing(ch);
+            } else {
+                cur.apply(ch, pipe.crtc.id);
+            }
         }
         Ok(blob)
     }
@@ -208,7 +220,13 @@ impl Connector {
             let _ = sys::destroy_blob(dev.fd.as_fd(), old);
         }
         if let Some(cur) = &pipe.cursor {
-            cur.commit_done();
+            if cur.is_overlay() {
+                // the modeset cleared the plane; the buffered image and
+                // enable state restage whole in the next commit
+                cur.rearm();
+            } else {
+                cur.commit_done();
+            }
         }
         self.vrr_cur.set(self.vrr_want.get());
         // the modeset carried the vrr state; flip-time toggles may retry
@@ -279,20 +297,24 @@ impl Connector {
         let primary = take_plane(PlaneType::Primary, XRGB8888.drm)
             .ok_or(DrmError::NoPrimaryPlane(self.id))?;
         primary.crtc.set(crtc.id);
-        // joined modes: the kernel gangs two pipes and the cursor plane
-        // misbehaves per driver (xe: phantom doubled state, the 1px smudge;
-        // amdgpu: the plane lands offset). composite the cursor on every
-        // joined mode.
-        let cursor = if mode_needs_joiner(&mode) {
-            eprintln!(
-                "carrot: {}: joined mode, hardware cursor off (composited instead)",
-                self.name
-            );
-            None
-        } else {
-            take_plane(PlaneType::Cursor, ARGB8888.drm).and_then(|p| {
+        let joined = mode_needs_joiner(&mode);
+        let cursor = pick_carrier_plane(&dev.planes, crtc.idx, joined).and_then(|(p, kind)| {
+            if kind == CarrierKind::Overlay {
+                if !overlay_stacks_above(&primary, &p) {
+                    eprintln!(
+                        "carrot: {}: overlay plane {} is pinned below the primary; cursor composites",
+                        self.name, p.id
+                    );
+                    return None;
+                }
+                eprintln!("carrot: {}: cursor rides overlay plane {}", self.name, p.id);
+            }
             p.crtc.set(crtc.id);
-            match CursorPlane::new(dev, p.clone()) {
+            let zpos = match kind {
+                CarrierKind::Overlay => overlay_zpos_target(&primary, &p),
+                CarrierKind::Cursor => None,
+            };
+            match CursorPlane::new(dev, p.clone(), kind, zpos) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     eprintln!("carrot: cursor plane setup failed, continuing without: {e}");
@@ -300,8 +322,13 @@ impl Connector {
                     None
                 }
             }
-            })
-        };
+        });
+        if cursor.is_none() && joined {
+            eprintln!(
+                "carrot: {}: joined mode, no overlay plane; cursor composites",
+                self.name
+            );
+        }
 
         if prefer.is_some() {
             eprintln!(
@@ -352,7 +379,7 @@ impl Connector {
         if self.flip_pending.get() {
             return Ok(FlipResult::NotPresented);
         }
-        let build = |out_fd: &mut i32, ch: &mut Change, with_vrr: Option<bool>| {
+        let build = |out_fd: &mut i32, ch: &mut Change, with_vrr: Option<bool>, with_cursor: bool| {
             ch.clear();
             ch.set(
                 pipe.crtc.id,
@@ -365,8 +392,10 @@ impl Connector {
             if let (Some(prop), Some(fence)) = (pipe.primary.props.in_fence_fd, in_fence) {
                 ch.set(pipe.primary.id, prop, fence as u64);
             }
-            if let Some(cur) = &pipe.cursor {
-                cur.apply(ch, pipe.crtc.id);
+            if with_cursor {
+                if let Some(cur) = &pipe.cursor {
+                    cur.apply(ch, pipe.crtc.id);
+                }
             }
             if let (Some(prop), Some(on)) = (pipe.crtc.props.vrr_enabled, with_vrr) {
                 ch.set(pipe.crtc.id, prop, on as u64);
@@ -375,13 +404,15 @@ impl Connector {
         // vrr rides the flip where drivers allow it; if they call it a
         // modeset instead, retry once without so the frame still lands
         let vrr = self.vrr_dirty().then(|| self.vrr_want.get());
+        let cursor_staged = pipe.cursor.as_ref().is_some_and(|c| c.changed());
         let mut out_fd: i32 = -1;
         let mut ch = self.change.borrow_mut();
-        build(&mut out_fd, &mut ch, vrr);
+        build(&mut out_fd, &mut ch, vrr, true);
         let mut res = ch.commit(dev.fd.as_fd(), atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT, 0);
         let mut vrr_applied = vrr;
+        let mut cursor_applied = true;
         if res.is_err() && vrr.is_some() && !matches!(res, Err(Errno::BUSY)) {
-            build(&mut out_fd, &mut ch, None);
+            build(&mut out_fd, &mut ch, None, true);
             res = ch.commit(dev.fd.as_fd(), atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT, 0);
             vrr_applied = None;
             if res.is_ok() {
@@ -389,11 +420,29 @@ impl Connector {
                 eprintln!("carrot: {}: vrr change needs a modeset on this driver", self.name);
             }
         }
+        // same shape for the cursor carrier: a driver that rejects the
+        // plane (overlay quirks under a join) must not cost the frame -
+        // land without it and let the consumer demote to compositing
+        if res.is_err() && cursor_staged && !matches!(res, Err(Errno::BUSY)) {
+            build(&mut out_fd, &mut ch, None, false);
+            res = ch.commit(dev.fd.as_fd(), atomic::NONBLOCK | atomic::PAGE_FLIP_EVENT, 0);
+            vrr_applied = None;
+            cursor_applied = false;
+            if res.is_ok() {
+                self.cursor_fault.set(true);
+                eprintln!(
+                    "carrot: {}: cursor plane rejected at flip; compositing the cursor instead",
+                    self.name
+                );
+            }
+        }
         match res {
             Ok(()) => {
                 self.take_out_fence(out_fd);
-                if let Some(cur) = &pipe.cursor {
-                    cur.commit_done();
+                if cursor_applied {
+                    if let Some(cur) = &pipe.cursor {
+                        cur.commit_done();
+                    }
                 }
                 if let Some(on) = vrr_applied {
                     self.vrr_cur.set(on);
@@ -445,6 +494,11 @@ impl Connector {
             Err(Errno::BUSY) => Ok(FlipResult::NotPresented),
             Err(e) => Err(commit_error(e)),
         }
+    }
+
+    /// one-shot: a flip dropped the cursor carrier to land
+    pub fn take_cursor_fault(&self) -> bool {
+        self.cursor_fault.replace(false)
     }
 
     /// pending cursor plane changes would disqualify an async commit
@@ -584,11 +638,85 @@ fn commit_error(e: Errno) -> DrmError {
 
 // -- cursor --
 
+/// which plane type carries the cursor image
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CarrierKind {
+    Cursor,
+    /// a generic overlay stands in where the dedicated cursor plane is
+    /// unusable (joined modes) or absent; its enable never rides a modeset
+    Overlay,
+}
+
+/// the plane that carries the cursor for this crtc: the dedicated cursor
+/// plane where it behaves, else a free ARGB overlay. joined modes skip the
+/// cursor plane outright - the kernel gangs two pipes and it misbehaves
+/// per driver (xe: phantom doubled state, the 1px smudge; amdgpu: the
+/// plane lands offset). None means the frame composites the cursor
+pub(crate) fn pick_carrier_plane(
+    planes: &[Rc<Plane>],
+    crtc_idx: usize,
+    joined: bool,
+) -> Option<(Rc<Plane>, CarrierKind)> {
+    let free = |p: &Rc<Plane>, ty: PlaneType| {
+        p.ty == ty
+            && p.possible_crtcs & (1 << crtc_idx) != 0
+            && p.crtc.get() == ObjId(0)
+            && p.supports(ARGB8888.drm)
+    };
+    let overlay = || {
+        planes
+            .iter()
+            .find(|p| free(p, PlaneType::Overlay))
+            .cloned()
+            .map(|p| (p, CarrierKind::Overlay))
+    };
+    if joined {
+        return overlay();
+    }
+    planes
+        .iter()
+        .find(|p| free(p, PlaneType::Cursor))
+        .cloned()
+        .map(|p| (p, CarrierKind::Cursor))
+        .or_else(overlay)
+}
+
+/// an overlay pinned below the primary would commit fine and scan out
+/// invisibly behind the frame - no error ever surfaces it. refuse the
+/// plane instead and let the cursor composite
+pub(crate) fn overlay_stacks_above(primary: &Plane, overlay: &Plane) -> bool {
+    let Some(oz) = overlay.zpos.as_ref() else {
+        // no zpos prop: the driver's fixed order decides, and overlays
+        // sit above the primary everywhere we know of
+        return true;
+    };
+    let pz = primary.zpos.as_ref().map(|z| z.value).unwrap_or(0);
+    oz.value > pz || oz.range.0 < oz.range.1
+}
+
+/// raise the overlay above the primary where the driver lets us. already
+/// stacked right (i915's immutable order): stage nothing
+pub(crate) fn overlay_zpos_target(primary: &Plane, overlay: &Plane) -> Option<(PropId, u64)> {
+    let oz = overlay.zpos.as_ref()?;
+    let pz = primary.zpos.as_ref().map(|z| z.value).unwrap_or(0);
+    if oz.value > pz {
+        return None;
+    }
+    let (min, max) = oz.range;
+    if min >= max {
+        return None;
+    }
+    Some((oz.prop, (pz + 1).clamp(min, max)))
+}
+
 /// double-buffered dumb buffers, cpu-written, ARGB. changes ride along in
 /// whatever commit goes out next; a bare move without content damage still
 /// needs a flip-shaped commit from the caller
 pub struct CursorPlane {
     pub plane: Rc<Plane>,
+    kind: CarrierKind,
+    /// staged while enabled; picked at assign time, never re-negotiated
+    zpos: Option<(PropId, u64)>,
     bufs: [CursorBuf; 2],
     back: Cell<usize>,
     pub width: u32,
@@ -613,7 +741,12 @@ struct CursorBuf {
 }
 
 impl CursorPlane {
-    pub fn new(dev: &DrmDevice, plane: Rc<Plane>) -> Result<CursorPlane, DrmError> {
+    pub fn new(
+        dev: &DrmDevice,
+        plane: Rc<Plane>,
+        kind: CarrierKind,
+        zpos: Option<(PropId, u64)>,
+    ) -> Result<CursorPlane, DrmError> {
         let (w, h) = dev.cursor_size;
         let mk = || -> Result<CursorBuf, DrmError> {
             let db = sys::create_dumb(dev.fd.as_fd(), w, h, 32)
@@ -653,6 +786,8 @@ impl CursorPlane {
         };
         Ok(CursorPlane {
             plane,
+            kind,
+            zpos,
             bufs: [mk()?, mk()?],
             back: Cell::new(0),
             width: w,
@@ -715,6 +850,16 @@ impl CursorPlane {
         self.changed.get()
     }
 
+    pub fn is_overlay(&self) -> bool {
+        self.kind == CarrierKind::Overlay
+    }
+
+    /// the modeset just cleared this plane; restage everything, content
+    /// buffer included, in the next flip-shaped commit
+    fn rearm(&self) {
+        self.changed.set(true);
+    }
+
     fn apply(&self, ch: &mut Change, crtc_id: ObjId) {
         if !self.changed.get() {
             return;
@@ -729,6 +874,9 @@ impl CursorPlane {
             };
             let w = self.width as u64;
             let h = self.height as u64;
+            if let Some((prop, v)) = self.zpos {
+                ch.set(p.id, prop, v);
+            }
             ch.set(p.id, p.props.crtc_id, crtc_id.0 as u64);
             ch.set(p.id, p.props.fb_id, self.bufs[idx].fb as u64);
             ch.set(p.id, p.props.src_x, 0);
@@ -768,6 +916,104 @@ impl Drop for CursorBuf {
 /// driver threshold varies, erring low only over-reserves a pipe
 pub fn mode_needs_joiner(mode: &ModeInfo) -> bool {
     mode.clock > 1_000_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drm::device::{PlaneProps, Zpos};
+
+    fn plane(id: u32, ty: PlaneType, crtcs: u32, argb: bool, zpos: Option<Zpos>) -> Rc<Plane> {
+        let fourcc = if argb { ARGB8888.drm } else { XRGB8888.drm };
+        Rc::new(Plane {
+            id: ObjId(id),
+            ty,
+            possible_crtcs: crtcs,
+            formats: vec![(fourcc, Vec::new())],
+            props: PlaneProps {
+                crtc_id: PropId(1),
+                fb_id: PropId(2),
+                src_x: PropId(3),
+                src_y: PropId(4),
+                src_w: PropId(5),
+                src_h: PropId(6),
+                crtc_x: PropId(7),
+                crtc_y: PropId(8),
+                crtc_w: PropId(9),
+                crtc_h: PropId(10),
+                in_fence_fd: None,
+            },
+            zpos,
+            crtc: Cell::new(ObjId(0)),
+        })
+    }
+
+    #[test]
+    fn joined_modes_take_an_overlay_never_the_cursor_plane() {
+        let planes = vec![
+            plane(1, PlaneType::Primary, 0b1, false, None),
+            plane(2, PlaneType::Cursor, 0b1, true, None),
+            plane(3, PlaneType::Overlay, 0b1, true, None),
+        ];
+        let (p, kind) = pick_carrier_plane(&planes, 0, true).unwrap();
+        assert_eq!((p.id, kind), (ObjId(3), CarrierKind::Overlay));
+        // and without a free overlay, the join composites
+        assert!(pick_carrier_plane(&planes[..2], 0, true).is_none());
+    }
+
+    #[test]
+    fn unjoined_prefers_the_cursor_plane_and_falls_back_to_overlay() {
+        let planes = vec![
+            plane(2, PlaneType::Cursor, 0b1, true, None),
+            plane(3, PlaneType::Overlay, 0b1, true, None),
+        ];
+        let (p, kind) = pick_carrier_plane(&planes, 0, false).unwrap();
+        assert_eq!((p.id, kind), (ObjId(2), CarrierKind::Cursor));
+        // cursor-plane-less hardware still gets a plane-backed cursor
+        let (p, kind) = pick_carrier_plane(&planes[1..], 0, false).unwrap();
+        assert_eq!((p.id, kind), (ObjId(3), CarrierKind::Overlay));
+    }
+
+    #[test]
+    fn carrier_planes_must_be_free_argb_and_reach_the_crtc() {
+        let owned = plane(3, PlaneType::Overlay, 0b1, true, None);
+        owned.crtc.set(ObjId(9));
+        let wrong_crtc = plane(4, PlaneType::Overlay, 0b10, true, None);
+        let no_argb = plane(5, PlaneType::Overlay, 0b1, false, None);
+        let planes = vec![owned, wrong_crtc, no_argb];
+        assert!(pick_carrier_plane(&planes, 0, true).is_none());
+    }
+
+    #[test]
+    fn zpos_stages_only_when_mutable_and_below_the_primary() {
+        let z = |value, range| Some(Zpos { prop: PropId(40), value, range });
+        let primary = plane(1, PlaneType::Primary, 1, false, z(1, (0, 0)));
+        // below and mutable: raised past the primary, clamped to range
+        let ov = plane(3, PlaneType::Overlay, 1, true, z(0, (0, 254)));
+        assert_eq!(overlay_zpos_target(&primary, &ov), Some((PropId(40), 2)));
+        // already above (i915's immutable order): nothing staged
+        let ov = plane(3, PlaneType::Overlay, 1, true, z(2, (2, 2)));
+        assert_eq!(overlay_zpos_target(&primary, &ov), None);
+        // below but immutable: a new value would reject the commit
+        let ov = plane(3, PlaneType::Overlay, 1, true, z(0, (0, 0)));
+        assert_eq!(overlay_zpos_target(&primary, &ov), None);
+        // no zpos prop at all: trust the driver's default order
+        let ov = plane(3, PlaneType::Overlay, 1, true, None);
+        assert_eq!(overlay_zpos_target(&primary, &ov), None);
+    }
+
+    #[test]
+    fn an_overlay_pinned_below_the_primary_is_refused() {
+        let z = |value, range| Some(Zpos { prop: PropId(40), value, range });
+        let primary = plane(1, PlaneType::Primary, 1, false, z(1, (0, 0)));
+        // immutable and below: it would scan out behind the frame
+        let ov = plane(3, PlaneType::Overlay, 1, true, z(0, (0, 0)));
+        assert!(!overlay_stacks_above(&primary, &ov));
+        // mutable-below, immutable-above, and zpos-less all pass
+        assert!(overlay_stacks_above(&primary, &plane(3, PlaneType::Overlay, 1, true, z(0, (0, 254)))));
+        assert!(overlay_stacks_above(&primary, &plane(3, PlaneType::Overlay, 1, true, z(2, (2, 2)))));
+        assert!(overlay_stacks_above(&primary, &plane(3, PlaneType::Overlay, 1, true, None)));
+    }
 }
 
 /// kernel connector-type names, drm_connector_enum_list verbatim

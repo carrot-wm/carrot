@@ -137,6 +137,14 @@ pub struct PlaneProps {
     pub in_fence_fd: Option<PropId>,
 }
 
+/// stacking-order prop, where the driver exposes one; min == max in
+/// `range` means the order is fixed and staging a new value would reject
+pub struct Zpos {
+    pub prop: PropId,
+    pub value: u64,
+    pub range: (u64, u64),
+}
+
 pub struct Plane {
     pub id: ObjId,
     pub ty: PlaneType,
@@ -144,6 +152,7 @@ pub struct Plane {
     /// fourcc -> modifiers. empty list = no IN_FORMATS, plain format array only
     pub formats: Vec<(u32, Vec<u64>)>,
     pub props: PlaneProps,
+    pub zpos: Option<Zpos>,
     /// crtc id this plane is bound to, 0 = free
     pub crtc: Cell<ObjId>,
 }
@@ -253,6 +262,14 @@ impl DrmDevice {
                     crtc_h: props.require("CRTC_H", id)?,
                     in_fence_fd: props.id("IN_FENCE_FD"),
                 },
+                zpos: props.id("zpos").map(|prop| {
+                    let value = props.value("zpos").unwrap_or(0);
+                    Zpos {
+                        prop,
+                        value,
+                        range: props.range("zpos").unwrap_or((value, value)),
+                    }
+                }),
                 crtc: Cell::new(ObjId(0)),
             }));
         }

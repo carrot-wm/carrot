@@ -2105,6 +2105,16 @@ fn fs_surface_candidate(
     Some((surface, buf))
 }
 
+/// a flip had to drop a rejected cursor carrier to land; switch to
+/// software compositing once - never leave the user cursorless
+fn service_cursor_fault(state: &Rc<State>, out: &Rc<Output>) {
+    if out.conn.take_cursor_fault() {
+        if let Some(d) = state.display.borrow().as_ref() {
+            d.set_software_cursor(state, true);
+        }
+    }
+}
+
 /// a frame that is exactly one client buffer needs no compose at all: the
 /// buffer goes on the primary plane and the gpu stays idle
 fn scanout_candidate(
@@ -2520,7 +2530,9 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             if let Some(fb) = scanout_fb(out, &buf) {
                 let fence = buf.dmabuf().and_then(|img| img.read_fence());
                 out.conn.vrr_want.set(vrr_wanted(state, out));
-                match out.conn.flip(&out.dev, fb, fence.as_ref().map(|f| f.as_raw_fd())) {
+                let flip_res = out.conn.flip(&out.dev, fb, fence.as_ref().map(|f| f.as_raw_fd()));
+                service_cursor_fault(state, out);
+                match flip_res {
                     Ok(FlipResult::Queued) => {
                         out.inflight_vsync.set(true);
                         out.inflight_zero_copy.set(true);
@@ -2682,6 +2694,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             out.conn
                 .flip(&out.dev, buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd()))
         };
+        service_cursor_fault(state, out);
         match res {
             Ok(FlipResult::Queued) => {
                 out.front.set(back);
