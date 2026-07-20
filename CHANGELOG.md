@@ -1,5 +1,32 @@
 # Changelog
 
+## Carrot v0.1.1 Beta
+
+Hardening across the launch path, no new features.
+
+- Loader: packed relative relocations (DT_RELR) load on distros that
+  build mesa with them; the residual unaligned entries no longer fail
+  the whole driver dlopen
+- Loader: multilib systems pick the 64-bit driver; foreign-arch ICD
+  manifests are skipped and every matching ICD gets a fallback try
+- Loader: qemu guests match the venus ICD (virtio_gpu)
+- Loader: the taproot libc pairing is verified before any driver code
+  runs, on libc.so.6 and libm.so.6 both; a missing legacy-soname stub
+  is a hard error instead of a silent glibc leak
+- taproot: the thread metadata prefix is frozen repr(C), so a cdylib
+  built by a different compiler can no longer corrupt the session
+- taproot: the cdylib links clean under GNU ld (the init/fini array
+  bounds no longer become unresolvable imports)
+- install: the libc family stages all-or-nothing, verified against the
+  installing binary, stale files swept, writes are atomic
+- install: a udev rule grants the active seat /dev/udmabuf, so the
+  zero-copy shm path works out of the box
+- install: --build-taproot makes a cargo install GPU-capable in one
+  command; it fetches the matching taproot source with curl and builds
+  the libc family with your own cargo, pairing-checked before staging
+- config: a multibyte character in a color value errors instead of
+  crashing the compositor at startup
+
 ## Carrot v0.1.0 Beta
 
 - Dwindle Tiling

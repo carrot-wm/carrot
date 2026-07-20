@@ -902,7 +902,7 @@
           commonArgs = {
             inherit src;
             pname = "carrot";
-            version = "0.1.0";
+            version = "0.1.1";
             strictDeps = true;
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -916,7 +916,9 @@
           taproot-libs = craneLib.buildPackage {
             src = inputs.taproot;
             pname = "taproot-libs";
-            version = "0.22.5";
+            # tracks the taproot cdylib crate version; the payload is
+            # whatever the flake input pins
+            version = "0.22.7";
             strictDeps = true;
             # the c-ward workspace root is a targetless hybrid manifest
             # crane's dummy crate can't model; build in one derivation
