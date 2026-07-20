@@ -47,6 +47,9 @@ pub struct SeatGlobal {
     pub ptr_y: Cell<f64>,
     ptr_focus: RefCell<Option<Rc<WlSurface>>>,
     ptr_origin: Cell<(i32, i32)>,
+    /// the origin moved while a lock muzzled the corrective motion; the
+    /// client's anchor is stale until one is delivered at unlock
+    ptr_rebase_owed: Cell<bool>,
     ptr_buttons: RefCell<Vec<u32>>,
     /// buttons whose press a screencast pick consumed; their releases
     /// stay consumed too
@@ -125,6 +128,7 @@ impl SeatGlobal {
             ptr_y: Cell::new(0.0),
             ptr_focus: RefCell::new(None),
             ptr_origin: Cell::new((0, 0)),
+            ptr_rebase_owed: Cell::new(false),
             ptr_buttons: RefCell::new(Vec::new()),
             pick_swallow: RefCell::new(Vec::new()),
             last_press_serial: Cell::new(0),
@@ -658,7 +662,7 @@ impl SeatGlobal {
         self.constraints.borrow_mut().retain(|c| !c.dead.get());
     }
 
-    fn deactivate_constraint(&self, state: &Rc<State>, con: &Rc<Constraint>) {
+    fn deactivate_constraint(self: &Rc<Self>, state: &Rc<State>, con: &Rc<Constraint>) {
         if !con.active.get() {
             return;
         }
@@ -669,18 +673,22 @@ impl SeatGlobal {
         // while the lock holds, and no motion runs to rebase in between
         if con.kind == Kind::Lock {
             if let Some((hx, hy)) = con.hint.take() {
-                let Some((ox, oy)) = crate::tree::surface_origin(state, &con.surface) else {
-                    return;
-                };
-                let (w, h) = state.output_size.get();
-                let x = (ox as f64 + hx).clamp(0.0, (w.max(1) - 1) as f64);
-                let y = (oy as f64 + hy).clamp(0.0, (h.max(1) - 1) as f64);
-                self.ptr_x.set(x);
-                self.ptr_y.set(y);
-                if let Some(d) = state.display.borrow().as_ref() {
-                    d.move_cursor(state, x as i32, y as i32);
+                if let Some((ox, oy)) = crate::tree::surface_origin(state, &con.surface) {
+                    let (x, y) = crate::output::clamp_pointer(
+                        state,
+                        ox as f64 + hx,
+                        oy as f64 + hy,
+                    );
+                    self.ptr_x.set(x);
+                    self.ptr_y.set(y);
+                    if let Some(d) = state.display.borrow().as_ref() {
+                        d.move_cursor(state, x as i32, y as i32);
+                    }
                 }
             }
+            // the lock is gone: whatever moved the surface while it held,
+            // the cache and the client resync before any button lands
+            self.rebase_origin(state);
         }
     }
 
@@ -1193,6 +1201,7 @@ impl SeatGlobal {
                 let origin = (x as i32 - lx, y as i32 - ly);
                 if origin != self.ptr_origin.get() && !s.destroyed.get() {
                     self.ptr_origin.set(origin);
+                    self.ptr_rebase_owed.set(false);
                     let ms = (crate::util::Time::now().nsec() / 1_000_000) as u32;
                     let (fx, fy) = (Fixed::from_int(*lx), Fixed::from_int(*ly));
                     self.for_each_pointer(s.client.id, 1, |p| {
@@ -1225,6 +1234,8 @@ impl SeatGlobal {
             });
             self.ptr_frame(new.client.id);
             self.ptr_origin.set((x as i32 - lx, y as i32 - ly));
+            // the enter carried absolute coords; nothing is owed
+            self.ptr_rebase_owed.set(false);
             // focus-follows-mouse targets the window root, never a subsurface,
             // and never fires while a popup grab or lock holds the keyboard.
             // popups and layer surfaces take the keyboard by click or
@@ -1252,7 +1263,64 @@ impl SeatGlobal {
 
     /// the scene changed under a stationary cursor (map/unmap/arrange):
     /// re-resolve pointer focus without waiting for the next motion
+    /// re-resolve the cached painted origin of the current pointer focus
+    /// from the tree. this runs even while a lock, held button, or drag
+    /// pins focus identity: a fullscreen or retile under any pin used to
+    /// strand ptr_origin at the old rect, and every consumer (motion
+    /// delivery, confine boxes, late enters) inherited the displacement
+    /// until the next free motion. a locked client hears nothing - it
+    /// consumes only relative deltas and absolute motion is forbidden
+    /// under a lock; otherwise the corrective motion tells the client
+    /// where it now stands
+    pub fn rebase_origin(self: &Rc<Self>, state: &Rc<State>) {
+        let focus = self.ptr_focus.borrow().clone();
+        let Some(s) = focus.filter(|s| !s.destroyed.get()) else {
+            return;
+        };
+        let Some((ox, oy)) = crate::tree::surface_origin(state, &s) else {
+            return;
+        };
+        let changed = (ox, oy) != self.ptr_origin.get();
+        if changed {
+            self.ptr_origin.set((ox, oy));
+        }
+        if self.active_lock().is_some() {
+            // silently healed; the client's anchor resyncs at unlock
+            if changed {
+                self.ptr_rebase_owed.set(true);
+            }
+            return;
+        }
+        if changed || self.ptr_rebase_owed.replace(false) {
+            let ms = (crate::util::Time::now().nsec() / 1_000_000) as u32;
+            let fx = Fixed::from_f64(self.ptr_x.get() - ox as f64);
+            let fy = Fixed::from_f64(self.ptr_y.get() - oy as f64);
+            self.for_each_pointer(s.client.id, 1, |p| {
+                p.client
+                    .event(|o| wl_pointer::motion::send(o, p.id, ms, fx, fy));
+            });
+            self.ptr_frame(s.client.id);
+        }
+    }
+
+    /// jump the pointer, the plane, and focus together; the one authority
+    /// for programmatic pointer placement. a live lock owns the pointer,
+    /// so the seat, the plane, and the client all stay where they are
+    pub fn place_pointer(self: &Rc<Self>, state: &Rc<State>, x: f64, y: f64) {
+        if self.active_lock().is_some() {
+            return;
+        }
+        self.warp(state, x, y);
+        if let Some(d) = state.display.borrow().as_ref() {
+            d.move_cursor(state, x as i32, y as i32);
+        }
+    }
+
     pub fn repick(self: &Rc<Self>, state: &Rc<State>) {
+        // the painted origin heals no matter what pins focus identity;
+        // a stale cache under a pin was the recurring fullscreen
+        // displacement
+        self.rebase_origin(state);
         // an implicit grab pins focus; dnd re-targets on its own motion.
         // a lock pins too - but only while its window is still on the
         // visible scene, else a workspace switch leaves relative motion
@@ -1979,6 +2047,87 @@ mod tests {
         let bytes = client.queued_out_bytes();
         assert_eq!(count_events(&bytes, ptr, 1), leaves, "same surface, no leave");
         assert!(count_events(&bytes, ptr, 2) > motions, "a motion rebases the client's view");
+    }
+
+    #[test]
+    fn fullscreen_under_a_locked_pointer_keeps_origin_live() {
+        use crate::protocol::interfaces::{zwp_locked_pointer_v1, zwp_pointer_constraints_v1};
+        use crate::protocol::pointer_constraints::{ConstraintsManager, LockedPointer};
+        use zwp_locked_pointer_v1::Handler as _;
+        use zwp_pointer_constraints_v1::Handler as _;
+
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let bind = Rc::new(WlSeat {
+            id: ObjectId(80),
+            client: client.clone(),
+            version: 9,
+            global: seat.clone(),
+            keyboards: RefCell::new(Vec::new()),
+            pointers: RefCell::new(Vec::new()),
+        });
+        client.add_client_obj(bind.clone()).unwrap();
+        seat.bindings.borrow_mut().entry(client.id).or_default().push(bind.clone());
+        bind.get_pointer(wl_seat::get_pointer::Request { id: ObjectId(81) }).unwrap();
+
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        let (sb, xb, _tb) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 11, 41, 51);
+        crate::shell::xdg::tests::map(&state, &client, &sb, &xb, 21);
+        seat.warp(&state, 410.0, 10.0);
+        assert_eq!(seat.ptr_origin.get(), (400, 0));
+
+        let mgr = ConstraintsManager { id: ObjectId(70), client: client.clone(), version: 1 };
+        mgr.lock_pointer(zwp_pointer_constraints_v1::lock_pointer::Request {
+            id: ObjectId(71),
+            surface: sa.id,
+            pointer: ObjectId(0),
+            region: ObjectId(0),
+            lifetime: 1,
+        })
+        .unwrap();
+        let con = seat.constraint_for(&sa).unwrap();
+        assert!(con.active.get(), "lock engages on the focused surface");
+        let ptr = ObjectId(81);
+        let m0 = count_events(&client.queued_out_bytes(), ptr, 2);
+
+        // fullscreen while the lock pins focus: the cache heals silently
+        let win = crate::tree::window_for_surface(&state, &sa).unwrap();
+        crate::tree::set_fullscreen(&state, &win, true);
+        assert_eq!(seat.ptr_origin.get(), (0, 0), "origin heals under the pin");
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (410.0, 10.0), "locked pointer never moves");
+        assert_eq!(count_events(&client.queued_out_bytes(), ptr, 2), m0, "locked client hears no motion");
+
+        // programmatic placement yields whole while the lock holds
+        seat.place_pointer(&state, 5.0, 5.0);
+        assert_eq!((seat.ptr_x.get(), seat.ptr_y.get()), (410.0, 10.0));
+
+        // unlock still-fullscreen: the client resyncs before any button
+        let lp = LockedPointer { id: ObjectId(71), con };
+        lp.destroy(zwp_locked_pointer_v1::destroy::Request {}).unwrap();
+        let m1 = count_events(&client.queued_out_bytes(), ptr, 2);
+        assert!(m1 > m0, "unlock delivers the owed rebase");
+
+        // the re-lock cycle: grab again, leave fullscreen under it, unlock
+        mgr.lock_pointer(zwp_pointer_constraints_v1::lock_pointer::Request {
+            id: ObjectId(72),
+            surface: sa.id,
+            pointer: ObjectId(0),
+            region: ObjectId(0),
+            lifetime: 1,
+        })
+        .unwrap();
+        let con = seat.constraint_for(&sa).unwrap();
+        assert!(con.active.get(), "re-lock engages");
+        crate::tree::set_fullscreen(&state, &win, false);
+        assert_eq!(seat.ptr_origin.get(), (400, 0), "origin heals back to the tile");
+        assert_eq!(count_events(&client.queued_out_bytes(), ptr, 2), m1, "still muzzled");
+        let lp = LockedPointer { id: ObjectId(72), con };
+        lp.destroy(zwp_locked_pointer_v1::destroy::Request {}).unwrap();
+        assert!(count_events(&client.queued_out_bytes(), ptr, 2) > m1, "second unlock resyncs too");
     }
 
     #[test]

@@ -670,7 +670,9 @@ fn windows_json(state: &Rc<State>) -> Value {
     let ws = crate::tree::active(state);
     let mut out = Vec::new();
     ws.for_each(|w| {
-        let r = w.rect.get();
+        // painted rect, matching the clients query: fullscreen reports
+        // where it draws, not the tile it will return to
+        let r = w.draw_rect(state);
         out.push(json!({
             "title": w.title(),
             "app-id": w.app_id(),

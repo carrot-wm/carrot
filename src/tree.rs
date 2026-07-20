@@ -105,21 +105,20 @@ pub fn send_surface_output_named(surface: &crate::surface::WlSurface, name: &str
 /// keybind-driven focus onto another output lands the cursor there too:
 /// center of the workspace's focused-most window, else the output center
 fn warp_to_workspace(state: &Rc<State>, ws: &Workspace) {
+    // painted rects: the fullscreen slot draws at the output rect, and
+    // the cursor should land where the window actually is
     let r = ws
         .fullscreen
         .borrow()
         .as_ref()
-        .map(|w| w.rect.get())
+        .map(|w| w.draw_rect(state))
         .or_else(|| ws.tiling.first().map(|w| w.rect.get()))
         .or_else(|| ws.top_float().map(|w| w.rect.get()))
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| workspace_output_rect(state, ws));
     let (cx, cy) = ((r.x1 + r.x2) / 2, (r.y1 + r.y2) / 2);
     if let Some(seat) = state.seat.borrow().clone() {
-        seat.warp(state, cx as f64, cy as f64);
-    }
-    if let Some(d) = state.display.borrow().as_ref() {
-        d.move_cursor(state, cx, cy);
+        seat.place_pointer(state, cx as f64, cy as f64);
     }
 }
 
@@ -844,12 +843,7 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
 /// lands centered
 fn warp_pointer_into(state: &Rc<State>, from: Rect, win: &Rc<Window>) {
     let Some(seat) = state.seat.borrow().clone() else { return };
-    // a locked pointer is frozen by contract; the drawn cursor must not
-    // teleport away from it either
-    if seat.lock_active() {
-        return;
-    }
-    let to = win.rect.get();
+    let to = win.draw_rect(state);
     if to.is_empty() {
         return;
     }
@@ -865,10 +859,9 @@ fn warp_pointer_into(state: &Rc<State>, from: Rect, win: &Rc<Window>) {
     };
     let nx = to.x1 as f64 + fx * to.width() as f64;
     let ny = to.y1 as f64 + fy * to.height() as f64;
-    seat.warp(state, nx, ny);
-    if let Some(d) = state.display.borrow().as_ref() {
-        d.move_cursor(state, nx as i32, ny as i32);
-    }
+    // place_pointer yields whole under a lock: a locked pointer is frozen
+    // by contract and the drawn cursor must not teleport away from it
+    seat.place_pointer(state, nx, ny);
 }
 
 // -- directional navigation --

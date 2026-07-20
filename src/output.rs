@@ -1797,15 +1797,14 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
     for ws in crate::tree::visible_workspaces(state) {
         crate::tree::relayout(state, &ws);
     }
-    // pull the pointer back onto glass if its output vanished
+    // pull the pointer back onto glass if its output vanished; the
+    // placement yields whole under a lock so the plane never detaches
+    // from the frozen seat position
     if let Some(seat) = state.seat.borrow().clone() {
         let (px, py) = (seat.ptr_x.get(), seat.ptr_y.get());
         let (cx, cy) = clamp_pointer(state, px, py);
         if (cx, cy) != (px, py) {
-            seat.warp(state, cx, cy);
-            if let Some(d) = state.display.borrow().as_ref() {
-                d.move_cursor(state, cx as i32, cy as i32);
-            }
+            seat.place_pointer(state, cx, cy);
         }
     }
     // surviving outputs may have new positions; bound objects re-learn them
@@ -4298,6 +4297,7 @@ fn remap_local(ops: &mut [RenderOp], out: &Output, r: Rect) {
 /// means degrade to a plain draw (the caller snaps the anim)
 #[allow(clippy::too_many_arguments)]
 fn draw_resize_xfade(
+    state: &Rc<State>,
     out: &Rc<Output>,
     win: &Rc<crate::tree::Window>,
     arect: Rect,
@@ -4307,7 +4307,9 @@ fn draw_resize_xfade(
     live: &mut Vec<((ClientId, u64), u64)>,
 ) -> bool {
     let surface = win.surface();
-    let target = win.rect.get();
+    // painted rect: a crossfade live across a fullscreen flip bakes at
+    // where the window draws, not where the layout parked it
+    let target = win.draw_rect(state);
     let geo = win.geometry();
     // current content, drawn fresh at the target size into the live side
     let mut tmp = Vec::new();
@@ -4437,7 +4439,9 @@ fn draw_window(
     let mark = ops.len();
     let lmark = live.len();
     let rect = if mode == DrawMode::Rest {
-        win.rect.get()
+        // painted rect: a hidden workspace can hold a fullscreen slot,
+        // and a rest capture must not paint it at the tile rect
+        win.draw_rect(state)
     } else {
         win.visual_rect(state)
     };
@@ -4552,7 +4556,7 @@ fn draw_window(
     let mut xfaded = false;
     if let Some((p, _)) = rz_progress {
         if mode == DrawMode::Present {
-            xfaded = draw_resize_xfade(out, win, rect, round, p, ops, live);
+            xfaded = draw_resize_xfade(state, out, win, rect, round, p, ops, live);
             if !xfaded {
                 // degrade: snap the crossfade, draw plainly
                 let mut m = win.anims.borrow_mut();
