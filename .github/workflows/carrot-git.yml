@@ -12,11 +12,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container: archlinux:latest
+    env:
+      AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
     steps:
       - name: deps
-        run: pacman -Syu --noconfirm rust gcc git binutils xkeyboard-config
+        run: pacman -Syu --noconfirm rust gcc git binutils xkeyboard-config openssh
 
+      # full history: the aur pkgver counts every commit
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: taproot at main
         run: git clone --depth 1 https://github.com/carrot-wm/taproot ../taproot
@@ -54,3 +59,23 @@ jobs:
       # breakage and leave the behavioral run to the dev lane
       - name: tests compile
         run: cargo test --release --locked --no-run
+
+      # a green build IS the aur update: bump the pkgver the page shows
+      # so helpers see the new revision without --devel. inert until the
+      # AUR_SSH_PRIVATE_KEY secret exists
+      - name: publish the pkgver to the aur
+        if: github.event_name == 'push' && env.AUR_KEY != ''
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/known_hosts"
+          ver="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          git clone ssh://aur@aur.archlinux.org/carrot-git.git /tmp/aur
+          cd /tmp/aur
+          sed -i "s/^pkgver=.*/pkgver=$ver/" PKGBUILD
+          sed -i "s/^\tpkgver = .*/\tpkgver = $ver/" .SRCINFO
+          git config user.name "Bunny"
+          git config user.email "bunny@carrotwm.org"
+          git diff --quiet || { git commit -qam "bump to $ver"; git push -q; }
