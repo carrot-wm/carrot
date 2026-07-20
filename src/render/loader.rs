@@ -123,6 +123,14 @@ pub(crate) fn preload() -> Result<(), String> {
     static DONE: OnceLock<Result<(), String>> = OnceLock::new();
     DONE.get_or_init(|| {
         elf_loader::tls::set_static_tls_allocator(alloc_static_tls);
+        // a driver's closure (mesa->llvm->ncurses) references glibc
+        // symbols taproot does not export - fortify __*_chk wrappers, C23
+        // __isoc23_* aliases, locale - which it never calls on this path.
+        // bind them to a trap instead of failing the whole dlopen, and
+        // name each so a genuinely-called gap still surfaces
+        elf_loader::relocation::set_unresolved_handler(|name| {
+            eprintln!("carrot: vulkan: driver references {name}, unprovided; stubbed (traps only if called)");
+        });
         let libc_path = taproot_lib("libc.so.6", "CARROT_LIBC")?;
         let libm_path = taproot_lib("libm.so.6", "CARROT_LIBM")?;
         for p in [&libc_path, &libm_path] {

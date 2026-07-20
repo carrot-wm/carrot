@@ -269,6 +269,10 @@ impl<D> DynamicImage<D> {
                         segments.write(rel.r_offset(), symbol);
                         continue;
                     }
+                    if let Some(stub) = helper.stub_unresolved(r_sym) {
+                        segments.write(rel.r_offset(), stub);
+                        continue;
+                    }
                     // a missing non-weak plt symbol falls through and
                     // fails loudly instead of leaving the slot unbased
                     if helper.handle_post(rel)? {
@@ -390,6 +394,10 @@ impl<D> DynamicImage<D> {
                 REL_GOT | REL_SYMBOLIC => {
                     if let Some(symbol) = helper.find_symbol_or_weak0(r_sym) {
                         segments.write(rel.r_offset(), symbol + r_addend);
+                        continue;
+                    }
+                    if let Some(stub) = helper.stub_unresolved(r_sym) {
+                        segments.write(rel.r_offset(), stub);
                         continue;
                     }
                 }

@@ -14,6 +14,42 @@ use core::{
 };
 use elf::abi::STT_GNU_IFUNC;
 
+/// Called with the name of each still-undefined non-weak symbol when
+/// lenient loading is enabled. The reloc binds the symbol to a trap
+/// stub, so the host can warn while the load proceeds.
+pub type UnresolvedHandler = fn(&str);
+static UNRESOLVED_HANDLER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Opt into lenient loading: an unresolved non-weak symbol binds to a
+/// trap stub and `f` is called with its name, instead of failing the
+/// dlopen. A dlopened GPU driver's closure references glibc symbols it
+/// never calls (fortify wrappers, C23 aliases, locale); a partial libc
+/// cannot export them all, and failing the whole load over an
+/// address-taken-but-never-called symbol is the wrong tradeoff. Without
+/// a handler set, an unresolved symbol fails the load as before.
+pub fn set_unresolved_handler(f: UnresolvedHandler) {
+    UNRESOLVED_HANDLER.store(f as usize, core::sync::atomic::Ordering::SeqCst);
+}
+
+fn unresolved_handler() -> Option<UnresolvedHandler> {
+    let v = UNRESOLVED_HANDLER.load(core::sync::atomic::Ordering::SeqCst);
+    (v != 0).then(|| unsafe { core::mem::transmute::<usize, UnresolvedHandler>(v) })
+}
+
+/// Where a stubbed symbol's relocation points. If the closure only took
+/// the address (the common case for the fortify/locale tail), harmless;
+/// if it actually calls the symbol, this traps loudly instead of
+/// running wrong code.
+extern "C" fn unresolved_trap() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    loop {}
+}
+
 /// Internal context for managing relocation state and handlers.
 pub(crate) struct RelocHelper<'find, D, PreS: ?Sized, PostS: ?Sized, PreH: ?Sized, PostH: ?Sized> {
     pub(crate) core: &'find ElfCore<D>,
@@ -96,6 +132,17 @@ where
             return Some(RelocValue::new(0));
         }
         None
+    }
+
+    /// Lenient fallback for a still-undefined non-weak symbol: names it
+    /// for the registered handler and returns the trap-stub address. If
+    /// no handler is set, returns None so the caller fails the load.
+    #[inline]
+    pub(crate) fn stub_unresolved(&self, r_sym: usize) -> Option<RelocValue<usize>> {
+        let handler = unresolved_handler()?;
+        let (_, info) = self.core.symtab().symbol_idx(r_sym);
+        handler(info.name());
+        Some(RelocValue::new(unresolved_trap as usize))
     }
 
     pub(crate) fn find_symbol(&mut self, r_sym: usize) -> Option<RelocValue<usize>> {

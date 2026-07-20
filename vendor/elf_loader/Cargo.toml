@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.93.0"
 name = "taproot-elf-loader"
-version = "0.14.0"
+version = "0.14.1"
 authors = ["wzhao <1207410841@qq.com>"]
 build = "build.rs"
 exclude = [

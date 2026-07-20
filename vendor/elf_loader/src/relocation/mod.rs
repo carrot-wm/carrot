@@ -18,3 +18,4 @@ pub(crate) use utils::{
 };
 
 pub use traits::{RelocationContext, RelocationHandler, SymbolLookup};
+pub use utils::{UnresolvedHandler, set_unresolved_handler};
