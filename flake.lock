@@ -118,11 +118,11 @@
     "taproot": {
       "flake": false,
       "locked": {
-        "lastModified": 1784483908,
-        "narHash": "sha256-hMaBGlwW/lVEn8DPqR/zl8LAYyUFLYe3kxAQXTNSQaY=",
+        "lastModified": 1784543963,
+        "narHash": "sha256-anRRTpTxysshLY9PA5IV3lFUTOLJa1HwFrb7RQz51YY=",
         "owner": "carrot-wm",
         "repo": "taproot",
-        "rev": "c99bfd77e54f02c8a39c2991f0e35fb10a1b06a1",
+        "rev": "355bd876f4df59572ec43e26b63158df60dd5539",
         "type": "github"
       },
       "original": {
