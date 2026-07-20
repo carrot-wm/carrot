@@ -176,6 +176,10 @@ fn icd_matches(driver: &str, icd_file: &str) -> bool {
         "i915" | "xe" => icd_file.contains("intel") && !icd_file.contains("hasvk"),
         "amdgpu" | "radeon" => icd_file.contains("radeon"),
         "nouveau" => icd_file.contains("nouveau") || icd_file.contains("nvk"),
+        // qemu's paravirtual gpu: the kernel names it virtio_gpu, mesa's
+        // venus icd is libvulkan_virtio.so; the substring fallback below
+        // never connects the two
+        "virtio_gpu" => icd_file.contains("virtio"),
         _ => icd_file.contains(driver),
     }
 }
@@ -217,13 +221,34 @@ pub(crate) fn all_icd_libraries() -> Vec<PathBuf> {
 
 fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(rd) = std::fs::read_dir(dir) {
+        let start = out.len();
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "json") {
                 out.push(p);
             }
         }
+        // readdir order is filesystem-layout history; identical systems
+        // must pick identical drivers
+        out[start..].sort();
     }
+}
+
+/// is this file an ELF for the machine carrot runs on? multilib systems
+/// ship the 32-bit halves of mesa in the same manifest dirs, and a
+/// foreign-class library must be skipped, never dlopened
+fn native_elf(p: &Path) -> bool {
+    use std::io::Read;
+    let mut ident = [0u8; 20];
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return false;
+    };
+    if f.read_exact(&mut ident).is_err() {
+        return false;
+    }
+    ident[..4] == [0x7f, b'E', b'L', b'F']
+        && ident[4] == 2 // ELFCLASS64
+        && u16::from_le_bytes([ident[18], ident[19]]) == 0x3e // EM_X86_64
 }
 
 /// "library_path" out of an icd manifest. absolute paths stand, paths
@@ -233,8 +258,29 @@ fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) {
 fn resolve_manifest(manifest: &Path) -> Option<PathBuf> {
     let txt = std::fs::read_to_string(manifest).ok()?;
     let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
-    let lp = PathBuf::from(v.get("ICD")?.get("library_path")?.as_str()?);
-    manifest_library(manifest, lp, &lib_search_dirs())
+    let icd = v.get("ICD")?;
+    // multilib mesa ships 32- and 64-bit manifests side by side (fedora:
+    // radeon_icd.x86_64.json and radeon_icd.i686.json); the khronos
+    // loader skips foreign arches via library_arch, and the elf ident
+    // check below covers manifests too old to carry the field
+    if icd
+        .get("library_arch")
+        .and_then(|a| a.as_str())
+        .is_some_and(|a| a != "64")
+    {
+        return None;
+    }
+    let lp = PathBuf::from(icd.get("library_path")?.as_str()?);
+    let lib = manifest_library(manifest, lp, &lib_search_dirs())?;
+    if !native_elf(&lib) {
+        eprintln!(
+            "carrot: vulkan: {}: {} is not an elf for this machine; skipped",
+            manifest.display(),
+            lib.display()
+        );
+        return None;
+    }
+    Some(lib)
 }
 
 fn manifest_library(manifest: &Path, lp: PathBuf, search: &[PathBuf]) -> Option<PathBuf> {
@@ -246,7 +292,9 @@ fn manifest_library(manifest: &Path, lp: PathBuf, search: &[PathBuf]) -> Option<
     }
     for dir in search {
         let p = dir.join(&lp);
-        if p.exists() {
+        // a foreign-class hit (a bare soname resolving into a 32-bit
+        // libdir) keeps searching instead of shadowing the real driver
+        if p.exists() && native_elf(&p) {
             return Some(p);
         }
     }
@@ -264,12 +312,15 @@ fn lib_search_dirs() -> Vec<PathBuf> {
         dirs.extend(std::env::split_paths(&paths));
     }
     for d in [
-        "/usr/lib",
+        // lib64 and the multiarch dir before plain lib: on fedora
+        // /usr/lib IS the 32-bit libdir, and a bare soname must not
+        // resolve there first
         "/usr/lib64",
         "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib",
         "/usr/local/lib",
-        "/lib",
         "/lib64",
+        "/lib",
         "/run/opengl-driver/lib",
     ] {
         dirs.push(PathBuf::from(d));
@@ -328,30 +379,47 @@ pub fn entry_for(card: BorrowedFd<'_>) -> Result<ash::Entry, RenderError> {
     let driver = kernel_driver(card).map_err(RenderError::Load)?;
     let all = all_icd_libraries();
     let file = |p: &Path| p.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let icd = all
-        .iter()
-        .find(|p| icd_matches(&driver, &file(p).to_lowercase()))
-        .ok_or_else(|| {
-            let found: Vec<_> = all.iter().map(|p| file(p)).collect();
-            RenderError::Load(format!(
-                "no vulkan icd for drm driver {driver} (found: {})",
-                found.join(", ")
-            ))
-        })?;
-    eprintln!("carrot: vulkan: {} for {driver}", icd.display());
-    entry_for_icd(icd).map_err(RenderError::Load)
+    // every matching icd gets a chance: one broken candidate (a stale
+    // manifest, a driver missing its closure) must not kill the gpu
+    // path while a working sibling sits right behind it
+    let mut errors = Vec::new();
+    for icd in all.iter().filter(|p| icd_matches(&driver, &file(p).to_lowercase())) {
+        eprintln!("carrot: vulkan: {} for {driver}", icd.display());
+        match entry_for_icd(icd) {
+            Ok(entry) => return Ok(entry),
+            Err(e) => {
+                eprintln!("carrot: vulkan: {e}; trying the next icd");
+                errors.push(e);
+            }
+        }
+    }
+    Err(RenderError::Load(if errors.is_empty() {
+        let found: Vec<_> = all.iter().map(|p| file(p)).collect();
+        format!("no vulkan icd for drm driver {driver} (found: {})", found.join(", "))
+    } else {
+        format!("every {driver} icd failed: {}", errors.join("; "))
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// the minimal ident native_elf accepts (or, class-flipped, rejects)
+    fn write_elf(path: &Path, class: u8) {
+        let mut ident = [0u8; 20];
+        ident[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        ident[4] = class;
+        ident[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+        std::fs::write(path, ident).unwrap();
+    }
+
     #[test]
     fn manifest_paths_resolve_by_shape() {
         let m = Path::new("/usr/share/vulkan/icd.d/x.json");
         let dir = std::env::temp_dir().join(format!("carrot-libdir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("libGLX_test.so.0"), b"x").unwrap();
+        write_elf(&dir.join("libGLX_test.so.0"), 2);
         let search = [dir.clone()];
         assert_eq!(
             manifest_library(m, PathBuf::from("/abs/libvk.so"), &search),
@@ -368,6 +436,27 @@ mod tests {
         );
         assert_eq!(manifest_library(m, PathBuf::from("libGLX_absent.so.0"), &search), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bare_soname_skips_foreign_class_hits() {
+        // fedora layout: /usr/lib is 32-bit, /usr/lib64 is native. the
+        // first-dir hit is ELFCLASS32 and must lose to the later native one
+        let base = std::env::temp_dir().join(format!("carrot-multilib-{}", std::process::id()));
+        let (lib32, lib64) = (base.join("lib"), base.join("lib64"));
+        std::fs::create_dir_all(&lib32).unwrap();
+        std::fs::create_dir_all(&lib64).unwrap();
+        write_elf(&lib32.join("libvk.so"), 1);
+        write_elf(&lib64.join("libvk.so"), 2);
+        let m = Path::new("/usr/share/vulkan/icd.d/x.json");
+        assert_eq!(
+            manifest_library(m, PathBuf::from("libvk.so"), &[lib32.clone(), lib64.clone()]),
+            Some(lib64.join("libvk.so"))
+        );
+        // nothing native anywhere: the search reports a miss
+        std::fs::remove_file(lib64.join("libvk.so")).unwrap();
+        assert_eq!(manifest_library(m, PathBuf::from("libvk.so"), &[lib32, lib64]), None);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// drivers spawn workers with the preloaded libc's pthread_create; those
