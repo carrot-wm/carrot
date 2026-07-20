@@ -104,7 +104,7 @@ impl Display {
                         cur.set_enabled(!sw && !o.cursor_client_hidden.get());
                     }
                 }
-                o.conn.cursor_commit(&o.dev);
+                cursor_commit_idle(&o);
                 st.damage.trigger();
             }));
         }
@@ -124,7 +124,7 @@ impl Display {
                     cur.set_enabled(false);
                 }
                 drop(pipe);
-                out.conn.cursor_commit(&out.dev);
+                cursor_commit_idle(out);
             }
             if self.sw_image.borrow().is_none() {
                 let seed = self
@@ -177,7 +177,7 @@ impl Display {
                 cur.set_enabled(false);
             }
             drop(pipe);
-            if !out.conn.cursor_commit(&out.dev) {
+            if !cursor_commit_idle(out) {
                 // the kernel won't take this plane (joined-pipe quirks, odm);
                 // never leave the user cursorless - composite from here on
                 self.set_software_cursor(state, true);
@@ -199,7 +199,7 @@ impl Display {
             let Some(cur) = &p.cursor else { continue };
             cur.set_enabled(!hidden && !out.cursor_locked.get());
             drop(pipe);
-            out.conn.cursor_commit(&out.dev);
+            cursor_commit_idle(out);
         }
     }
 
@@ -221,7 +221,7 @@ impl Display {
             cur.write(px, w, h);
             cur.hotspot.set(hot);
             drop(pipe);
-            out.conn.cursor_commit(&out.dev);
+            cursor_commit_idle(out);
         }
     }
 
@@ -257,7 +257,55 @@ impl Display {
             cur.write(&px, w, h);
             cur.hotspot.set(hot);
             drop(pipe);
-            out.conn.cursor_commit(&out.dev);
+            cursor_commit_idle(out);
+        }
+    }
+}
+
+/// the present loop is actively flipping this output: a flip completed
+/// within the last period and a half (the slack forgives scheduling
+/// jitter so a steady stream never reads as idle), or one is in flight
+fn cursor_gate_active(now_ns: u64, flip_ns: u64, period: u64, flip_pending: bool) -> bool {
+    flip_pending
+        || (period != 0 && flip_ns != 0 && now_ns.saturating_sub(flip_ns) < period + period / 2)
+}
+
+/// standalone cursor commits are for idle screens only. while frames
+/// flow, staged cursor state rides the next flip (flip() applies the
+/// carrier); a lone commit here would occupy the crtc's nonblocking slot
+/// until vblank, and at gaming-mouse polling rates a fresh commit lands
+/// the moment the last one retires - every flip then loses the race with
+/// EBUSY and content starves for as long as the pointer moves
+fn cursor_commit_idle(out: &Rc<Output>) -> bool {
+    let (sec, usec) = out.conn.flip_time.get();
+    let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
+    let active = cursor_gate_active(
+        Time::now().nsec(),
+        flip_ns,
+        period_ns(out),
+        out.conn.flip_pending.get(),
+    );
+    if active {
+        // the ride is only guaranteed while flips keep coming; the flush
+        // task lands the final state once the screen goes idle
+        out.cursor_flush.trigger();
+        return true;
+    }
+    out.conn.cursor_commit(&out.dev)
+}
+
+/// lands cursor state the gate skipped: once the output has sat idle for
+/// a period, the staged position gets its standalone commit so the
+/// pointer never parks a frame behind where the user left it
+async fn cursor_flush_loop(state: &Rc<State>, out: &Rc<Output>) {
+    loop {
+        out.cursor_flush.triggered().await;
+        let ms = (period_ns(out) / 1_000_000).max(1) + 2;
+        if state.wheel.timeout(ms).await.is_err() {
+            return;
+        }
+        if out.conn.cursor_changed() && !out.conn.flip_pending.get() {
+            cursor_commit_idle(out);
         }
     }
 }
@@ -314,6 +362,9 @@ pub struct Output {
     /// callback pacer: fire the sweep at this instant (0 = nothing owed)
     cb_at: Cell<u64>,
     cb_kick: AsyncEvent,
+    /// a gated standalone cursor commit was skipped while frames flowed;
+    /// the flush task lands the staged state once the screen goes idle
+    cursor_flush: AsyncEvent,
     /// global origin; outputs tile left to right
     pub pos: Cell<(i32, i32)>,
     /// the workspace this output currently shows
@@ -577,6 +628,19 @@ mod sched_tests {
     use super::*;
 
     const P: u64 = 2_083_381;
+
+    #[test]
+    fn cursor_commits_yield_to_an_active_present_loop() {
+        // flip landed a moment ago: the change rides the next flip
+        assert!(cursor_gate_active(P, P / 2, P, false));
+        // flip in flight: same
+        assert!(cursor_gate_active(P, 0, P, true));
+        // the screen sat idle past a period and a half: standalone is fine
+        assert!(!cursor_gate_active(3 * P, P, P, false));
+        // no flip ever, no period known: never treated as active
+        assert!(!cursor_gate_active(P, 0, P, false));
+        assert!(!cursor_gate_active(P, P / 2, 0, false));
+    }
 
     #[test]
     fn dropped_flight_guards_never_wedge_the_count() {
@@ -1895,6 +1959,7 @@ fn init_output(
         damage: AsyncEvent::default(),
         cb_at: Cell::new(0),
         cb_kick: AsyncEvent::default(),
+        cursor_flush: AsyncEvent::default(),
         pos: Cell::new((0, 0)),
         ws: Cell::new(0),
         usable: Cell::new(Rect::default()),
@@ -2436,6 +2501,13 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         state
             .eng
             .spawn("callback pacer", async move { callback_pacer(&st, &o).await })
+    };
+    let _cursor_flush = {
+        let st = state.clone();
+        let o = out.clone();
+        state
+            .eng
+            .spawn("cursor flush", async move { cursor_flush_loop(&st, &o).await })
     };
     let mut dirty = false;
     loop {
