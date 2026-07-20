@@ -72,7 +72,8 @@ jobs:
           printf '%s\n' "$AUR_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/known_hosts"
+          # absolute paths: the shell HOME and ssh tilde expansion disagree in container jobs
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o IdentitiesOnly=yes"
           ver="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
           git clone ssh://aur@aur.archlinux.org/carrot-git.git /tmp/aur
           cd /tmp/aur
