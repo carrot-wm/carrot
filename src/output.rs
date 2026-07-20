@@ -397,18 +397,23 @@ struct CleanupJob {
     flight: FlightGuard,
 }
 
-/// one submitted frame's slot in the global in-flight count. drop-driven
-/// so cancellation can't wedge it: an unplugged output's cleanup task
-/// dies mid-await with jobs queued, and a count that never reaches zero
-/// would park every replaced dmabuf attachment for the session
+/// one submitted frame's slot in the in-flight set. drop-driven so
+/// cancellation can't wedge it: an unplugged output's cleanup task dies
+/// mid-await with jobs queued, and a frame that never fences out would
+/// park every attachment retired under it for the session
 struct FlightGuard {
     state: Rc<State>,
+    /// this frame's submission number; its fence releases the retire
+    /// batches parked while it flew
+    seq: u64,
 }
 
 impl FlightGuard {
     fn new(state: &Rc<State>) -> FlightGuard {
         state.frames_in_flight.set(state.frames_in_flight.get() + 1);
-        FlightGuard { state: state.clone() }
+        let seq = state.frame_seq.get() + 1;
+        state.frame_seq.set(seq);
+        FlightGuard { state: state.clone(), seq }
     }
 }
 
@@ -416,11 +421,11 @@ impl Drop for FlightGuard {
     fn drop(&mut self) {
         let inflight = self.state.frames_in_flight.get().saturating_sub(1);
         self.state.frames_in_flight.set(inflight);
-        // parked attachments release once NO output still has a frame in
-        // flight that might sample them
-        if inflight == 0 {
-            self.state.retired.borrow_mut().clear();
-        }
+        // attachments parked while this frame flew lose their last
+        // sampler with its fence - no global idle barrier: a client
+        // whose own gpu load keeps a frame in flight permanently must
+        // still get its releases, one fence after each replacement
+        self.state.retired.frame_done(self.seq);
     }
 }
 
@@ -3052,8 +3057,8 @@ async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
                 out.renderer.destroy_texture(t);
             }
         }
-        // frame done: the guard's drop decrements and, at zero, releases
-        // the parked attachments
+        // frame done: the guard's drop releases the retire batches
+        // parked while this frame flew
         drop(flight);
         out.renderer.recycle_frame(frame);
         // pending output captures complete against the frame just shown

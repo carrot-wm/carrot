@@ -269,7 +269,10 @@ impl WlSurface {
                     if st.scanout_uids.borrow().contains(&old.buf.uid) {
                         st.scanout_hold.borrow_mut().push(old);
                     } else {
-                        st.retired.borrow_mut().push(old);
+                        // parked under the frames flying right now; later
+                        // frames latch after this replacement and never
+                        // sample the old buffer
+                        st.retired.park(st.frame_seq.get(), st.frames_in_flight.get(), old);
                     }
                 }
             }

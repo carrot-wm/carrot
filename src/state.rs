@@ -68,8 +68,14 @@ pub struct State {
     pub lock: RefCell<Option<Rc<crate::protocol::session_lock::SessionLock>>>,
     /// heads are dark (dpms); any input wakes them
     pub dpms_off: std::cell::Cell<bool>,
-    /// replaced dmabuf attachments; released after the next present's fence
-    pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
+    /// replaced dmabuf attachments, parked until every frame that was in
+    /// flight at replacement time has fenced out. a global "wait for
+    /// idle" here starved clients whose own gpu load kept a frame in
+    /// flight permanently: no release ever, swapchain exhausted, viz
+    /// thread blocked (the discord first-frame hang)
+    pub retired: crate::util::RetireQueue<crate::protocol::shm::AttachedBuffer>,
+    /// monotonic render-frame submission counter; retire watermarks
+    pub frame_seq: std::cell::Cell<u64>,
     /// attachments whose buffer sits on a plane (direct scanout); they
     /// release when the buffer leaves it, not when render frames drain
     pub scanout_hold: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
@@ -78,7 +84,7 @@ pub struct State {
     /// surfaces drawn since the last callback sweep; the sweep drains this
     /// instead of walking every surface of every client each vblank
     pub shown_surfaces: RefCell<Vec<std::rc::Rc<crate::surface::WlSurface>>>,
-    /// frames between render submit and fence; gates the retired drain
+    /// frames between render submit and fence; the retire park snapshot
     pub frames_in_flight: std::cell::Cell<u32>,
     /// the renderer imports sealed shm pools: those buffers sample in
     /// place and release like dmabufs instead of copying at commit
@@ -141,7 +147,8 @@ impl State {
             idle: Default::default(),
             lock: RefCell::new(None),
             dpms_off: std::cell::Cell::new(false),
-            retired: RefCell::new(Vec::new()),
+            retired: crate::util::RetireQueue::new(),
+            frame_seq: std::cell::Cell::new(0),
             scanout_hold: RefCell::new(Vec::new()),
             scanout_uids: RefCell::new(Vec::new()),
             shown_surfaces: RefCell::new(Vec::new()),
@@ -185,7 +192,7 @@ impl State {
         self.cast_pick.borrow_mut().take();
         self.lock.borrow_mut().take();
         self.idle.clear();
-        self.retired.borrow_mut().clear();
+        self.retired.clear();
         self.wheel.clear();
         self.run_toplevel.clear();
         self.display.borrow_mut().take();

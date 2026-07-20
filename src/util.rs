@@ -273,3 +273,115 @@ impl std::hash::Hasher for IdHasher {
 pub type IdHashMap<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<IdHasher>>;
 pub type IdHashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<IdHasher>>;
+
+// -- deferred retirement --
+
+/// a parking lot for values that must outlive the in-flight gpu frames
+/// that may still reference them. parking snapshots the live frame set
+/// (count + submission watermark); each frame completion releases the
+/// batches whose frames have all fenced out. frames submitted after the
+/// park latched after the replacement and never see the value, so they
+/// don't extend the wait - under permanent pipelining (some frame always
+/// in flight) a batch still drains one fence later, never "at idle"
+pub struct RetireQueue<T> {
+    batches: RefCell<Vec<RetireBatch<T>>>,
+}
+
+struct RetireBatch<T> {
+    /// in-flight frames at park time still unfenced
+    waits: u32,
+    /// highest frame seq issued by park time; younger frames don't count
+    watermark: u64,
+    vals: Vec<T>,
+}
+
+impl<T> RetireQueue<T> {
+    pub fn new() -> Self {
+        RetireQueue { batches: RefCell::new(Vec::new()) }
+    }
+
+    /// park under the frames live right now; none in flight means nothing
+    /// can reference the value and it drops on the spot
+    pub fn park(&self, watermark: u64, inflight: u32, v: T) {
+        if inflight == 0 {
+            return;
+        }
+        let mut b = self.batches.borrow_mut();
+        match b.last_mut() {
+            Some(last) if last.waits == inflight && last.watermark == watermark => {
+                last.vals.push(v);
+            }
+            _ => b.push(RetireBatch { waits: inflight, watermark, vals: vec![v] }),
+        }
+    }
+
+    /// frame `seq`'s fence signaled (or its output died mid-await; holding
+    /// forever would park the values for the session)
+    pub fn frame_done(&self, seq: u64) {
+        self.batches.borrow_mut().retain_mut(|b| {
+            if seq <= b.watermark {
+                b.waits -= 1;
+            }
+            b.waits > 0
+        });
+    }
+
+    /// session teardown: drop everything regardless
+    pub fn clear(&self) {
+        self.batches.borrow_mut().clear();
+    }
+
+    #[cfg(test)]
+    fn parked(&self) -> usize {
+        self.batches.borrow().iter().map(|b| b.vals.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::RetireQueue;
+
+    #[test]
+    fn nothing_in_flight_drops_on_the_spot() {
+        let q: RetireQueue<u8> = RetireQueue::new();
+        q.park(5, 0, 1);
+        assert_eq!(q.parked(), 0);
+    }
+
+    #[test]
+    fn a_batch_waits_out_exactly_the_frames_it_was_parked_under() {
+        let q: RetireQueue<u8> = RetireQueue::new();
+        // frames 1 and 2 in flight; the value may be sampled by both
+        q.park(2, 2, 1);
+        // frame 3 submits later and completes first: not a wait of ours
+        q.frame_done(3);
+        assert_eq!(q.parked(), 1, "a younger frame never releases the batch");
+        q.frame_done(1);
+        assert_eq!(q.parked(), 1);
+        q.frame_done(2);
+        assert_eq!(q.parked(), 0, "both parked-under frames fenced out");
+    }
+
+    #[test]
+    fn pipelining_drains_one_fence_later_not_at_idle() {
+        let q: RetireQueue<u8> = RetireQueue::new();
+        // steady state: one frame always in flight. park under frame N,
+        // frame N completes while N+1 is already flying: the batch drains
+        // even though the in-flight count never touches zero
+        for seq in 1..100u64 {
+            q.park(seq, 1, seq as u8);
+            q.frame_done(seq);
+            assert_eq!(q.parked(), 0, "batch parked under frame {seq} drained at its fence");
+        }
+    }
+
+    #[test]
+    fn batches_under_the_same_frames_coalesce() {
+        let q: RetireQueue<u8> = RetireQueue::new();
+        q.park(4, 2, 1);
+        q.park(4, 2, 2);
+        assert_eq!(q.batches.borrow().len(), 1);
+        q.park(5, 3, 3);
+        assert_eq!(q.batches.borrow().len(), 2);
+    }
+}
