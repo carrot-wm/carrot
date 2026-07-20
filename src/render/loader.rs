@@ -115,6 +115,31 @@ pub(crate) const STUB_SONAMES: [&str; 6] = [
     "ld-linux-x86-64.so.2",
 ];
 
+/// both origin copies reach per-thread state through the shared thread
+/// pointer; if their layouts drift, the driver's errno writes land inside
+/// this build's thread metadata and the session dies far from the cause.
+/// each side answers fs:0 plus a constant, so comparing the two addresses
+/// proves the pairing before any driver code runs
+pub(crate) fn pairing_check(lib: &ElfLibrary, p: &Path) -> Result<(), String> {
+    unsafe extern "C" {
+        fn __errno_location() -> *mut i32;
+    }
+    let theirs = unsafe {
+        lib.get::<unsafe extern "C" fn() -> *mut i32>("__errno_location")
+            .map_err(|e| format!("{}: __errno_location: {e}", p.display()))?
+    };
+    let (theirs, ours) = unsafe { (theirs(), __errno_location()) };
+    if theirs != ours {
+        return Err(format!(
+            "{}: thread layout does not pair with this carrot build \
+             (its errno at {theirs:p}, ours at {ours:p}); rebuild it \
+             against the taproot-origin carrot links",
+            p.display(),
+        ));
+    }
+    Ok(())
+}
+
 /// preload the taproot family GLOBAL by absolute path, once. every NEEDED
 /// entry in the icd's closure then reuses these by filename instead of
 /// searching RUNPATH and finding glibc. the handles are leaked on
@@ -133,17 +158,26 @@ pub(crate) fn preload() -> Result<(), String> {
         });
         let libc_path = taproot_lib("libc.so.6", "CARROT_LIBC")?;
         let libm_path = taproot_lib("libm.so.6", "CARROT_LIBM")?;
+        // libm is the same full cdylib under a second name; both are
+        // origin copies, so both get the pairing check
         for p in [&libc_path, &libm_path] {
             let lib = ElfLibrary::dlopen(p, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
                 .map_err(|e| format!("preload {}: {e}", p.display()))?;
+            pairing_check(&lib, p)?;
             std::mem::forget(lib);
         }
         for name in STUB_SONAMES {
-            let Ok(p) = taproot_lib(name, "CARROT_STUB_UNSET") else {
-                // an older staging: glibc may leak into heavy closures
-                eprintln!("carrot: vulkan: {name} stub not staged; run carrot install");
-                continue;
-            };
+            // no stub means the closure's NEEDED entry for this soname
+            // searches RUNPATH and loads real glibc (libstdc++ names
+            // ld-linux directly): mixed libcs deadlock or corrupt far
+            // from here, so a partial staging is fatal, not a warning
+            let p = taproot_lib(name, "CARROT_STUB_UNSET").map_err(|_| {
+                format!(
+                    "{name} stub not staged next to {}; the family installs \
+                     as one set - rerun carrot install (or restage the build)",
+                    libc_path.display()
+                )
+            })?;
             let lib = ElfLibrary::dlopen(&p, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL)
                 .map_err(|e| format!("preload {}: {e}", p.display()))?;
             std::mem::forget(lib);
