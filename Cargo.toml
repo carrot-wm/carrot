@@ -29,6 +29,11 @@ elf_loader = { package = "taproot-elf-loader", version = "0.14.2" }
 rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "pipe", "time", "process"] }
 kbvm = "0.1.6"
 
+# the installer's --build-taproot inflates the fetched tarball itself
+# (curl stays the only external tool); pure rust, the same inflate the
+# rust compiler bundles
+miniz_oxide = "0.9"
+
 # config + ipc; all pure rust. v1-fallback stays off forever.
 kdl = { version = "6", default-features = false, features = ["span"] }
 piccolo = "0.3.3"
