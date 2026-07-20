@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.93.0"
 name = "taproot-dlopen-rs"
-version = "0.8.1"
+version = "0.8.2"
 authors = ["wzhao <1207410841@qq.com>"]
 build = false
 exclude = [
@@ -63,7 +63,7 @@ version = "1.0.0"
 version = "0.6.3"
 
 [dependencies.elf_loader]
-version = "=0.14.1"
+version = "=0.14.2"
 package = "taproot-elf-loader"
 features = ["log"]
 default-features = false

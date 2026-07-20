@@ -540,8 +540,12 @@ impl<'a> OpenContext<'a> {
         if let Some(cache) = &*LD_CACHE {
             if let Some(path) = cache.lookup(lib_name) {
                 if let Ok(path) = ElfPath::from_str(&path) {
-                    if self.try_load_internal(rpath, runpath, &path, bytes).is_ok() {
-                        return Ok(());
+                    // a cache hit that fails to load carries the real
+                    // cause (a nested NEEDED miss, a bad file); keep it
+                    // instead of reporting a bare not-found later
+                    match self.try_load_internal(rpath, runpath, &path, bytes) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => self.note_candidate(&path, &e),
                     }
                 }
             }
@@ -621,6 +625,12 @@ static LD_LIBRARY_PATH: Lazy<Box<[ElfPath]>> = Lazy::new(|| {
 });
 static DEFAULT_PATH: Lazy<Box<[ElfPath]>> = Lazy::new(|| unsafe {
     let v = vec![
+        // debian multiarch first: on those systems the plain dirs hold
+        // nothing, and everything (mesa included) lives here
+        #[cfg(target_arch = "x86_64")]
+        ElfPath::from_str("/lib/x86_64-linux-gnu").unwrap_unchecked(),
+        #[cfg(target_arch = "x86_64")]
+        ElfPath::from_str("/usr/lib/x86_64-linux-gnu").unwrap_unchecked(),
         ElfPath::from_str("/lib").unwrap_unchecked(),
         ElfPath::from_str("/usr/lib").unwrap_unchecked(),
         ElfPath::from_str("/lib64").unwrap_unchecked(),

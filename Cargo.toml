@@ -24,8 +24,8 @@ ash = { version = "0.38", default-features = false }
 # taproot. the taproot forks carry the tlsdesc entry alignment fix, the
 # static-TLS surplus allocator and ld.so-style dl* exports; sources live
 # in vendor/, flip to path = "vendor/..." while hacking on them
-dlopen-rs = { package = "taproot-dlopen-rs", version = "0.8.1" }
-elf_loader = { package = "taproot-elf-loader", version = "0.14.1" }
+dlopen-rs = { package = "taproot-dlopen-rs", version = "0.8.2" }
+elf_loader = { package = "taproot-elf-loader", version = "0.14.2" }
 rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "pipe", "time", "process"] }
 kbvm = "0.1.6"
 
