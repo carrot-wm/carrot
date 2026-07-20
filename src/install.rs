@@ -26,6 +26,8 @@ default=*
 org.freedesktop.impl.portal.ScreenCast=carrot
 ";
 
+const UDMABUF_RULE: &str = "KERNEL==\"udmabuf\", TAG+=\"uaccess\"\n";
+
 pub fn run(args: &[String]) -> i32 {
     let mut prefix = PathBuf::from("/usr/local");
     let mut root = PathBuf::from("/");
@@ -130,6 +132,12 @@ pub fn run(args: &[String]) -> i32 {
         put(
             &stage(&share.join("xdg-desktop-portal/carrot-portals.conf")),
             PORTALS_CONF,
+        )?;
+        // the zero-copy shm bridge opens /dev/udmabuf; uaccess hands it to the
+        // active-seat user. 60- so it precedes systemd's 70-uaccess.rules
+        put(
+            &stage(&prefix.join("lib/udev/rules.d/60-carrot-udmabuf.rules")),
+            UDMABUF_RULE,
         )
     })();
     match res {

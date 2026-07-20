@@ -55,6 +55,10 @@
             environment.systemPackages = [ package pkgs.xdg-utils ];
             # the package carries the session entry; this lists it at the DM
             services.displayManager.sessionPackages = [ package ];
+            # the package ships 60-carrot-udmabuf.rules; udev.packages keeps
+            # the filename, so it still sorts before 70-uaccess.rules (the
+            # applier). extraRules would land in 99-local.rules - too late
+            services.udev.packages = [ package ];
             # carrot is its own screencast backend; the package ships the
             # portal registration and the preference file
             xdg.portal = {
@@ -1003,6 +1007,14 @@
               [preferred]
               default=*
               org.freedesktop.impl.portal.ScreenCast=carrot
+              EOF
+
+              # the zero-copy shm bridge opens /dev/udmabuf; uaccess hands it
+              # to the active-seat user. 60- so it precedes systemd's
+              # 70-uaccess.rules, the rule that applies the tag
+              mkdir -p $out/lib/udev/rules.d
+              cat > $out/lib/udev/rules.d/60-carrot-udmabuf.rules << EOF
+              KERNEL=="udmabuf", TAG+="uaccess"
               EOF
             '';
 
