@@ -64,7 +64,7 @@ jobs:
       # so helpers see the new revision without --devel. inert until the
       # AUR_SSH_PRIVATE_KEY secret exists
       - name: publish the pkgver to the aur
-        if: github.event_name == 'push' && env.AUR_KEY != ''
+        if: env.AUR_KEY != ''
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$AUR_KEY" > ~/.ssh/aur
