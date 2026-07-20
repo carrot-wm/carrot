@@ -66,6 +66,8 @@ jobs:
       - name: publish the pkgver to the aur
         if: env.AUR_KEY != ''
         run: |
+          # the checkout is owned by the runner uid, not the container's
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           mkdir -p ~/.ssh
           printf '%s\n' "$AUR_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
