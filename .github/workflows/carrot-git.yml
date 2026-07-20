@@ -44,6 +44,10 @@ jobs:
           for sym in memcpy memset memmove malloc free ceil sqrt getauxval _start snprintf; do
             nm -D --defined-only target/x86_64-unknown-linux-gnu/release/libc.so.6 | grep -qw "$sym"
           done
+          # and no unresolvable imports: GNU ld defines no __init/fini_array
+          # bounds for a shared library, and any strong undefined dynsym
+          # here fails preload on loaders without the stub backstop
+          test "$(nm -D --undefined-only target/x86_64-unknown-linux-gnu/release/libc.so.6 | grep -c ' U ')" = 0
 
       # the suite runs panic = "unwind" here (no build-std), which the
       # zero-C stack can't unwind to completion; compile it to catch

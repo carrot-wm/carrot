@@ -944,6 +944,14 @@
                   exit 1
                 }
               done
+              # and no unresolvable imports: GNU ld defines no
+              # __init/fini_array bounds for a shared library, and any
+              # strong undefined dynsym here fails preload on loaders
+              # without the stub backstop
+              if nm -D --undefined-only $out/lib/libc.so.6 | grep ' U '; then
+                echo "libc.so.6 has strong undefined imports (above)" >&2
+                exit 1
+              fi
             '';
           };
 
