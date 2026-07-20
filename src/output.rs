@@ -2868,6 +2868,14 @@ async fn callback_pacer(state: &Rc<State>, out: &Rc<Output>) {
         if at > Time::now().nsec() {
             let _ = state.ring.timeout(Time::from_nsec(at)).await;
         }
+        // a newer wake got armed while this one slept (the sweep slipped
+        // past the next flip-done): yield to it instead of firing twice
+        // back-to-back - a client paced off both commits a frame that
+        // supersedes before any latch and lands as discarded feedback.
+        // nothing is lost: the sweep drains an accumulating list
+        if out.cb_at.get() != 0 {
+            continue;
+        }
         fire_callback_sweep(state);
     }
 }
