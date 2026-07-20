@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -78,12 +84,13 @@ dependencies = [
 
 [[package]]
 name = "carrot"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ash",
  "gc-arena",
  "kbvm",
  "kdl",
+ "miniz_oxide",
  "piccolo",
  "regex-lite",
  "rustix",
@@ -208,7 +215,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -476,6 +483,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -654,7 +670,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -878,9 +894,9 @@ dependencies = [
 
 [[package]]
 name = "taproot-dlopen-rs"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c150b00213e8441fc947a553a4d8a15a1d29fdf55e18512fcb382d9be18cf177"
+checksum = "5144379edd1ec4737281d7ab9858c540f278187408b4f64621775fe3fa6ac10c"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
@@ -895,9 +911,9 @@ dependencies = [
 
 [[package]]
 name = "taproot-elf-loader"
-version = "0.14.1"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c6c8587f1aa3b0797f5fa53de15405044312b13518b95efc3e69155183ef070"
+checksum = "8e60df46e19271aa32584ad4af1a9f66a2ff3ac84f9f7e37e56b24951d9efe19"
 dependencies = [
  "bitflags 2.13.1",
  "cc",
@@ -922,9 +938,9 @@ dependencies = [
 
 [[package]]
 name = "taproot-origin"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8251a3004f654d2a462fb1e80f6626d132dd7e9032ed38220075f67343583647"
+checksum = "cb6daca32217b559c27e9c874a2ef3b6ef639caadb7f598082d571a70e21ef46"
 dependencies = [
  "bitflags 2.13.1",
  "linux-raw-sys 0.9.4",
