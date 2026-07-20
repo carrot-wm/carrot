@@ -390,6 +390,13 @@ impl<D> DynamicImage<D> {
             let r_addend = rel.r_addend(base);
 
             match r_type {
+                // Relative relocations normally live in the split-off
+                // fast path, but with RELR the linker's residual
+                // (unaligned) entries stay in .rela.dyn and land here
+                REL_RELATIVE => {
+                    segments.write(rel.r_offset(), RelocValue::new(base) + r_addend);
+                    continue;
+                }
                 // Handle GOT and symbolic relocations
                 REL_GOT | REL_SYMBOLIC => {
                     if let Some(symbol) = helper.find_symbol_or_weak0(r_sym) {
@@ -451,11 +458,29 @@ impl DynamicRelocation {
         rela_count: Option<NonZeroUsize>,
     ) -> Self {
         if let Some(relr) = relr {
-            // Use RELR relocations if available (more compact format)
+            // Use RELR relocations if available (more compact format).
+            // RELR only encodes word-aligned relative relocations; the
+            // linker keeps the residual (unaligned) REL_RELATIVE entries
+            // in .rela.dyn, and JMPREL may still overlap its tail - the
+            // same layout as the non-RELR case, so the same pltrel dedup
+            // applies. The residual relative entries stay in dynrel and
+            // take the generic arm in relocate_dynrel.
+            let old_dynrel = dynrel.unwrap_or(&[]);
+            let pltrel = pltrel.unwrap_or(&[]);
+            let dynrel = if unsafe {
+                core::ptr::eq(
+                    old_dynrel.as_ptr().add(old_dynrel.len()),
+                    pltrel.as_ptr().add(pltrel.len()),
+                )
+            } {
+                &old_dynrel[..old_dynrel.len() - pltrel.len()]
+            } else {
+                old_dynrel
+            };
             Self {
                 relative: RelativeRel::Relr(relr),
-                pltrel: pltrel.unwrap_or(&[]),
-                dynrel: dynrel.unwrap_or(&[]),
+                pltrel,
+                dynrel,
             }
         } else {
             // Use traditional REL/RELA relocations
