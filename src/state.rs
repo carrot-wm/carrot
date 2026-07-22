@@ -50,6 +50,9 @@ pub struct State {
     /// ext-foreign-toplevel-list watchers; same fan-out, fewer verbs
     pub ext_toplevel_lists:
         RefCell<Vec<Rc<crate::protocol::foreign_toplevel_list::ExtToplevelList>>>,
+    /// ext-workspace watchers (pagers/docks), diff-driven fan-out
+    pub ext_workspace_managers:
+        RefCell<Vec<Rc<crate::protocol::ext_workspace::ExtWorkspaceManager>>>,
     /// live image-copy-capture sessions, serviced from present/commit
     pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
     /// live portal screencasts, fed from the present tail
@@ -138,6 +141,7 @@ impl State {
             ipc_subs: RefCell::new(Vec::new()),
             ftl_managers: RefCell::new(Vec::new()),
             ext_toplevel_lists: RefCell::new(Vec::new()),
+            ext_workspace_managers: RefCell::new(Vec::new()),
             icc_sessions: RefCell::new(Vec::new()),
             casts: RefCell::new(Vec::new()),
             last_config_event: RefCell::new(None),
@@ -185,6 +189,7 @@ impl State {
         self.layers.borrow_mut().clear();
         self.ipc_subs.borrow_mut().clear();
         self.ext_toplevel_lists.borrow_mut().clear();
+        self.ext_workspace_managers.borrow_mut().clear();
         self.ftl_managers.borrow_mut().clear();
         self.icc_sessions.borrow_mut().clear();
         self.casts.borrow_mut().clear();

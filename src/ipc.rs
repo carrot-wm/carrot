@@ -165,6 +165,9 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
         Action::FocusWorkspaceRel(d) => crate::tree::switch_workspace_rel(state, *d),
         Action::SendToWorkspace(n) => crate::tree::send_to_workspace(state, *n, false),
         Action::MoveToWorkspace(n) => crate::tree::send_to_workspace(state, *n, true),
+        Action::MoveWorkspaceToOutput(n) => {
+            crate::tree::move_workspace_to_output(state, state.active_ws.get(), *n)
+        }
         Action::ToggleFullscreen => {
             if let Some(win) = crate::tree::focused_window(state) {
                 let on = !win.fullscreen.get();

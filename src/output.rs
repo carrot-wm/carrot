@@ -1823,6 +1823,9 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
     }
     // surviving outputs may have new positions; bound objects re-learn them
     crate::protocol::output::resend_output_state(state);
+    // groups follow outputs: the re-tile may have created, killed, or
+    // re-homed workspaces, and pagers learn it all as one atomic burst
+    crate::protocol::ext_workspace::changed(state);
     state.damage.trigger();
 }
 

@@ -361,6 +361,43 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface ext_workspace_manager_v1, version = 1;
+    request commit();
+    request stop();
+    event workspace_group(workspace_group: new_id);
+    event workspace(workspace: new_id);
+    event done();
+    event finished();
+}
+
+crate::wl_protocol! {
+    interface ext_workspace_group_handle_v1, version = 1;
+    request create_workspace(workspace: string);
+    request destroy();
+    event capabilities(capabilities: uint);
+    event output_enter(output: object);
+    event output_leave(output: object);
+    event workspace_enter(workspace: object);
+    event workspace_leave(workspace: object);
+    event removed();
+}
+
+crate::wl_protocol! {
+    interface ext_workspace_handle_v1, version = 1;
+    request destroy();
+    request activate();
+    request deactivate();
+    request assign(workspace_group: object);
+    request remove();
+    event id(id: string);
+    event name(name: string);
+    event coordinates(coordinates: array);
+    event state(state: uint);
+    event capabilities(capabilities: uint);
+    event removed();
+}
+
+crate::wl_protocol! {
     interface ext_image_capture_source_v1, version = 1;
     request destroy();
 }
@@ -786,6 +823,24 @@ mod tests {
         assert_eq!(zwp_primary_selection_device_v1::selection::OPCODE, 1);
         assert_eq!(zwp_primary_selection_offer_v1::receive::OPCODE, 0);
         assert_eq!(zwp_primary_selection_offer_v1::offer::OPCODE, 0);
+        assert_eq!(ext_workspace_manager_v1::commit::OPCODE, 0);
+        assert_eq!(ext_workspace_manager_v1::stop::OPCODE, 1);
+        assert_eq!(ext_workspace_manager_v1::workspace_group::OPCODE, 0);
+        assert_eq!(ext_workspace_manager_v1::workspace::OPCODE, 1);
+        assert_eq!(ext_workspace_manager_v1::done::OPCODE, 2);
+        assert_eq!(ext_workspace_manager_v1::finished::OPCODE, 3);
+        assert_eq!(ext_workspace_group_handle_v1::create_workspace::OPCODE, 0);
+        assert_eq!(ext_workspace_group_handle_v1::destroy::OPCODE, 1);
+        assert_eq!(ext_workspace_group_handle_v1::capabilities::OPCODE, 0);
+        assert_eq!(ext_workspace_group_handle_v1::workspace_enter::OPCODE, 3);
+        assert_eq!(ext_workspace_group_handle_v1::removed::OPCODE, 5);
+        assert_eq!(ext_workspace_handle_v1::destroy::OPCODE, 0);
+        assert_eq!(ext_workspace_handle_v1::activate::OPCODE, 1);
+        assert_eq!(ext_workspace_handle_v1::assign::OPCODE, 3);
+        assert_eq!(ext_workspace_handle_v1::remove::OPCODE, 4);
+        assert_eq!(ext_workspace_handle_v1::id::OPCODE, 0);
+        assert_eq!(ext_workspace_handle_v1::state::OPCODE, 3);
+        assert_eq!(ext_workspace_handle_v1::removed::OPCODE, 5);
         assert_eq!(zwlr_screencopy_manager_v1::capture_output_region::OPCODE, 1);
         assert_eq!(zwlr_screencopy_frame_v1::copy::OPCODE, 0);
         assert_eq!(zwlr_screencopy_frame_v1::copy_with_damage::OPCODE, 2);

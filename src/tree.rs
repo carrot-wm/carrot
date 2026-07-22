@@ -601,11 +601,19 @@ pub const MAX_WORKSPACES: usize = 256;
 /// grows the list to reach idx, capped; returns the index actually used
 pub fn ensure_workspace(state: &Rc<State>, idx: usize) -> usize {
     let idx = idx.min(MAX_WORKSPACES - 1);
-    let mut list = state.workspaces.borrow_mut();
-    while list.len() <= idx {
-        let w = new_workspace(state);
-        w.output.set(state.focused_output.get());
-        list.push(w);
+    let grew = {
+        let mut list = state.workspaces.borrow_mut();
+        let before = list.len();
+        while list.len() <= idx {
+            let w = new_workspace(state);
+            w.output.set(state.focused_output.get());
+            list.push(w);
+        }
+        list.len() != before
+    };
+    // announced outside the borrow: the fan-out re-reads the list
+    if grew {
+        crate::protocol::ext_workspace::changed(state);
     }
     idx
 }
@@ -658,6 +666,7 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     // tick feeding; without the nudge a client mid-callback never wakes
     crate::portal::cast::glass_changed(state);
     crate::ipc::emit(state, &serde_json::json!({ "workspace": idx + 1 }));
+    crate::protocol::ext_workspace::changed(state);
     state.damage.trigger();
 }
 
@@ -773,6 +782,102 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
         focus_window(state, next.as_ref());
     }
     crate::protocol::foreign_toplevel::output_changed(state, &win);
+}
+
+/// re-homes a workspace onto another output. assign is not activate: the
+/// workspace arrives hidden on the destination, and the vacated glass
+/// falls back to another workspace of the source, minting one if the
+/// source held nothing else - the same recipe topology changes follow
+pub fn move_workspace_to_output(state: &Rc<State>, ws_idx: usize, dst: usize) {
+    let Some(ws) = state.workspaces.borrow().get(ws_idx).cloned() else {
+        return;
+    };
+    let src = ws.output.get();
+    let (n_outs, on_glass) = {
+        let d = state.display.borrow();
+        let Some(d) = d.as_ref() else { return };
+        let outs = d.outputs.borrow();
+        (outs.len(), outs.get(src).is_some_and(|o| o.ws.get() == ws_idx))
+    };
+    if dst == src || dst >= n_outs {
+        return;
+    }
+    ws.output.set(dst);
+    // every window on it re-learns its screen
+    ws.for_each(|w| {
+        send_surface_output(state, &w.surface(), src, false);
+        send_surface_output(state, &w.surface(), dst, true);
+        crate::protocol::foreign_toplevel::output_changed(state, w);
+    });
+    // the fullscreen slot spans the destination rect now
+    if let Some(w) = ws.fullscreen.borrow().clone() {
+        let r = workspace_output_rect(state, &ws);
+        if let Some(tl) = w.xdg_opt() {
+            tl.configure_size(r.width(), r.height());
+        } else if let Some(xw) = w.x11_opt() {
+            xw.configure_to(r);
+        }
+    }
+    if on_glass {
+        let fallback = {
+            let mut list = state.workspaces.borrow_mut();
+            match list.iter().position(|w| w.output.get() == src) {
+                Some(i) => i,
+                None => {
+                    let w = new_workspace(state);
+                    w.output.set(src);
+                    list.push(w);
+                    list.len() - 1
+                }
+            }
+        };
+        if let Some(d) = state.display.borrow().as_ref()
+            && let Some(o) = d.outputs.borrow().get(src)
+        {
+            o.ws.set(fallback);
+        }
+        if state.focused_output.get() == src {
+            state.active_ws.set(fallback);
+        }
+        if let Some(fb) = state.workspaces.borrow().get(fallback).cloned() {
+            relayout(state, &fb);
+        }
+    }
+    relayout(state, &ws);
+    // the scene under the cursor may be entirely different now
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.repick(state);
+    }
+    let dst_name = state
+        .display
+        .borrow()
+        .as_ref()
+        .and_then(|d| d.outputs.borrow().get(dst).map(|o| o.conn.name.clone()))
+        .unwrap_or_default();
+    crate::ipc::emit(
+        state,
+        &serde_json::json!({ "workspace-moved": { "workspace": ws_idx + 1, "output": dst_name } }),
+    );
+    crate::protocol::ext_workspace::changed(state);
+    state.damage.trigger();
+}
+
+/// mints the next workspace bound to the given output slot; the pager's
+/// create verb lands here, and the name it asked for is dropped because
+/// workspaces answer to their index
+pub fn create_workspace_on(state: &Rc<State>, slot: usize) -> Option<usize> {
+    let idx = {
+        let mut list = state.workspaces.borrow_mut();
+        if list.len() >= MAX_WORKSPACES {
+            return None;
+        }
+        let w = new_workspace(state);
+        w.output.set(slot);
+        list.push(w);
+        list.len() - 1
+    };
+    crate::protocol::ext_workspace::changed(state);
+    Some(idx)
 }
 
 // the x server died; every window it owned goes with it

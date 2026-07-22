@@ -313,6 +313,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::foreign_toplevel_list::ForeignToplevelListGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::ext_workspace::ExtWorkspaceGlobal));
     // the source managers and the copy-capture manager ship together:
     // clients gate on the source manager and then use the consumer blind
     state

@@ -148,6 +148,20 @@ fn action(node: &KdlNode, cx: &mut Cx) -> Option<Action> {
             }
         }
         "send-to-workspace" => Action::SendToWorkspace(ws(cx)?),
+        "move-workspace-to-output" => {
+            match node
+                .entries()
+                .iter()
+                .find(|e| e.name().is_none())
+                .and_then(|e| e.value().as_integer())
+            {
+                Some(n) if n >= 1 => Action::MoveWorkspaceToOutput(n as usize - 1),
+                _ => {
+                    cx.at(node, "move-workspace-to-output takes an output number from 1");
+                    return None;
+                }
+            }
+        }
         "close-window" => {
             none(cx, name);
             Action::CloseWindow

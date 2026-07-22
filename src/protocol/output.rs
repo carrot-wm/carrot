@@ -34,7 +34,10 @@ impl Global for WlOutputGlobal {
             name: self.name.clone(),
         });
         client.add_client_obj(out.clone())?;
-        client.objects.track_output(out);
+        client.objects.track_output(out.clone());
+        // a fresh wl_output bind re-enters any workspace group already
+        // pinned to this connector for the binding client
+        crate::protocol::ext_workspace::output_bound(client, &out);
         client.event(|o| {
             // physical size unknown; 0,0 is the protocol's "don't know"
             wl_output::geometry::send(o, id, self.x, self.y, 0, 0, 0, "carrot", &self.name, 0);

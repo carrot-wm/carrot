@@ -6,6 +6,7 @@ pub mod data_control;
 pub mod data_device;
 pub mod dmabuf;
 pub mod display;
+pub mod ext_workspace;
 pub mod foreign_toplevel;
 pub mod foreign_toplevel_list;
 pub mod globals;

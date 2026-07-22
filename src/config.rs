@@ -33,6 +33,8 @@ pub enum Action {
     /// move the window; focus follows unless told otherwise
     MoveToWorkspace(usize),
     SendToWorkspace(usize),
+    /// re-home the active workspace onto output n
+    MoveWorkspaceToOutput(usize),
     ToggleFullscreen,
     ToggleFloating,
     CloseWindow,
