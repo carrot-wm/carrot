@@ -1,5 +1,35 @@
 # Changelog
 
+## Carrot v0.1.3 Beta
+
+Input correctness across games, grabs and workspaces, one new protocol.
+
+- Present: joined modes ride the cursor on an overlay plane, so
+  fullscreen dmabuf scans out directly again at >1GHz pixel clocks
+- Present: a callback sweep that slips past the next flip coalesces
+  into it instead of firing twice; presentation stops reporting
+  discarded frames
+- Present: replaced dmabufs release after the frames that sampled
+  them, not at gpu idle; electron apps no longer hang at startup
+- Input: cursor commits wait for an idle screen, so a high-rate mouse
+  no longer starves the present loop
+- Input: the pointer origin heals under any grab; fullscreen under a
+  locked pointer keeps clicks where the cursor is
+- xwayland: surface pairing follows the serial across map cycles, so
+  hidden apps come back clickable
+- xwayland: fullscreen windows answer configure requests with the
+  painted rect instead of the layout tile; game clicks land where the
+  cursor is, on every output
+- xwayland: hidden workspaces iconify their windows for real
+  (WM_STATE), so a buried menu's pointer grab releases the seat
+  instead of eating clicks across workspaces
+- Protocol: ext-workspace v1 for pagers and docks; groups follow
+  outputs, workspaces diff atomically against what each client was
+  last told, and activate, assign and create are backed by real
+  mutators
+- config: a move-workspace-to-output bind action, the first
+  workspace-to-output mutator
+
 ## Carrot v0.1.1 Beta
 
 Hardening across the launch path, no new features.
