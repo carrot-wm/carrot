@@ -142,6 +142,13 @@ pub struct XWindow {
     // window type in the dialog/utility/toolbar/splash set
     pub float_type: Cell<bool>,
     pub fullscreen_requested: Cell<bool>,
+    /// the wm iconified this window because its workspace hid; x_mapped
+    /// stays true - the client never withdrew - and the tree keeps the
+    /// window so its layout slot survives until the workspace returns
+    pub wm_iconic: Cell<bool>,
+    /// wm-sent unmaps still echoing back as UnmapNotify; those echoes
+    /// must not read as a client withdrawal
+    pub wm_unmap_echoes: Cell<u32>,
     pub transient_for: Cell<u32>,
     pub atoms: RefCell<Option<Rc<XAtoms>>>,
 }
@@ -149,6 +156,9 @@ pub struct XWindow {
 // SubstructureRedirect, the mask WM_TAKE_FOCUS rides on
 const SUBSTRUCTURE_REDIRECT: u32 = 0x0010_0000;
 const REVERT_TO_POINTER_ROOT: u8 = 1;
+// icccm WM_STATE values
+const NORMAL_STATE: u32 = 1;
+const ICONIC_STATE: u32 = 3;
 const XA_WINDOW: u32 = 33;
 
 impl XWindow {
@@ -217,6 +227,47 @@ impl XWindow {
                 XA_WINDOW,
                 32,
                 &self.xid.to_ne_bytes(),
+            )
+        });
+    }
+
+    /// x input focus is surrendered, not just abandoned: a hidden client
+    /// that keeps core focus reads keys that now belong to a wl window
+    pub fn drop_focus(&self) {
+        use crate::xparsnip::wire;
+        self.parsnip
+            .send(|b| wire::set_input_focus(b, REVERT_TO_POINTER_ROOT, 0, 0));
+    }
+
+    /// wm-initiated visibility. hiding unmaps the window for real: an
+    /// active pointer grab releases when its window goes unviewable,
+    /// which is how a hidden app's menu lets go of every click. showing
+    /// maps it back, and the serial re-pairing lands the fresh surface
+    /// in the same tree slot, so the layout never notices
+    pub fn set_wm_visible(&self, show: bool) {
+        use crate::xparsnip::wire;
+        if self.wm_iconic.get() != show {
+            return;
+        }
+        let Some(a) = self.atoms.borrow().clone() else { return };
+        self.wm_iconic.set(!show);
+        let state = if show {
+            self.parsnip.send(|b| wire::map_window(b, self.xid));
+            NORMAL_STATE
+        } else {
+            self.wm_unmap_echoes.set(self.wm_unmap_echoes.get() + 1);
+            self.parsnip.send(|b| wire::unmap_window(b, self.xid));
+            ICONIC_STATE
+        };
+        self.parsnip.send(|b| {
+            wire::change_property(
+                b,
+                0,
+                self.xid,
+                a.wm_state,
+                a.wm_state,
+                32,
+                &[state.to_ne_bytes(), 0u32.to_ne_bytes()].concat(),
             )
         });
     }

@@ -42,6 +42,16 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
     let old_win = old.as_ref().and_then(|s| crate::tree::window_for_surface(state, s));
     *seat.kb_focus.borrow_mut() = new.clone();
     let new_win = new.as_ref().and_then(|s| crate::tree::window_for_surface(state, s));
+    // when focus leaves the x world entirely, the x server must be told:
+    // a hidden client that keeps core focus reads keys that now belong
+    // to a wl window. focusing another x window replaces focus instead
+    let old_x = old_win.as_ref().and_then(|w| w.x11_opt()).cloned();
+    let new_is_x = new_win.as_ref().is_some_and(|w| w.x11_opt().is_some());
+    if let Some(xw) = old_x
+        && !new_is_x
+    {
+        xw.drop_focus();
+    }
     crate::protocol::foreign_toplevel::focus_changed(state, old_win, new_win);
     if let Some(new) = &new {
         let serial = state.next_serial(Some(&new.client)) as u32;

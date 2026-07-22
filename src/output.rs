@@ -1826,6 +1826,7 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
     // groups follow outputs: the re-tile may have created, killed, or
     // re-homed workspaces, and pagers learn it all as one atomic burst
     crate::protocol::ext_workspace::changed(state);
+    crate::tree::sync_x_visibility(state);
     state.damage.trigger();
 }
 

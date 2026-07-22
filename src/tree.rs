@@ -667,6 +667,7 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     crate::portal::cast::glass_changed(state);
     crate::ipc::emit(state, &serde_json::json!({ "workspace": idx + 1 }));
     crate::protocol::ext_workspace::changed(state);
+    sync_x_visibility(state);
     state.damage.trigger();
 }
 
@@ -782,6 +783,27 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
         focus_window(state, next.as_ref());
     }
     crate::protocol::foreign_toplevel::output_changed(state, &win);
+    // the sent window may have landed on a hidden workspace
+    sync_x_visibility(state);
+}
+
+/// x windows follow the glass: a hidden workspace's windows unmap for
+/// real (releasing any pointer grab a hidden menu still holds, exactly
+/// what a stuck electron popup needs) and re-map when their workspace
+/// returns. diff-driven and idempotent like the pager fan-out, so every
+/// visibility site just calls it
+pub fn sync_x_visibility(state: &Rc<State>) {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return };
+    let outs = d.outputs.borrow();
+    for (i, ws) in state.workspaces.borrow().iter().enumerate() {
+        let shown = outs.get(ws.output.get()).is_some_and(|o| o.ws.get() == i);
+        ws.for_each(|w| {
+            if let Some(xw) = w.x11_opt() {
+                xw.set_wm_visible(shown);
+            }
+        });
+    }
 }
 
 /// re-homes a workspace onto another output. assign is not activate: the
@@ -859,6 +881,7 @@ pub fn move_workspace_to_output(state: &Rc<State>, ws_idx: usize, dst: usize) {
         &serde_json::json!({ "workspace-moved": { "workspace": ws_idx + 1, "output": dst_name } }),
     );
     crate::protocol::ext_workspace::changed(state);
+    sync_x_visibility(state);
     state.damage.trigger();
 }
 
@@ -1241,6 +1264,8 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
             "app-id": win.app_id(),
         }}),
     );
+    // an open-on-workspace rule may have pinned it to a hidden one
+    sync_x_visibility(state);
     state.damage.trigger();
 }
 

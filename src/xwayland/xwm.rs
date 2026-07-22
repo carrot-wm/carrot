@@ -322,6 +322,8 @@ impl Xwm {
                     modal: Cell::new(false),
                     float_type: Cell::new(false),
                     fullscreen_requested: Cell::new(false),
+                    wm_iconic: Cell::new(false),
+                    wm_unmap_echoes: Cell::new(0),
                     transient_for: Cell::new(0),
                     atoms: RefCell::new(Some(self.atoms.clone())),
                 });
@@ -364,9 +366,14 @@ impl Xwm {
             }
             E::UnmapNotify { window, .. } => {
                 if let Some(xwin) = self.win(window) {
-                    xwin.x_mapped.set(false);
-                    self.set_wm_state(window, WITHDRAWN_STATE);
-                    self.gate(&xwin);
+                    // our own iconify echoes back; the client never withdrew
+                    if xwin.wm_unmap_echoes.get() > 0 {
+                        xwin.wm_unmap_echoes.set(xwin.wm_unmap_echoes.get() - 1);
+                    } else {
+                        xwin.x_mapped.set(false);
+                        self.set_wm_state(window, WITHDRAWN_STATE);
+                        self.gate(&xwin);
+                    }
                 }
             }
             E::ConfigureNotify { window, x, y, width, height, override_redirect, .. } => {
@@ -1010,7 +1017,10 @@ impl Xwm {
                 }
                 self.client_list_add(xwin.xid);
             }
-        } else if !mapped && in_tree {
+        } else if !mapped && in_tree && !(xwin.wm_iconic.get() && xwin.x_mapped.get()) {
+            // a wm-iconified window keeps its tree slot: its surface died
+            // with the unmap, but the client never withdrew, and the
+            // remap re-pairs a fresh surface into the same window
             let win = xwin.window.borrow_mut().take().unwrap();
             // unmap_window finds the workspace that really holds it; the
             // active one may have changed since map (workspace switches,

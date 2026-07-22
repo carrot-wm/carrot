@@ -84,6 +84,12 @@ pub fn map_window(b: &mut Vec<u8>, window: u32) {
     finish(b, s);
 }
 
+pub fn unmap_window(b: &mut Vec<u8>, window: u32) {
+    let s = begin(b, 10, 0);
+    b.extend_from_slice(&window.to_ne_bytes());
+    finish(b, s);
+}
+
 pub fn get_geometry(b: &mut Vec<u8>, drawable: u32) {
     let s = begin(b, 14, 0);
     b.extend_from_slice(&drawable.to_ne_bytes());
