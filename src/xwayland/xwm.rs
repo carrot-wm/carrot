@@ -391,14 +391,30 @@ impl Xwm {
             }
             E::ConfigureRequest { window, x, y, width, height, value_mask, .. } => {
                 let xwin = self.win(window);
-                let tiled = xwin
-                    .as_ref()
-                    .and_then(|xw| xw.window.borrow().clone())
-                    .is_some_and(|w| !w.floating.get());
-                if tiled {
+                let win = xwin.as_ref().and_then(|xw| xw.window.borrow().clone());
+                if let Some(w) = win.as_ref().filter(|w| w.fullscreen.get()) {
+                    // fullscreen answers with the painted rect: the layout
+                    // tile and the client's own box both lie, and the real
+                    // x geometry must never leave the output rect while
+                    // the slot holds - a forwarded request moves the root
+                    // coordinate frame the client's warps and cursor reads
+                    // live in, and clicks land displaced until the next
+                    // fullscreen cycle re-truths it
+                    let r = w.draw_rect(&self.state);
+                    let ev = wire::encode_configure_notify(
+                        window,
+                        r.x1 as i16,
+                        r.y1 as i16,
+                        r.width() as u16,
+                        r.height() as u16,
+                        0,
+                    );
+                    self.c
+                        .send(|b| wire::send_event(b, false, window, STRUCTURE_NOTIFY, &ev));
+                } else if win.as_ref().is_some_and(|w| !w.floating.get()) {
                     // the tile is the answer; a synthetic notify keeps the
                     // client's view of the world honest
-                    let r = xwin.unwrap().window.borrow().as_ref().unwrap().rect.get();
+                    let r = win.as_ref().unwrap().rect.get();
                     let ev = wire::encode_configure_notify(
                         window,
                         r.x1 as i16,

@@ -1797,6 +1797,20 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
     for ws in crate::tree::visible_workspaces(state) {
         crate::tree::relayout(state, &ws);
     }
+    // fullscreen slots draw at their workspace's output rect, and the
+    // re-tile may have moved or resized it. relayout skips fullscreen
+    // configures, so the client (and for x11, the real x geometry the
+    // root coordinate frame maps through) must re-learn the rect here
+    // or input lands displaced until a fullscreen cycle
+    for ws in state.workspaces.borrow().iter() {
+        let Some(w) = ws.fullscreen.borrow().clone() else { continue };
+        let r = crate::tree::workspace_output_rect(state, ws);
+        if let Some(tl) = w.xdg_opt() {
+            tl.configure_size(r.width(), r.height());
+        } else if let Some(xw) = w.x11_opt() {
+            xw.configure_to(r);
+        }
+    }
     // pull the pointer back onto glass if its output vanished; the
     // placement yields whole under a lock so the plane never detaches
     // from the frozen seat position
