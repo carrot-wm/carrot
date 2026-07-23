@@ -466,9 +466,24 @@ impl DrmDevice {
             loop {
                 let (b, n) = match ring.read(&dev.fd, buf).await {
                     Ok(r) => r,
+                    Err(crate::uring::RingError::Os(e))
+                        if e == rustix::io::Errno::INTR || e == rustix::io::Errno::AGAIN =>
+                    {
+                        buf = vec![0u8; 1024];
+                        continue;
+                    }
+                    Err(crate::uring::RingError::Destroyed) => return,
                     Err(e) => {
-                        eprintln!("carrot: drm event read failed: {e}");
-                        return;
+                        // every present waits on a flip completion: a dead
+                        // pump is a dead compositor. log, back off a beat,
+                        // keep reading; only ring teardown ends this task
+                        eprintln!("carrot: drm event read failed: {e}; retrying");
+                        let deadline = crate::util::Time::from_nsec(
+                            crate::util::Time::now().nsec() + 50_000_000,
+                        );
+                        let _ = ring.timeout(deadline).await;
+                        buf = vec![0u8; 1024];
+                        continue;
                     }
                 };
                 buf = b;
