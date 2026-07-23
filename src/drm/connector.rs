@@ -28,6 +28,9 @@ pub struct Connector {
     pub connected: Cell<bool>,
     /// kernel-style name, "DP-1"; what output config blocks match on
     pub name: String,
+    /// panel physical size in mm from the probe; a rescan refreshes it so a
+    /// swapped monitor on the same connector reports its own glass
+    pub mm_size: Cell<(u32, u32)>,
     pub vrr_capable: bool,
     /// desired vs programmed VRR_ENABLED; flips converge them
     pub vrr_want: Cell<bool>,
@@ -98,6 +101,7 @@ impl Connector {
             link_status,
             connected: Cell::new(info.connection == 1),
             name,
+            mm_size: Cell::new((info.mm_width, info.mm_height)),
             vrr_capable: props.value("vrr_capable") == Some(1),
             vrr_want: Cell::new(false),
             vrr_cur: Cell::new(false),
@@ -263,6 +267,7 @@ impl Connector {
 
         let info = sys::connector(dev.fd.as_fd(), self.id.0, false)
             .map_err(|e| DrmError::ObjOp("connector", self.id.0, e))?;
+        self.mm_size.set((info.mm_width, info.mm_height));
         let mut crtc_mask = 0u32;
         for &enc in &info.encoders {
             crtc_mask |= sys::encoder_possible_crtcs(dev.fd.as_fd(), enc)

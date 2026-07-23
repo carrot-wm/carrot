@@ -55,6 +55,7 @@ impl Display {
             .unwrap_or(60) as i32
             * 1000;
         let (x, y) = out.pos.get();
+        let (mm_w, mm_h) = out.conn.mm_size.get();
         crate::protocol::output::WlOutputGlobal {
             name: out.conn.name.clone(),
             x,
@@ -62,6 +63,8 @@ impl Display {
             width: out.width as i32,
             height: out.height as i32,
             refresh_mhz: refresh,
+            mm_width: mm_w as i32,
+            mm_height: mm_h as i32,
         }
     }
 

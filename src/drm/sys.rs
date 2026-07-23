@@ -208,6 +208,10 @@ pub struct ConnectorInfo {
     pub connection: u32,
     pub connector_type: u32,
     pub connector_type_id: u32,
+    /// panel physical size in mm; 0 when the kernel doesn't know
+    /// (projectors, some MST branches)
+    pub mm_width: u32,
+    pub mm_height: u32,
     pub encoders: Vec<u32>,
     pub modes: Vec<ModeInfo>,
 }
@@ -255,6 +259,8 @@ pub fn connector(fd: BorrowedFd<'_>, id: u32, force_probe: bool) -> Result<Conne
                 connection: d.connection,
                 connector_type: d.connector_type,
                 connector_type_id: d.connector_type_id,
+                mm_width: d.mm_width,
+                mm_height: d.mm_height,
                 encoders,
                 modes,
             });

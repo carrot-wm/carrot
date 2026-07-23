@@ -603,6 +603,8 @@ mod tests {
             width: 800,
             height: 600,
             refresh_mhz: 60_000,
+            mm_width: 0,
+            mm_height: 0,
         };
         crate::protocol::globals::Global::bind(&out, &client, ObjectId(90), 4).unwrap();
         let mgr = Rc::new(SessionLockManager {

@@ -15,6 +15,10 @@ pub struct WlOutputGlobal {
     pub width: i32,
     pub height: i32,
     pub refresh_mhz: i32,
+    /// panel size in mm from the connector; 0,0 stays the protocol's
+    /// "don't know" when the kernel had nothing
+    pub mm_width: i32,
+    pub mm_height: i32,
 }
 
 impl Global for WlOutputGlobal {
@@ -39,8 +43,18 @@ impl Global for WlOutputGlobal {
         // pinned to this connector for the binding client
         crate::protocol::ext_workspace::output_bound(client, &out);
         client.event(|o| {
-            // physical size unknown; 0,0 is the protocol's "don't know"
-            wl_output::geometry::send(o, id, self.x, self.y, 0, 0, 0, "carrot", &self.name, 0);
+            wl_output::geometry::send(
+                o,
+                id,
+                self.x,
+                self.y,
+                self.mm_width,
+                self.mm_height,
+                0,
+                "carrot",
+                &self.name,
+                0,
+            );
             // flags: current | preferred
             wl_output::mode::send(o, id, 3, self.width, self.height, self.refresh_mhz);
             if version >= 2 {
@@ -237,7 +251,7 @@ pub fn resend_output_state(state: &Rc<crate::state::State>) {
         });
         c.objects.for_each_output(|out| {
             let (x, y, w, h) = logical_of(&out.client, &out.name);
-            let hz = {
+            let (hz, (mm_w, mm_h)) = {
                 let d = out.client.state.display.borrow();
                 d.as_ref()
                     .and_then(|d| {
@@ -245,12 +259,32 @@ pub fn resend_output_state(state: &Rc<crate::state::State>) {
                             .borrow()
                             .iter()
                             .find(|o| o.conn.name == out.name)
-                            .and_then(|o| o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh))
+                            .map(|o| {
+                                let hz = o
+                                    .conn
+                                    .pipe
+                                    .borrow()
+                                    .as_ref()
+                                    .map(|p| p.mode.vrefresh)
+                                    .unwrap_or(0);
+                                (hz, o.conn.mm_size.get())
+                            })
                     })
-                    .unwrap_or(0)
+                    .unwrap_or((0, (0, 0)))
             };
             out.client.event(|o| {
-                wl_output::geometry::send(o, out.id, x, y, 0, 0, 0, "carrot", &out.name, 0);
+                wl_output::geometry::send(
+                    o,
+                    out.id,
+                    x,
+                    y,
+                    mm_w as i32,
+                    mm_h as i32,
+                    0,
+                    "carrot",
+                    &out.name,
+                    0,
+                );
                 // refresh is millihertz on the wire, like the bind path sends
                 wl_output::mode::send(o, out.id, 3, w, h, (hz * 1000) as i32);
                 if out.version >= 2 {
