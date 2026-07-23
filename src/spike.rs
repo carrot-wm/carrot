@@ -20,23 +20,13 @@ enum Outcome {
 }
 
 pub fn run() -> i32 {
-    let mut cards: Vec<PathBuf> = match std::fs::read_dir("/dev/dri") {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or(false)
-            })
-            .collect(),
+    let cards = match crate::drm::device::card_paths() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("cannot read /dev/dri: {e}");
             return 1;
         }
     };
-    cards.sort();
     if cards.is_empty() {
         eprintln!("no drm cards found");
         return 1;

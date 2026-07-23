@@ -2325,23 +2325,13 @@ impl Drop for Renderer {
 /// quads -> readback -> pixel check. proves shaders, blend, barriers and the
 /// tier-2 scanout write path.
 pub fn probe() -> i32 {
-    let mut cards: Vec<_> = match std::fs::read_dir("/dev/dri") {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or(false)
-            })
-            .collect(),
+    let cards = match crate::drm::device::card_paths() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("cannot read /dev/dri: {e}");
             return 1;
         }
     };
-    cards.sort();
     let mut failed = false;
     for path in cards {
         println!("=== {} ===", path.display());

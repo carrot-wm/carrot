@@ -488,23 +488,13 @@ impl DrmDevice {
 /// dev diagnostic (`carrot drm-probe`): bring up the object graph on every
 /// card and dump pipe assignments. needs no drm master
 pub fn probe_dump() -> i32 {
-    let mut cards: Vec<_> = match std::fs::read_dir("/dev/dri") {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or(false)
-            })
-            .collect(),
+    let cards = match card_paths() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("cannot read /dev/dri: {e}");
             return 1;
         }
     };
-    cards.sort();
     let mut failed = false;
     for path in cards {
         println!("=== {} ===", path.display());
@@ -569,4 +559,46 @@ fn plane_type(fd: BorrowedFd<'_>, props: &PropSet) -> PlaneType {
         }
     }
     PlaneType::Overlay
+}
+
+/// a /dev/dri entry that is a card node: "card" plus at least one digit.
+/// renderD* and the bare word "card" are not
+fn is_card_node(name: &str) -> bool {
+    let Some(n) = name.strip_prefix("card") else {
+        return false;
+    };
+    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// every card node in /dev/dri, sorted. the one enumeration all four
+/// callers share: bring-up, drm-probe, render-probe and the multi-card walk
+pub fn card_paths() -> Result<Vec<std::path::PathBuf>, std::io::Error> {
+    let mut cards: Vec<std::path::PathBuf> = std::fs::read_dir("/dev/dri")?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_card_node)
+        })
+        .collect();
+    cards.sort();
+    Ok(cards)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_nodes_need_card_plus_digits() {
+        assert!(is_card_node("card0"));
+        assert!(is_card_node("card10"));
+        // the render node is the same device and would double every card
+        assert!(!is_card_node("renderD128"));
+        assert!(!is_card_node("controlD64"));
+        // "card" alone has no digits; an empty suffix must not pass
+        assert!(!is_card_node("card"));
+        assert!(!is_card_node("card0x"));
+    }
 }
