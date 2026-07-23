@@ -177,6 +177,11 @@ pub struct DrmDevice {
     pub fd: Rc<OwnedFd>,
     /// kernel driver name; gates driver-private ioctls
     pub driver: String,
+    /// stable bus id from sysfs, "pci-0000:03:00.0"; how config names a gpu.
+    /// None off pci, where driver name or /dev/dri path is the only handle
+    pub pci: Option<String>,
+    /// card's dev_t, matching logind pause/resume and dmabuf feedback
+    pub devnum: u64,
     pub cursor_size: (u32, u32),
     /// kernel takes PAGE_FLIP_ASYNC on atomic commits (6.8+); tearing needs it
     pub supports_async_flip: bool,
@@ -202,6 +207,8 @@ impl DrmDevice {
         }
 
         let driver = sys::driver_name(fd.as_fd()).unwrap_or_default();
+        let devnum = rustix::fs::fstat(fd.as_fd()).map(|st| st.st_rdev).unwrap_or(0);
+        let pci = pci_address(devnum);
         let cursor_size = (
             sys::get_cap(fd.as_fd(), sys::CAP_CURSOR_WIDTH).unwrap_or(64) as u32,
             sys::get_cap(fd.as_fd(), sys::CAP_CURSOR_HEIGHT).unwrap_or(64) as u32,
@@ -277,6 +284,8 @@ impl DrmDevice {
         let dev = Rc::new(DrmDevice {
             fd,
             driver,
+            pci,
+            devnum,
             cursor_size,
             supports_async_flip,
             crtcs,
@@ -586,9 +595,94 @@ pub fn card_paths() -> Result<Vec<std::path::PathBuf>, std::io::Error> {
     Ok(cards)
 }
 
+/// pci address of a drm node as sysfs spells it, prefixed the way config
+/// names it: "pci-0000:03:00.0". None for anything not on a pci bus, which
+/// still works, it just has to be named by driver or by /dev/dri path.
+pub fn pci_address(devnum: u64) -> Option<String> {
+    pci_address_at(
+        Path::new("/sys"),
+        rustix::fs::major(devnum),
+        rustix::fs::minor(devnum),
+    )
+}
+
+fn pci_address_at(sysfs: &Path, major: u32, minor: u32) -> Option<String> {
+    let link = sysfs.join(format!("dev/char/{major}:{minor}/device"));
+    let real = std::fs::canonicalize(link).ok()?;
+    let name = real.file_name()?.to_str()?;
+    is_pci_address(name).then(|| format!("pci-{name}"))
+}
+
+/// sysfs spells a pci id "DDDD:BB:DD.F". a platform or usb node sits at the
+/// same place in the tree but has no bus address, and inventing one would
+/// give config a string it could never match against real hardware
+fn is_pci_address(s: &str) -> bool {
+    let Some((head, func)) = s.rsplit_once('.') else {
+        return false;
+    };
+    let [domain, bus, dev] = head.split(':').collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    let hex = |v: &str, n: usize| v.len() == n && v.bytes().all(|b| b.is_ascii_hexdigit());
+    hex(domain, 4) && hex(bus, 2) && hex(dev, 2) && hex(func, 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// a fake sysfs shaped like the real one: /sys/dev/char/<maj>:<min> is a
+    /// symlink into /sys/devices/..., and `device` inside the card dir points
+    /// back up at the pci node
+    /// `parent` is the path under devices/ that owns the card, e.g.
+    /// "pci0000:00/0000:03:00.0" or "platform/fe004000.gpu"
+    fn fake_sysfs(tag: &str, parent: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("carrot-pci-{tag}-{}", std::process::id()))
+            .join("sys");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        let card = root.join(format!("devices/{parent}/drm/card0"));
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::create_dir_all(root.join("dev/char")).unwrap();
+        symlink(
+            format!("../../devices/{parent}/drm/card0"),
+            root.join("dev/char/226:0"),
+        )
+        .unwrap();
+        symlink("../..", card.join("device")).unwrap();
+        root
+    }
+
+    #[test]
+    fn pci_address_comes_from_the_sysfs_device_link() {
+        let root = fake_sysfs("ok", "pci0000:00/0000:03:00.0");
+        assert_eq!(
+            pci_address_at(&root, 226, 0),
+            Some("pci-0000:03:00.0".to_string())
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_non_pci_card_has_no_pci_address() {
+        // a platform gpu: real path, no bus id. naming it "pci-fe004000.gpu"
+        // would be a lie config could not match
+        let root = fake_sysfs("platform", "platform/fe004000.gpu");
+        assert_eq!(pci_address_at(&root, 226, 0), None);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_card_with_no_device_link_has_no_pci_address() {
+        let root = fake_sysfs("bare", "pci0000:00/0000:03:00.0");
+        std::fs::remove_file(
+            root.join("devices/pci0000:00/0000:03:00.0/drm/card0/device"),
+        )
+        .unwrap();
+        assert_eq!(pci_address_at(&root, 226, 0), None);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
 
     #[test]
     fn card_nodes_need_card_plus_digits() {
