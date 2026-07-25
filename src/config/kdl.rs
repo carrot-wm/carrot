@@ -20,6 +20,29 @@ fn line_col(src: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
+/// one bad token makes the kdl parser emit a brace-error cascade that
+/// points everywhere except the typo. keep one diagnostic per line, drop
+/// the pure follow-ons, and show the offending source line with a caret
+/// so the mistake is visible in the error itself
+fn render_parse_errors(src: &str, e: &::kdl::KdlError, prefix: &str, out: &mut Vec<String>) {
+    let mut seen_lines: Vec<usize> = Vec::new();
+    let noise = e.diagnostics.len() > 1;
+    for d in &e.diagnostics {
+        let msg = d.message.clone().unwrap_or_else(|| "parse error".into());
+        if noise && msg.contains("Expected end of document") {
+            continue;
+        }
+        let (l, c) = line_col(src, d.span.offset());
+        if seen_lines.contains(&l) {
+            continue;
+        }
+        seen_lines.push(l);
+        let text = src.lines().nth(l - 1).unwrap_or("").trim_end();
+        let caret = format!("{}^", " ".repeat(c.saturating_sub(1)));
+        out.push(format!("{prefix}{l}:{c}: {msg}\n    {text}\n    {caret}"));
+    }
+}
+
 /// parse a user file: the embedded default underneath, the file's
 /// sections over it. Ok only when nothing at all went wrong; Err carries
 /// every rendered error. include nodes need `parse_at`, which is why
@@ -106,11 +129,7 @@ fn parse_into(
     let doc: KdlDocument = match src.parse::<KdlDocument>() {
         Ok(d) => d,
         Err(e) => {
-            for d in &e.diagnostics {
-                let (l, c) = line_col(src, d.span.offset());
-                let msg = d.message.clone().unwrap_or_else(|| "parse error".into());
-                errs.push(format!("{l}:{c}: {msg}"));
-            }
+            render_parse_errors(src, &e, "", &mut errs.list);
             return Err(errs.list);
         }
     };
@@ -184,11 +203,7 @@ fn walk(
             let sub: KdlDocument = match text.parse() {
                 Ok(d) => d,
                 Err(e) => {
-                    for d in &e.diagnostics {
-                        let (l, c) = line_col(&text, d.span.offset());
-                        let msg = d.message.clone().unwrap_or_else(|| "parse error".into());
-                        cx.errs.push(format!("{label} {l}:{c}: {msg}"));
-                    }
+                    render_parse_errors(&text, &e, &format!("{label} "), &mut cx.errs.list);
                     continue;
                 }
             };

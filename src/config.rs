@@ -1203,6 +1203,26 @@ mod tests {
     }
 
     #[test]
+    fn one_typo_reports_once_with_the_line_shown() {
+        // toggle=full-width for toggle-full-width: the kdl parser emits a
+        // brace-error cascade; the report must collapse it and show the
+        // offending source line with a caret at the column
+        let src = "binds {\n    Mod+F { toggle=full-width; }\n}\n";
+        let errs = parse(src).unwrap_err();
+        assert!(!errs.is_empty());
+        assert!(
+            errs.iter().all(|e| !e.contains("Expected end of document")),
+            "follow-on noise filtered: {errs:?}"
+        );
+        let lines: Vec<&String> = errs.iter().filter(|e| e.contains("toggle=full-width")).collect();
+        assert!(!lines.is_empty(), "the offending line is shown: {errs:?}");
+        assert!(lines[0].contains('^'), "a caret marks the column: {errs:?}");
+        // one diagnostic per source line, not four for line 2
+        let for_line_2 = errs.iter().filter(|e| e.starts_with("2:")).count();
+        assert!(for_line_2 <= 1, "cascade collapsed: {errs:?}");
+    }
+
+    #[test]
     fn colors_reject_multibyte_instead_of_panicking() {
         // a mid-pair multibyte char used to hit a byte-offset slice panic
         assert!(color("#a\u{e9}123").is_err());
