@@ -1548,6 +1548,7 @@ pub fn start_hotplug(state: &Rc<State>) {
         let aq = adds.clone();
         let ast = st.clone();
         let _adder = st.eng.spawn("input hotplug", async move {
+            use crate::input::evdev::AddOutcome;
             loop {
                 let devname = aq.pop().await;
                 let deadline = Time::from_nsec(Time::now().nsec() + 250_000_000);
@@ -1558,7 +1559,7 @@ pub fn start_hotplug(state: &Rc<State>) {
                     continue;
                 };
                 let path = std::path::PathBuf::from(format!("/dev/{devname}"));
-                if let Some(dev) = mgr.add_device(&ast, &session, &path).await {
+                if let AddOutcome::New(dev) = mgr.add_device(&ast, &session, &path).await {
                     println!("carrot: input: {} added", dev.name);
                 }
             }

@@ -162,8 +162,11 @@ pub struct Device {
     pub active: Cell<bool>,
     /// edge dedup + release synthesis on pause/removal
     pub pressed: RefCell<HashSet<u32>>,
-    /// queue overruns announce once per device, not per drop
-    drop_warned: Cell<bool>,
+    /// queue overruns count and report at most once a second: a lost
+    /// delta is lost motion, and the rate is the diagnosis
+    drops: Cell<u64>,
+    drops_reported: Cell<u64>,
+    drop_report_ns: Cell<u64>,
     /// from udev's MOUSE_DPI (hwdb), like libinput; 1000 when unlisted
     pub dpi: f64,
     reader: Cell<Option<crate::engine::SpawnedFuture<()>>>,
@@ -216,6 +219,17 @@ fn parse_mouse_dpi(value: &str) -> f64 {
 
 const EVENT_SIZE: usize = 24;
 
+/// what came of bringing a node under management
+pub enum AddOutcome {
+    New(Rc<Device>),
+    /// devnum already managed
+    Known,
+    /// not a keyboard or pointer; permanent for a settled node
+    Skip,
+    /// stat, TakeDevice, or a race lost it; worth retrying
+    Failed,
+}
+
 pub struct Manager {
     pub devices: RefCell<Vec<Rc<Device>>>,
     pub sink: Rc<AsyncQueue<(u64, InputEvent)>>,
@@ -253,25 +267,30 @@ impl Manager {
         state: &Rc<State>,
         session: &Rc<LogindSession>,
         node: &std::path::Path,
-    ) -> Option<Rc<Device>> {
-        let devnum = rustix::fs::stat(node).ok()?.st_rdev;
+    ) -> AddOutcome {
+        let Ok(devnum) = rustix::fs::stat(node).map(|s| s.st_rdev) else {
+            return AddOutcome::Failed;
+        };
         if self.devices.borrow().iter().any(|d| d.devnum == devnum) {
-            return None;
+            return AddOutcome::Known;
         }
         let (fd, inactive) = match session.take_device(devnum).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("carrot: {}: TakeDevice: {e}", node.display());
-                return None;
+                return AddOutcome::Failed;
             }
         };
         // a duplicate uevent may have raced us across the await
         if self.devices.borrow().iter().any(|d| d.devnum == devnum) {
-            return None;
+            return AddOutcome::Known;
         }
         let Some(kind) = classify(fd.as_fd()) else {
             session.release_device(devnum);
-            return None;
+            // no keyboard or pointer bits: not ours (joysticks, tablets),
+            // permanently - unless the node is still half-enumerated, so
+            // the caller's retry treats a young node as transient
+            return AddOutcome::Skip;
         };
         set_monotonic(fd.as_fd());
         let dev = Rc::new(Device {
@@ -281,7 +300,9 @@ impl Manager {
             fd: RefCell::new(fd),
             active: Cell::new(!inactive),
             pressed: RefCell::new(HashSet::new()),
-            drop_warned: Cell::new(false),
+            drops: Cell::new(0),
+            drops_reported: Cell::new(0),
+            drop_report_ns: Cell::new(0),
             dpi: udev_mouse_dpi(devnum),
             reader: Cell::new(None),
         });
@@ -323,7 +344,7 @@ impl Manager {
         );
         crate::trace!("input device {}: {} ({:?})", dev.devnum, dev.name, dev.kind);
         self.devices.borrow_mut().push(dev.clone());
-        Some(dev)
+        AddOutcome::New(dev)
     }
 
     /// unlist the device, stop its reader, and release held keys
@@ -473,11 +494,18 @@ impl Device {
                         // the kernel queue overran and events were lost; the
                         // pending rel state is garbage, start the batch over
                         EV_SYN if code == SYN_DROPPED => {
-                            if !dev.drop_warned.replace(true) {
+                            dev.drops.set(dev.drops.get() + 1);
+                            let now = crate::util::Time::now().nsec();
+                            if now.saturating_sub(dev.drop_report_ns.get()) >= 1_000_000_000 {
+                                dev.drop_report_ns.set(now);
+                                let total = dev.drops.get();
                                 eprintln!(
-                                    "carrot: input: {} overran the kernel queue, events dropped",
-                                    dev.name
+                                    "carrot: input: {} overran the kernel queue, events dropped \
+                                     ({} since the last report, {total} total)",
+                                    dev.name,
+                                    total - dev.drops_reported.get(),
                                 );
+                                dev.drops_reported.set(total);
                             }
                             dx = 0.0;
                             dy = 0.0;
@@ -561,7 +589,9 @@ mod tests {
             fd: RefCell::new(Rc::new(fd)),
             active: Cell::new(true),
             pressed: RefCell::new([30u32].into_iter().collect()),
-            drop_warned: Cell::new(false),
+            drops: Cell::new(0),
+            drops_reported: Cell::new(0),
+            drop_report_ns: Cell::new(0),
             dpi: 1000.0,
             reader: Cell::new(None),
         })
