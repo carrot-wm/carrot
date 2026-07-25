@@ -21,7 +21,10 @@ pub(super) fn parse(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                 if let Some(m) = cx.str_(c) {
                     match parse_mode(&m) {
                         Some(m) => out.mode = Some(m),
-                        None => cx.at(c, "mode looks like \"2560x1440@240\""),
+                        None => cx.at(
+                            c,
+                            "mode looks like \"2560x1440@240\" (fractional works: \"2560x1080@100.002\")",
+                        ),
                     }
                 }
             }

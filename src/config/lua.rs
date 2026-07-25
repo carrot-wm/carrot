@@ -424,7 +424,10 @@ fn outputs(v: &Value, cfg: &mut Config) -> Result<(), String> {
                     let m = need_str(&v, &key)?;
                     out.mode = Some(
                         super::parse_mode(&m)
-                            .ok_or_else(|| "mode looks like \"2560x1440@240\"".to_string())?,
+                            .ok_or_else(|| {
+                                "mode looks like \"2560x1440@240\" (fractional works: \"2560x1080@100.002\")"
+                                    .to_string()
+                            })?,
                     );
                 }
                 "scale" => {

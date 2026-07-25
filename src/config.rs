@@ -890,13 +890,22 @@ impl PartialEq for Pattern {
     }
 }
 
+/// "2560x1440@240" or "2560x1080@100.002"; the refresh is kept in
+/// millihertz so fractional panel modes match the advertised timing
+/// instead of failing the parse
 pub(crate) fn parse_mode(s: &str) -> Option<(u32, u32, Option<u32>)> {
-    let (res, hz) = match s.split_once('@') {
-        Some((r, h)) => (r, Some(h.parse().ok()?)),
+    let (res, mhz) = match s.split_once('@') {
+        Some((r, h)) => {
+            let z: f64 = h.parse().ok()?;
+            if !z.is_finite() || z <= 0.0 || z > 10_000.0 {
+                return None;
+            }
+            (r, Some((z * 1000.0).round() as u32))
+        }
         None => (s, None),
     };
     let (w, h) = res.split_once('x')?;
-    Some((w.parse().ok()?, h.parse().ok()?, hz))
+    Some((w.parse().ok()?, h.parse().ok()?, mhz))
 }
 
 /// "Mod+Shift+Return" -> (mods with M_MOD placeholder, evdev code)
@@ -1181,6 +1190,17 @@ pub fn resolve_remap(
 mod tests {
     use super::kdl::parse;
     use super::*;
+
+    #[test]
+    fn modes_parse_in_millihertz_with_fractions() {
+        // an ultrawide's real panel mode; integer input keeps working
+        assert_eq!(parse_mode("2560x1080@100.002"), Some((2560, 1080, Some(100_002))));
+        assert_eq!(parse_mode("2560x1440@240"), Some((2560, 1440, Some(240_000))));
+        assert_eq!(parse_mode("3440x1440"), Some((3440, 1440, None)));
+        assert_eq!(parse_mode("2560x1440@0"), None);
+        assert_eq!(parse_mode("2560x1440@nan"), None);
+        assert_eq!(parse_mode("nonsense"), None);
+    }
 
     #[test]
     fn colors_reject_multibyte_instead_of_panicking() {

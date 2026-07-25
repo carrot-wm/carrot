@@ -124,17 +124,20 @@ impl Connector {
     /// preferred (first) mode
     fn pick_mode(&self, prefer: Option<(u32, u32, Option<u32>)>) -> Option<ModeInfo> {
         let modes = self.modes.borrow();
-        if let Some((w, h, hz)) = prefer {
+        if let Some((w, h, mhz)) = prefer {
             let mut best: Option<&ModeInfo> = None;
             for m in modes.iter() {
                 if m.hdisplay as u32 != w || m.vdisplay as u32 != h {
                     continue;
                 }
-                best = match (best, hz) {
+                best = match (best, mhz) {
                     (None, _) => Some(m),
-                    (Some(b), Some(hz)) => {
-                        let d_new = (m.vrefresh as i64 - hz as i64).abs();
-                        let d_old = (b.vrefresh as i64 - hz as i64).abs();
+                    // the config asks in millihertz; compare against each
+                    // mode's real timing, so "100.002" lands on the panel
+                    // mode it names instead of the integer neighbor
+                    (Some(b), Some(mhz)) => {
+                        let d_new = (mode_mhz(m) as i64 - mhz as i64).abs();
+                        let d_old = (mode_mhz(b) as i64 - mhz as i64).abs();
                         Some(if d_new < d_old { m } else { b })
                     }
                     // no refresh asked: the first (highest) match wins
@@ -147,7 +150,7 @@ impl Connector {
             eprintln!(
                 "carrot: {}: no advertised mode matches {w}x{h}{}; using preferred",
                 self.name,
-                hz.map(|z| format!("@{z}")).unwrap_or_default()
+                mhz.map(|z| format!("@{:.3}", z as f64 / 1000.0)).unwrap_or_default()
             );
         }
         modes.first().copied()
@@ -608,6 +611,13 @@ impl Connector {
     }
 }
 
+/// a mode's real refresh in millihertz, from its timing; the integer
+/// vrefresh the kernel reports rounds fractional panels to their
+/// neighbor and cannot tell 100.002 from 100
+fn mode_mhz(m: &ModeInfo) -> u32 {
+    (m.clock as u64 * 1_000_000 / (m.htotal as u64 * m.vtotal as u64).max(1)) as u32
+}
+
 fn set_plane(ch: &mut Change, plane: &Plane, crtc_id: ObjId, fb: u32, mode: &ModeInfo) {
     let w = mode.hdisplay as u64;
     let h = mode.vdisplay as u64;
@@ -951,6 +961,23 @@ mod tests {
             zpos,
             crtc: Cell::new(ObjId(0)),
         })
+    }
+
+    #[test]
+    fn a_modes_millihertz_comes_from_its_timing_not_vrefresh() {
+        // a 100.002Hz panel rounds to vrefresh 100; the timing knows better
+        let m = ModeInfo {
+            clock: 100_002,
+            htotal: 1000,
+            vtotal: 1000,
+            vrefresh: 100,
+            ..Default::default()
+        };
+        assert_eq!(mode_mhz(&m), 100_002);
+        let m = ModeInfo { clock: 240_000, htotal: 1000, vtotal: 1000, ..Default::default() };
+        assert_eq!(mode_mhz(&m), 240_000);
+        // degenerate timing must not divide by zero
+        assert_eq!(mode_mhz(&ModeInfo::default()), 0);
     }
 
     #[test]
