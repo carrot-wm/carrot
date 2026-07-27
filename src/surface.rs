@@ -105,8 +105,19 @@ pub struct WlSurface {
     pub(crate) transform: Cell<Transform>,
     pub(crate) buf_x: Cell<i32>,
     pub(crate) buf_y: Cell<i32>,
-    /// logical size after transform swap and scale ceil-div
+    /// logical size after transform swap and scale ceil-div, then crop and
+    /// scale if a wp_viewport is set
     pub(crate) size: Cell<(i32, i32)>,
+    /// wp_viewporter crop and scale, applied at commit. src is in the
+    /// coordinates that would be surface-local without the viewport
+    pub(crate) viewport_src: Cell<Option<crate::protocol::viewport::Src>>,
+    pub(crate) viewport_dst: Cell<Option<(i32, i32)>>,
+    /// double-buffered halves: outer Some = the client touched it this
+    /// cycle, inner None = unset
+    pub(crate) pending_viewport_src: Cell<Option<Option<crate::protocol::viewport::Src>>>,
+    pub(crate) pending_viewport_dst: Cell<Option<Option<(i32, i32)>>>,
+    /// the surface's wp_viewport, for viewport_exists and apply-time errors
+    pub(crate) viewport: RefCell<std::rc::Weak<crate::protocol::viewport::Viewport>>,
     /// own rect union child extents, in local coords
     pub(crate) extents: Cell<Rect>,
     pub(crate) frame_callbacks: RefCell<Vec<FrameCallback>>,
@@ -149,6 +160,11 @@ impl WlSurface {
             buf_y: Cell::new(0),
             size: Cell::new((0, 0)),
             extents: Cell::new(Rect::default()),
+            viewport_src: Cell::new(None),
+            viewport_dst: Cell::new(None),
+            pending_viewport_src: Cell::new(None),
+            pending_viewport_dst: Cell::new(None),
+            viewport: RefCell::new(std::rc::Weak::new()),
             frame_callbacks: RefCell::new(Vec::new()),
             latched_feedbacks: RefCell::new(Vec::new()),
             tearing: Cell::new(false),

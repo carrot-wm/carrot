@@ -340,8 +340,17 @@ impl WlSurface {
             self.buf_x.set(self.buf_x.get() + pending.offset.0);
             self.buf_y.set(self.buf_y.get() + pending.offset.1);
         }
-        // logical size: swap for 90/270 transforms, ceil-div by scale
-        let size = match &*self.buffer.borrow() {
+        // crop and scale land after buffer_transform and buffer_scale, which
+        // is exactly the order the protocol specifies
+        if let Some(v) = self.pending_viewport_src.take() {
+            self.viewport_src.set(v);
+        }
+        if let Some(v) = self.pending_viewport_dst.take() {
+            self.viewport_dst.set(v);
+        }
+        // content size: swap for 90/270 transforms, ceil-div by scale. this
+        // is the coordinate space a viewport's source rectangle is given in
+        let content = match &*self.buffer.borrow() {
             Some(b) => {
                 let (mut w, mut h) = (b.buf.rect.width(), b.buf.rect.height());
                 if self.transform.get().swaps_dimensions() {
@@ -349,12 +358,26 @@ impl WlSurface {
                 }
                 let s = self.scale.get().max(1);
                 // i32::div_ceil is still unstable; dims are non-negative
-                (
+                Some((
                     (w as u32).div_ceil(s as u32) as i32,
                     (h as u32).div_ceil(s as u32) as i32,
-                )
+                ))
             }
-            None => (0, 0),
+            None => None,
+        };
+        let size = match crate::protocol::viewport::viewport_size(
+            self.viewport_src.get(),
+            self.viewport_dst.get(),
+            content,
+        ) {
+            Ok(sz) => sz,
+            Err(e) => {
+                // the spec raises these when the state is applied, not when
+                // it is requested: the buffer it is judged against is only
+                // known now
+                crate::protocol::viewport::post_apply_error(self, e);
+                content.unwrap_or((0, 0))
+            }
         };
         self.size.set(size);
         // mapping follows the committed buffer; role hooks refine it

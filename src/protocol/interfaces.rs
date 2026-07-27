@@ -457,6 +457,19 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface wp_viewporter, version = 1;
+    request destroy();
+    request get_viewport(id: new_id, surface: object);
+}
+
+crate::wl_protocol! {
+    interface wp_viewport, version = 1;
+    request destroy();
+    request set_source(x: fixed, y: fixed, width: fixed, height: fixed);
+    request set_destination(width: int, height: int);
+}
+
+crate::wl_protocol! {
     interface zwp_linux_dmabuf_v1, version = 4;
     request destroy();
     request create_params(params_id: new_id);
@@ -903,6 +916,9 @@ mod tests {
         assert_eq!(ext_image_copy_capture_cursor_session_v1::leave::OPCODE, 1);
         assert_eq!(ext_image_copy_capture_cursor_session_v1::position::OPCODE, 2);
         assert_eq!(ext_image_copy_capture_cursor_session_v1::hotspot::OPCODE, 3);
+        assert_eq!(wp_viewporter::get_viewport::OPCODE, 1);
+        assert_eq!(wp_viewport::set_source::OPCODE, 1);
+        assert_eq!(wp_viewport::set_destination::OPCODE, 2);
         assert_eq!(zwp_linux_dmabuf_v1::create_params::OPCODE, 1);
         assert_eq!(zwp_linux_dmabuf_v1::get_default_feedback::OPCODE, 2);
         assert_eq!(zwp_linux_dmabuf_v1::get_surface_feedback::OPCODE, 3);

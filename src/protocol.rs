@@ -22,6 +22,7 @@ pub mod relative_pointer;
 pub mod screencopy;
 pub mod shm;
 pub mod tearing;
+pub mod viewport;
 pub mod wire;
 pub mod xdg_activation;
 
