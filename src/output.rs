@@ -2176,6 +2176,11 @@ fn fs_surface_candidate(
     if surface.transform.get() != crate::surface::Transform::Normal || surface.scale.get() != 1 {
         veto!("transform or scale");
     }
+    // direct scanout puts the whole buffer on the plane 1:1; a crop or a
+    // scale is exactly the case where that is the wrong picture
+    if surface.viewport_src.get().is_some() || surface.viewport_dst.get().is_some() {
+        veto!("viewport crop or scale");
+    }
     let Some(buf) = surface.buffer.borrow().as_ref().map(|b| b.buf.clone()) else {
         veto!("no buffer");
     };
@@ -3898,13 +3903,32 @@ fn draw_buffer(
         (vis.width()) as f32 / out.width as f32 * 2.0,
         (vis.height()) as f32 / out.height as f32 * 2.0,
     ];
+    // a wp_viewport source rectangle narrows what we sample. it is given in
+    // post-transform, post-scale coordinates, so normalise it against the
+    // content size in those same coordinates; the texture itself is always
+    // [0,1] over the whole buffer
+    let (uv0, uvs) = match s.viewport_src.get() {
+        Some((sx, sy, srcw, srch)) => {
+            let (mut cw, mut ch) = (bw as f64, bh as f64);
+            if s.transform.get().swaps_dimensions() {
+                std::mem::swap(&mut cw, &mut ch);
+            }
+            let sc = s.scale.get().max(1) as f64;
+            let (cw, ch) = ((cw / sc).max(1.0), (ch / sc).max(1.0));
+            (
+                [(sx / cw) as f32, (sy / ch) as f32],
+                [(srcw / cw) as f32, (srch / ch) as f32],
+            )
+        }
+        None => ([0.0, 0.0], [1.0, 1.0]),
+    };
     let uv_pos = [
-        (vis.x1 - dst.x1) as f32 / sw as f32,
-        (vis.y1 - dst.y1) as f32 / sh as f32,
+        uv0[0] + (vis.x1 - dst.x1) as f32 / sw as f32 * uvs[0],
+        uv0[1] + (vis.y1 - dst.y1) as f32 / sh as f32 * uvs[1],
     ];
     let uv_size = [
-        vis.width() as f32 / sw as f32,
-        vis.height() as f32 / sh as f32,
+        vis.width() as f32 / sw as f32 * uvs[0],
+        vis.height() as f32 / sh as f32 * uvs[1],
     ];
     if round >= 0.5 {
         // clip corners against the window geometry, not this quad
