@@ -1343,7 +1343,7 @@ fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>, 
             }
         }
         if let Some(old) = out.cursor_tex.borrow_mut().replace(tex) {
-            out.renderer.destroy_texture(&old);
+            out.renderer.retire_texture(old);
         }
         out.cursor_gen.set(d.sw_gen.get());
     }
@@ -1663,10 +1663,10 @@ fn rescan(state: &Rc<State>) {
             out.conn.pipe_torn_down();
         }
         for (_, (t, _)) in out.textures.borrow_mut().drain() {
-            out.renderer.destroy_texture(&t);
+            out.renderer.retire_texture(t);
         }
         for t in out.retired_tex.borrow_mut().drain(..) {
-            out.renderer.destroy_texture(&t);
+            out.renderer.retire_texture(t);
         }
         eprintln!("carrot: output {} disconnected", out.conn.name);
     }
@@ -2851,13 +2851,10 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             }
         }
 
-        // everything gated on the render fence retires off-loop
-        let retired = if sync.is_some() {
-            std::mem::take(&mut *out.retired_tex.borrow_mut())
-        } else {
-            // no fence to wait: keep them for the next round, like before
-            Vec::new()
-        };
+        // everything gated on the render fence retires off-loop; the yard
+        // gates the actual destruction on fence proof either way, so a
+        // failed fd export no longer strands the batch here
+        let retired = std::mem::take(&mut *out.retired_tex.borrow_mut());
         out.gpu_done.push(CleanupJob { frame, sync, retired, submit_ns, flight });
     }
 }
@@ -3142,7 +3139,9 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
 async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
     loop {
         let CleanupJob { frame, sync, retired, submit_ns, flight } = out.gpu_done.pop().await;
-        let completed = sync.is_some();
+        // into the yard before any await: a cancellation mid-wait can no
+        // longer strand these, and the yard only frees on fence proof
+        out.renderer.retire_textures_at(frame.seq(), retired);
         if let Some(fd) = &sync {
             let _ = state.ring.readable(fd).await;
             // the gpu-tail sample for the latch scheduler; capped so a
@@ -3150,15 +3149,12 @@ async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
             let tail = Time::now().nsec().saturating_sub(submit_ns);
             Sched::ewma(&out.sched.ewma_gpu, tail.min(50_000_000));
         }
-        if completed {
-            for t in &retired {
-                out.renderer.destroy_texture(t);
-            }
-        }
-        // frame done: the guard's drop releases the retire batches
-        // parked while this frame flew
+        // deliberate policy split: client buffers release even unproven
+        // (withholding wedges swapchains; transient corruption under a
+        // wedged driver beats a dead session), while the vk objects sit
+        // in the yard until the fence proves out
         drop(flight);
-        out.renderer.recycle_frame(frame);
+        out.renderer.retire_frame(frame);
         // pending output captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
         crate::protocol::session_lock::output_presented(state, &out.conn.name);

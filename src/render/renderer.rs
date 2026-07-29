@@ -273,6 +273,9 @@ struct UploadSlot {
     ptr: *mut u8,
     /// pool a from-import copy reads; held until the fence says done
     pool: Option<Rc<crate::clientmem::ClientMem>>,
+    /// submission number of the last copy; uploads share the frame seq
+    /// space so retired textures can prove out against them too
+    seq: u64,
 }
 
 impl UploadSlot {
@@ -296,6 +299,7 @@ impl UploadSlot {
             cap: 0,
             ptr: std::ptr::null_mut(),
             pool: None,
+            seq: 0,
         })
     }
 }
@@ -323,34 +327,88 @@ struct CaptureTarget {
     height: u32,
 }
 
-/// a submitted frame. wait() is for bring-up and captures; the present
-/// loop exports the fence instead and never blocks.
-pub struct Frame {
+/// fence-proven deferred destruction, shared by every output on the card.
+/// passive storage only: destruction happens in Renderer methods, never
+/// here, so frames can park from Drop with no device in reach
+struct FrameYard {
+    /// stamped per successful queue_submit2 on the card's one queue
+    submit_seq: Cell<u64>,
+    /// highest seq proven signaled; one queue means fences signal in
+    /// submission order, so this proves everything at or below it
+    done_seq: Cell<u64>,
+    /// frames not yet proven signaled: parked captures, cancelled cleanup
+    /// jobs, anything dropped mid-await
+    frames: RefCell<Vec<FrameInner>>,
+    /// textures whose last sampler may still fly; destroyed once done_seq
+    /// passes the seq they retired at
+    textures: RefCell<Vec<(u64, Texture)>>,
+}
+
+/// the vulkan objects a submitted frame owns; parks whole in the yard
+struct FrameInner {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     waits: Vec<vk::Semaphore>,
     staging: Vec<PreUpload>,
     /// the pool a fast-path copy reads; pinned until the frame retires
     pool: Option<Rc<crate::clientmem::ClientMem>>,
+    seq: u64,
+}
+
+/// a submitted frame. wait() is for bring-up and captures; the present
+/// loop exports the fence instead and never blocks. dropping a frame
+/// anywhere - cancelled task, error path - parks its resources in the
+/// yard; a later reap destroys them once the fence proves out. no path
+/// can destroy in-flight objects or leak them
+pub struct Frame {
+    inner: Option<FrameInner>,
+    yard: Rc<FrameYard>,
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if let Some(i) = self.inner.take() {
+            self.yard.frames.borrow_mut().push(i);
+        }
+    }
 }
 
 impl Frame {
+    fn inner(&self) -> &FrameInner {
+        self.inner.as_ref().expect("frame accessed after retire")
+    }
+
+    /// submission number on the card's queue; texture retires key on it
+    pub fn seq(&self) -> u64 {
+        self.inner().seq
+    }
+
     pub fn export_sync_file(&self, r: &Renderer) -> Result<OwnedFd, RenderError> {
         let info = vk::FenceGetFdInfoKHR::default()
-            .fence(self.fence)
+            .fence(self.inner().fence)
             .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
         let fd = unsafe { r.core.ext_fence_fd.get_fence_fd(&info) }?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    pub fn wait(self, r: &Renderer) -> Result<(), RenderError> {
-        unsafe {
+    pub fn wait(mut self, r: &Renderer) -> Result<(), RenderError> {
+        let inner = self.inner.take().unwrap();
+        match unsafe {
             r.core
                 .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+                .wait_for_fences(&[inner.fence], true, u64::MAX)
+        } {
+            Ok(()) => {
+                r.recycle(inner);
+                Ok(())
+            }
+            Err(e) => {
+                // no proof the gpu is done: the yard holds everything
+                // rather than destroy under a possibly live batch
+                self.yard.frames.borrow_mut().push(inner);
+                Err(e.into())
+            }
         }
-        r.recycle(self);
-        Ok(())
     }
 }
 
@@ -372,6 +430,10 @@ struct Pipelines {
 
 pub struct Renderer {
     pub core: Rc<VkCore>,
+    /// fence-proven deferred destruction for frames and retired textures;
+    /// a transient stall costs dropped captures, never the session, and
+    /// teardown can never destroy what the gpu still samples
+    yard: Rc<FrameYard>,
     format: vk::Format,
     sampler: vk::Sampler,
     tex_set_layout: vk::DescriptorSetLayout,
@@ -546,6 +608,12 @@ impl Renderer {
 
         Ok(Renderer {
             core: core.clone(),
+            yard: Rc::new(FrameYard {
+                submit_seq: Cell::new(0),
+                done_seq: Cell::new(0),
+                frames: RefCell::new(Vec::new()),
+                textures: RefCell::new(Vec::new()),
+            }),
             format,
             sampler,
             tex_set_layout,
@@ -624,11 +692,7 @@ impl Renderer {
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
-        let dev = &self.core.device;
-        let cb = self.take_cb()?;
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        let cb = self.open_batch(&waits, &uploads)?;
         self.record_pre(cb, &uploads, &passes);
 
         // take the target from the display side, hand it back after
@@ -655,7 +719,6 @@ impl Renderer {
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
             );
         self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
-        unsafe { dev.end_command_buffer(cb) }?;
         self.submit_frame(cb, waits, uploads, None)
     }
 
@@ -672,10 +735,7 @@ impl Renderer {
         waits: Vec<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
-        let cb = self.take_cb()?;
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        let cb = self.open_batch(&waits, &[])?;
         // take the target from the display side, hand it back after
         let acquire = [image_barrier(target.image)
             .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
@@ -719,7 +779,6 @@ impl Renderer {
             .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
         barrier2(dev, cb, &release);
-        unsafe { dev.end_command_buffer(cb) }?;
         self.submit_frame(cb, waits, Vec::new(), Some(pool.clone()))
     }
 
@@ -820,10 +879,23 @@ impl Renderer {
         pool: Option<Rc<crate::clientmem::ClientMem>>,
     ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
+        // the cb closes here so every failure between recording and the
+        // queue lands in the one net below: waits, staging and the cb
+        // all recover on every arm
+        if let Err(e) = unsafe { dev.end_command_buffer(cb) } {
+            self.abort_submit(cb, &waits, &staging, None);
+            return Err(e.into());
+        }
         let mut export = vk::ExportFenceCreateInfo::default()
             .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
         let fence_info = vk::FenceCreateInfo::default().push_next(&mut export);
-        let fence = unsafe { dev.create_fence(&fence_info, None) }?;
+        let fence = match unsafe { dev.create_fence(&fence_info, None) } {
+            Ok(f) => f,
+            Err(e) => {
+                self.abort_submit(cb, &waits, &staging, None);
+                return Err(e.into());
+            }
+        };
 
         let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let wait_infos: Vec<_> = waits
@@ -839,22 +911,85 @@ impl Renderer {
             .wait_semaphore_infos(&wait_infos);
         let res = unsafe { dev.queue_submit2(self.core.queue, &[submit], fence) };
         if let Err(e) = res {
-            unsafe {
-                dev.destroy_fence(fence, None);
-                for s in &waits {
-                    dev.destroy_semaphore(*s, None);
-                }
-                for u in &staging {
-                    if u.owned {
-                        dev.destroy_buffer(u.buffer, None);
-                        dev.free_memory(u.memory, None);
-                    }
-                }
-            }
-            self.free_cbs.borrow_mut().push(cb);
+            eprintln!("carrot: vulkan: frame queue_submit2 failed: {e:?}");
+            self.abort_submit(cb, &waits, &staging, Some(fence));
             return Err(e.into());
         }
-        Ok(Frame { cb, fence, waits, staging, pool })
+        let seq = self.yard.submit_seq.get() + 1;
+        self.yard.submit_seq.set(seq);
+        Ok(Frame {
+            inner: Some(FrameInner { cb, fence, waits, staging, pool, seq }),
+            yard: self.yard.clone(),
+        })
+    }
+
+    /// a batch that will never reach the queue hands back what it owns:
+    /// imported wait semaphores and owned staging. the near-side twin of
+    /// abort_submit, for failures before a cb even opens
+    fn release_batch(&self, waits: &[vk::Semaphore], staging: &[PreUpload]) {
+        unsafe {
+            for s in waits {
+                self.core.device.destroy_semaphore(*s, None);
+            }
+            for u in staging {
+                if u.owned {
+                    self.core.device.destroy_buffer(u.buffer, None);
+                    self.core.device.free_memory(u.memory, None);
+                }
+            }
+        }
+    }
+
+    /// take and open a cb for a batch. every frame submit funnels through
+    /// here so no early failure can drop the batch's semaphores or
+    /// staging on the floor - the error escapes, the objects never do
+    fn open_batch(
+        &self,
+        waits: &[vk::Semaphore],
+        staging: &[PreUpload],
+    ) -> Result<vk::CommandBuffer, RenderError> {
+        let cb = match self.take_cb() {
+            Ok(cb) => cb,
+            Err(e) => {
+                self.release_batch(waits, staging);
+                return Err(e);
+            }
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if let Err(e) = unsafe { self.core.device.begin_command_buffer(cb, &begin) } {
+            self.free_cbs.borrow_mut().push(cb);
+            self.release_batch(waits, staging);
+            return Err(e.into());
+        }
+        Ok(cb)
+    }
+
+    /// everything a would-be frame owns, recovered: semaphores and owned
+    /// staging destroyed and the cb recycled, never dropped on the floor
+    fn abort_submit(
+        &self,
+        cb: vk::CommandBuffer,
+        waits: &[vk::Semaphore],
+        staging: &[PreUpload],
+        fence: Option<vk::Fence>,
+    ) {
+        let dev = &self.core.device;
+        unsafe {
+            if let Some(f) = fence {
+                dev.destroy_fence(f, None);
+            }
+            for s in waits {
+                dev.destroy_semaphore(*s, None);
+            }
+            for u in staging {
+                if u.owned {
+                    dev.destroy_buffer(u.buffer, None);
+                    dev.free_memory(u.memory, None);
+                }
+            }
+        }
+        self.free_cbs.borrow_mut().push(cb);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1282,7 +1417,9 @@ impl Renderer {
         let submit = vk::SubmitInfo2::default().command_buffer_infos(&cbs);
         let out = unsafe {
             dev.queue_submit2(self.core.queue, &[submit], fence)
+                .inspect_err(|e| eprintln!("carrot: vulkan: readback submit failed: {e:?}"))
                 .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX))
+                .inspect_err(|e| eprintln!("carrot: vulkan: readback wait failed: {e:?}"))
                 .map(|_| {
                     let ptr = dev
                         .map_memory(mem, 0, size, vk::MemoryMapFlags::empty())
@@ -1331,25 +1468,78 @@ impl Renderer {
         Ok(unsafe { self.core.device.allocate_command_buffers(&alloc) }?[0])
     }
 
-    /// async path: call once the frame's fence is known signaled
-    pub fn recycle_frame(&self, frame: Frame) {
-        self.recycle(frame);
+    /// async path: recycle when the fence proves signaled, park in the
+    /// yard otherwise, then reap whatever else has since proven out. the
+    /// cleanup loop's per-frame call is what keeps the yard draining
+    pub fn retire_frame(&self, mut frame: Frame) {
+        if let Some(inner) = frame.inner.take() {
+            let done =
+                unsafe { self.core.device.get_fence_status(inner.fence) }.unwrap_or(false);
+            if done {
+                self.recycle(inner);
+            } else {
+                self.yard.frames.borrow_mut().push(inner);
+            }
+        }
+        self.reap();
     }
 
-    fn recycle(&self, frame: Frame) {
+    /// destroy a proven-out frame's objects. callers guarantee the fence
+    /// was observed signaled; on the card's one queue that also proves
+    /// every submission at or below its seq
+    fn recycle(&self, f: FrameInner) {
+        if f.seq > self.yard.done_seq.get() {
+            self.yard.done_seq.set(f.seq);
+        }
         unsafe {
-            self.core.device.destroy_fence(frame.fence, None);
-            for s in &frame.waits {
+            self.core.device.destroy_fence(f.fence, None);
+            for s in &f.waits {
                 self.core.device.destroy_semaphore(*s, None);
             }
-            for u in &frame.staging {
+            for u in &f.staging {
                 if u.owned {
                     self.core.device.destroy_buffer(u.buffer, None);
                     self.core.device.free_memory(u.memory, None);
                 }
             }
         }
-        self.free_cbs.borrow_mut().push(frame.cb);
+        self.free_cbs.borrow_mut().push(f.cb);
+        self.drain_yard_textures();
+    }
+
+    /// retire a texture the gpu may still sample: destroyed on the spot
+    /// when every submission is proven done, parked on the current seq
+    /// otherwise. the only public destruction path for cached textures
+    pub fn retire_texture(&self, tex: Texture) {
+        self.retire_textures_at(self.yard.submit_seq.get(), vec![tex]);
+    }
+
+    /// same, keyed to a known frame's seq (its batch was the last that
+    /// could sample these)
+    pub fn retire_textures_at(&self, seq: u64, texs: Vec<Texture>) {
+        let done = self.yard.done_seq.get();
+        let mut parked = self.yard.textures.borrow_mut();
+        for tex in texs {
+            if seq <= done {
+                self.destroy_texture(&tex);
+            } else {
+                parked.push((seq, tex));
+            }
+        }
+    }
+
+    fn drain_yard_textures(&self) {
+        let done = self.yard.done_seq.get();
+        let mut texs = self.yard.textures.borrow_mut();
+        let mut i = 0;
+        while i < texs.len() {
+            if texs[i].0 <= done {
+                let (_, tex) = texs.swap_remove(i);
+                self.destroy_texture(&tex);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     // -- textures (shm upload path) --
@@ -1469,7 +1659,10 @@ impl Renderer {
         })
     }
 
-    pub fn destroy_texture(&self, tex: &Texture) {
+    /// immediate destruction; private on purpose. everything outside the
+    /// renderer goes through retire_texture, which defers until the
+    /// fence-proven seq says no submitted batch can still sample this
+    fn destroy_texture(&self, tex: &Texture) {
         unsafe {
             self.core.device.destroy_image_view(tex.view, None);
             self.core.device.destroy_image(tex.image, None);
@@ -1696,6 +1889,34 @@ impl Renderer {
         }
     }
 
+    /// prove and destroy whatever the yard holds. upload-slot fences fold
+    /// into done_seq too: a card whose last submission was a commit-time
+    /// upload must still be able to drain its retired textures
+    pub fn reap(&self) {
+        for s in self.upload_slots.borrow().iter() {
+            if s.seq > self.yard.done_seq.get()
+                && unsafe { self.core.device.get_fence_status(s.fence) }.unwrap_or(false)
+            {
+                self.yard.done_seq.set(s.seq);
+            }
+        }
+        if !self.yard.frames.borrow().is_empty() {
+            let lot: Vec<FrameInner> = self.yard.frames.borrow_mut().drain(..).collect();
+            let mut still = Vec::new();
+            for f in lot {
+                let done =
+                    unsafe { self.core.device.get_fence_status(f.fence) }.unwrap_or(false);
+                if done {
+                    self.recycle(f);
+                } else {
+                    still.push(f);
+                }
+            }
+            self.yard.frames.borrow_mut().extend(still);
+        }
+        self.drain_yard_textures();
+    }
+
     /// render pending uploads/pre-passes + ops offscreen and read the
     /// pixels back as tightly packed rows. one submit, one fence wait;
     /// the target and readback buffer persist across calls.
@@ -1710,13 +1931,13 @@ impl Renderer {
         waits: Vec<vk::Semaphore>,
     ) -> Result<Vec<u8>, RenderError> {
         let dev = &self.core.device;
-        self.ensure_capture(w, h)?;
+        if let Err(e) = self.ensure_capture(w, h) {
+            self.release_batch(&waits, &uploads);
+            return Err(e);
+        }
         let slot = self.capture.borrow();
         let cap = slot.as_ref().unwrap();
-        let cb = self.take_cb()?;
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        let cb = self.open_batch(&waits, &uploads)?;
         self.record_pre(cb, &uploads, &passes);
         // every capture clears, so the old contents can be discarded; the
         // previous read finished before the last call returned
@@ -1750,7 +1971,6 @@ impl Renderer {
                 cap.buffer,
                 &[region],
             );
-            dev.end_command_buffer(cb)?;
         }
         let frame = self.submit_frame(cb, waits, uploads, None)?;
         frame.wait(self)?;
@@ -2163,7 +2383,14 @@ impl Renderer {
         slot.pool = None;
         let (cb, fence, buf) = (slot.cb, slot.fence, slot.buf);
         drop(slots);
-        self.record_and_submit_upload(cb, fence, tex, buf, 0, 0)?;
+        let seq = match self.record_and_submit_upload(cb, fence, tex, buf, 0, 0) {
+            Ok(s) => s,
+            Err(e) => {
+                self.recover_upload_slot(idx);
+                return Err(e);
+            }
+        };
+        self.upload_slots.borrow_mut()[idx].seq = seq;
         Ok(true)
     }
 
@@ -2198,10 +2425,49 @@ impl Renderer {
         slots[idx].pool = Some(src_pool.clone());
         let (cb, fence) = (slots[idx].cb, slots[idx].fence);
         drop(slots);
-        self.record_and_submit_upload(cb, fence, tex, src, offset, row_texels)?;
+        let seq = match self.record_and_submit_upload(cb, fence, tex, src, offset, row_texels) {
+            Ok(s) => s,
+            Err(e) => {
+                self.recover_upload_slot(idx);
+                return Err(e);
+            }
+        };
+        self.upload_slots.borrow_mut()[idx].seq = seq;
         Ok(true)
     }
 
+    /// a failed upload leaves its slot's fence reset with nothing left to
+    /// signal it: dead for the renderer's life, pinning any pool it held.
+    /// restore the invariant (fence signaled = slot free) with a fresh
+    /// signaled fence; if even that fails, the slot dies whole instead of
+    /// lingering half-alive
+    fn recover_upload_slot(&self, idx: usize) {
+        let dev = &self.core.device;
+        let mut slots = self.upload_slots.borrow_mut();
+        let Some(slot) = slots.get_mut(idx) else { return };
+        slot.pool = None;
+        unsafe {
+            dev.destroy_fence(slot.fence, None);
+        }
+        let signaled =
+            vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        match unsafe { dev.create_fence(&signaled, None) } {
+            Ok(f) => slot.fence = f,
+            Err(e) => {
+                eprintln!("carrot: upload slot lost ({e}); continuing with fewer");
+                let dead = slots.remove(idx);
+                unsafe {
+                    if dead.buf != vk::Buffer::null() {
+                        dev.destroy_buffer(dead.buf, None);
+                        dev.free_memory(dead.mem, None);
+                    }
+                }
+                self.free_cbs.borrow_mut().push(dead.cb);
+            }
+        }
+    }
+
+    /// returns the submission seq the copy was stamped with
     fn record_and_submit_upload(
         &self,
         cb: vk::CommandBuffer,
@@ -2210,7 +2476,7 @@ impl Renderer {
         src: vk::Buffer,
         offset: u64,
         row_texels: u32,
-    ) -> Result<(), RenderError> {
+    ) -> Result<u64, RenderError> {
         let dev = &self.core.device;
         unsafe {
             dev.begin_command_buffer(
@@ -2266,10 +2532,13 @@ impl Renderer {
             dev.reset_fences(&[fence])?;
             let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
             let submit = vk::SubmitInfo2::default().command_buffer_infos(&cbs);
-            dev.queue_submit2(self.core.queue, &[submit], fence)?;
+            dev.queue_submit2(self.core.queue, &[submit], fence)
+                .inspect_err(|e| eprintln!("carrot: vulkan: texture upload submit failed: {e:?}"))?;
         }
         tex.undefined.set(false);
-        Ok(())
+        let seq = self.yard.submit_seq.get() + 1;
+        self.yard.submit_seq.set(seq);
+        Ok(seq)
     }
 }
 
@@ -2287,21 +2556,52 @@ pub struct Texture {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let dev = &self.core.device;
-        if let Some(c) = self.capture.borrow_mut().take() {
-            unsafe {
-                let _ = dev.device_wait_idle();
-            }
-            self.destroy_capture(&c);
-        }
         unsafe {
             let _ = dev.device_wait_idle();
+        }
+        if let Some(c) = self.capture.borrow_mut().take() {
+            self.destroy_capture(&c);
+        }
+        // idle proven: everything the yard was minding is safe to free
+        for f in self.yard.frames.borrow_mut().drain(..) {
+            unsafe {
+                dev.destroy_fence(f.fence, None);
+                for s in &f.waits {
+                    dev.destroy_semaphore(*s, None);
+                }
+                for u in &f.staging {
+                    if u.owned {
+                        dev.destroy_buffer(u.buffer, None);
+                        dev.free_memory(u.memory, None);
+                    }
+                }
+            }
+        }
+        for (_, tex) in self.yard.textures.borrow_mut().drain(..) {
+            self.destroy_texture(&tex);
+        }
+        unsafe {
             dev.destroy_pipeline(self.pipes.fill_opaque, None);
             dev.destroy_pipeline(self.pipes.fill_blend, None);
             dev.destroy_pipeline(self.pipes.tex_opaque, None);
             dev.destroy_pipeline(self.pipes.tex_blend, None);
+            dev.destroy_pipeline(self.pipes.texr_blend, None);
+            dev.destroy_pipeline(self.pipes.border_blend, None);
+            dev.destroy_pipeline(self.pipes.shadow_blend, None);
+            dev.destroy_pipeline(self.pipes.xfade_blend, None);
+            dev.destroy_pipeline(self.pipes.blur_down, None);
+            dev.destroy_pipeline(self.pipes.blur_up, None);
+            dev.destroy_pipeline(self.pipes.blur_mask_blend, None);
             dev.destroy_pipeline_layout(self.fill_layout, None);
             dev.destroy_pipeline_layout(self.tex_layout, None);
+            dev.destroy_pipeline_layout(self.texr_layout, None);
+            dev.destroy_pipeline_layout(self.xfade_layout, None);
+            dev.destroy_pipeline_layout(self.blur_layout, None);
+            dev.destroy_pipeline_layout(self.blur_mask_layout, None);
+            dev.destroy_pipeline_layout(self.border_layout, None);
+            dev.destroy_pipeline_layout(self.shadow_layout, None);
             dev.destroy_descriptor_set_layout(self.tex_set_layout, None);
+            dev.destroy_descriptor_set_layout(self.xfade_set_layout, None);
             dev.destroy_sampler(self.sampler, None);
             for s in self.upload_slots.borrow_mut().drain(..) {
                 if s.buf != vk::Buffer::null() {
