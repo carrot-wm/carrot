@@ -221,7 +221,6 @@ pub struct PrePass {
     view: vk::ImageView,
     width: u32,
     height: u32,
-    undefined: bool,
     clear: Option<[f32; 4]>,
     ops: Vec<RenderOp>,
 }
@@ -233,11 +232,9 @@ impl PrePass {
             view: tex.view,
             width: tex.width,
             height: tex.height,
-            undefined: tex.undefined.get(),
             clear,
             ops,
         };
-        tex.undefined.set(false);
         p
     }
 }
@@ -251,7 +248,6 @@ pub struct PreUpload {
     image: vk::Image,
     width: u32,
     height: u32,
-    undefined: bool,
     /// byte offset of the first pixel within `buffer`
     offset: u64,
     /// source row stride in texels; 0 = tightly packed
@@ -456,6 +452,10 @@ pub struct Renderer {
     sem_pool: RefCell<Vec<vk::Semaphore>>,
     upload_slots: RefCell<Vec<UploadSlot>>,
     host_imports: RefCell<HashMap<usize, HostImport>>,
+    /// imports awaiting their sampled-layout transition; the next record_pre
+    /// on this queue records it, and queue order puts it before every later
+    /// sampler
+    pending_sampled: RefCell<Vec<PendingTransition>>,
 }
 
 impl Renderer {
@@ -638,6 +638,7 @@ impl Renderer {
             sem_pool: RefCell::new(Vec::new()),
             upload_slots: RefCell::new(Vec::new()),
             host_imports: RefCell::new(HashMap::new()),
+            pending_sampled: RefCell::new(Vec::new()),
         })
     }
 
@@ -718,9 +719,11 @@ impl Renderer {
         waits: Vec<vk::Semaphore>,
         staging: Vec<PreUpload>,
         pool: Option<Rc<crate::clientmem::ClientMem>>,
+        transitions: Vec<PendingTransition>,
     ) -> Result<(Frame, Option<Rc<OwnedFd>>), RenderError> {
         let export_sem = self.export_semaphore();
-        let mut frame = match self.submit_frame(cb, waits, staging, pool, export_sem) {
+        let mut frame = match self.submit_frame(cb, waits, staging, pool, transitions, export_sem)
+        {
             Ok(f) => f,
             Err(e) => {
                 if let Some(sem) = export_sem {
@@ -762,7 +765,7 @@ impl Renderer {
         waits: Vec<vk::Semaphore>,
     ) -> Result<(Frame, Option<Rc<OwnedFd>>), RenderError> {
         let cb = self.open_batch(&waits, &uploads)?;
-        self.record_pre(cb, &uploads, &passes);
+        let transitions = self.record_pre(cb, &uploads, &passes);
 
         // take the target from the display side, hand it back after
         let acquire = image_barrier(target.image)
@@ -788,7 +791,7 @@ impl Renderer {
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
             );
         self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
-        self.submit_with_sync(cb, waits, uploads, None)
+        self.submit_with_sync(cb, waits, uploads, None, transitions)
     }
 
     /// a fullscreen client buffer becomes the whole frame: one
@@ -848,22 +851,47 @@ impl Renderer {
             .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
         barrier2(dev, cb, &release);
-        self.submit_with_sync(cb, waits, Vec::new(), Some(pool.clone()))
+        self.submit_with_sync(cb, waits, Vec::new(), Some(pool.clone()), Vec::new())
     }
 
     /// staging copies, then the offscreen pre-passes in list order
-    fn record_pre(&self, cb: vk::CommandBuffer, uploads: &[PreUpload], passes: &[PrePass]) {
+    fn record_pre(
+        &self,
+        cb: vk::CommandBuffer,
+        uploads: &[PreUpload],
+        passes: &[PrePass],
+    ) -> Vec<PendingTransition> {
         let dev = &self.core.device;
+        // fresh dmabuf imports transition here, ahead of every sampler in
+        // this and any later submit on the queue. the batch rides to
+        // submit_frame: a layout advances only when its submit succeeds
+        let imports: Vec<_> = std::mem::take(&mut *self.pending_sampled.borrow_mut())
+            .into_iter()
+            .filter(|t| t.layout.get() == TexLayout::Undefined)
+            .collect();
+        if !imports.is_empty() {
+            let to_sample: Vec<_> = imports
+                .iter()
+                .map(|t| {
+                    image_barrier(t.image)
+                        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                })
+                .collect();
+            barrier2(dev, cb, &to_sample);
+        }
         if !uploads.is_empty() {
             let to_dst: Vec<_> = uploads
                 .iter()
                 .map(|u| {
                     image_barrier(u.image)
-                        .old_layout(if u.undefined {
-                            vk::ImageLayout::UNDEFINED
-                        } else {
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                        })
+                        // the copy covers the whole image: a discard
+                        // acquire stays truthful even for a re-staged
+                        // upload whose first batch was dropped
+                        .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                         .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
@@ -915,11 +943,9 @@ impl Renderer {
             // src fragment stage: the previous frame (or an earlier pass)
             // may still be sampling this target when the writes start
             let acquire = image_barrier(p.image)
-                .old_layout(if p.undefined {
-                    vk::ImageLayout::UNDEFINED
-                } else {
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                })
+                // bake targets redraw fully every bake: discard acquire,
+                // truthful even for a batch dropped before submit
+                .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -936,24 +962,28 @@ impl Renderer {
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
             self.record_pass(cb, p.view, p.width, p.height, p.clear, &p.ops, acquire, release);
         }
+        imports
     }
 
     /// exportable fence so the commit path can take a sync_file; failure
-    /// releases everything the frame would have owned
+    /// releases everything the frame would have owned. recorded layout
+    /// transitions confirm here: success advances them, failure re-queues
+    /// them so a texture is never believed sampleable on the gpu's behalf
     fn submit_frame(
         &self,
         cb: vk::CommandBuffer,
         waits: Vec<vk::Semaphore>,
         staging: Vec<PreUpload>,
         pool: Option<Rc<crate::clientmem::ClientMem>>,
+        transitions: Vec<PendingTransition>,
         signal: Option<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
         // the cb closes here so every failure between recording and the
-        // queue lands in the one net below: waits, staging and the cb
-        // all recover on every arm
+        // queue lands in the one net below: waits, staging, the cb, and
+        // the transition batch all recover on every arm
         if let Err(e) = unsafe { dev.end_command_buffer(cb) } {
-            self.abort_submit(cb, &waits, &staging, None);
+            self.abort_submit(cb, &waits, &staging, transitions, None);
             return Err(e.into());
         }
         // plain, private fence: completion leaves the gpu only through the
@@ -963,7 +993,7 @@ impl Renderer {
         let fence = match unsafe { dev.create_fence(&fence_info, None) } {
             Ok(f) => f,
             Err(e) => {
-                self.abort_submit(cb, &waits, &staging, None);
+                self.abort_submit(cb, &waits, &staging, transitions, None);
                 return Err(e.into());
             }
         };
@@ -992,8 +1022,11 @@ impl Renderer {
         let res = unsafe { dev.queue_submit2(self.core.queue, &[submit], fence) };
         if let Err(e) = res {
             eprintln!("carrot: vulkan: frame queue_submit2 failed: {e:?}");
-            self.abort_submit(cb, &waits, &staging, Some(fence));
+            self.abort_submit(cb, &waits, &staging, transitions, Some(fence));
             return Err(e.into());
+        }
+        for t in &transitions {
+            t.layout.set(TexLayout::Ready);
         }
         let seq = self.yard.submit_seq.get() + 1;
         self.yard.submit_seq.set(seq);
@@ -1046,12 +1079,15 @@ impl Renderer {
     }
 
     /// everything a would-be frame owns, recovered: semaphores and owned
-    /// staging destroyed and the cb recycled, never dropped on the floor
+    /// staging destroyed, the cb recycled, and the transition batch back
+    /// on the pending index - a barrier that never reached the queue must
+    /// be re-recorded, never believed
     fn abort_submit(
         &self,
         cb: vk::CommandBuffer,
         waits: &[vk::Semaphore],
         staging: &[PreUpload],
+        transitions: Vec<PendingTransition>,
         fence: Option<vk::Fence>,
     ) {
         let dev = &self.core.device;
@@ -1070,6 +1106,7 @@ impl Renderer {
             }
         }
         self.free_cbs.borrow_mut().push(cb);
+        self.pending_sampled.borrow_mut().extend(transitions);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1608,6 +1645,10 @@ impl Renderer {
     /// same, keyed to a known frame's seq (its batch was the last that
     /// could sample these)
     pub fn retire_textures_at(&self, seq: u64, texs: Vec<Texture>) {
+        // purge now: a dangling pending transition must not outlive intent
+        self.pending_sampled
+            .borrow_mut()
+            .retain(|t| !texs.iter().any(|tex| t.image == tex.image));
         let done = self.yard.done_seq.get();
         let mut parked = self.yard.textures.borrow_mut();
         for tex in texs {
@@ -1695,7 +1736,7 @@ impl Renderer {
             view,
             width: w,
             height: h,
-            undefined: std::cell::Cell::new(true),
+            layout: Rc::new(std::cell::Cell::new(TexLayout::Ready)),
             uid: self.next_tex_uid(),
         })
     }
@@ -1745,7 +1786,7 @@ impl Renderer {
             view,
             width: w,
             height: h,
-            undefined: std::cell::Cell::new(true),
+            layout: Rc::new(std::cell::Cell::new(TexLayout::Ready)),
             uid: self.next_tex_uid(),
         })
     }
@@ -1754,6 +1795,9 @@ impl Renderer {
     /// renderer goes through retire_texture, which defers until the
     /// fence-proven seq says no submitted batch can still sample this
     fn destroy_texture(&self, tex: &Texture) {
+        // an import destroyed before any record_pre must not leave a
+        // dangling handle in the pending-transition list
+        self.pending_sampled.borrow_mut().retain(|t| t.image != tex.image);
         unsafe {
             self.core.device.destroy_image_view(tex.view, None);
             self.core.device.destroy_image(tex.image, None);
@@ -1879,8 +1923,13 @@ impl Renderer {
         let view_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image_view(view, None) });
 
         // the draw pass expects SHADER_READ_ONLY; linear has no metadata so a
-        // one-time transition stays valid across the client's rewrites
-        self.transition_sampled(image)?;
+        // one-time transition stays valid across the client's rewrites. it
+        // rides the next frame's own command buffer instead of a synchronous
+        // submit, so the import never stalls the engine thread
+        let layout = Rc::new(std::cell::Cell::new(TexLayout::Undefined));
+        self.pending_sampled
+            .borrow_mut()
+            .push(PendingTransition { image, layout: layout.clone() });
 
         std::mem::forget(view_guard);
         std::mem::forget(mem_guard);
@@ -1891,7 +1940,7 @@ impl Renderer {
             view,
             width: w,
             height: h,
-            undefined: std::cell::Cell::new(false),
+            layout,
             uid: self.next_tex_uid(),
         })
     }
@@ -2029,7 +2078,7 @@ impl Renderer {
         let slot = self.capture.borrow();
         let cap = slot.as_ref().unwrap();
         let cb = self.open_batch(&waits, &uploads)?;
-        self.record_pre(cb, &uploads, &passes);
+        let transitions = self.record_pre(cb, &uploads, &passes);
         // every capture clears, so the old contents can be discarded; the
         // previous read finished before the last call returned
         let acquire = image_barrier(cap.image)
@@ -2063,7 +2112,7 @@ impl Renderer {
                 &[region],
             );
         }
-        let frame = self.submit_frame(cb, waits, uploads, None, None)?;
+        let frame = self.submit_frame(cb, waits, uploads, None, transitions, None)?;
         frame.wait(self)?;
 
         let size = (w as u64) * (h as u64) * 4;
@@ -2074,41 +2123,6 @@ impl Renderer {
             dev.unmap_memory(cap.bmem);
         }
         Ok(out)
-    }
-
-    /// synchronous one-shot layout transition; import-time work, not the
-    /// frame loop
-    fn transition_sampled(&self, image: vk::Image) -> Result<(), RenderError> {
-        let dev = &self.core.device;
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(self.core.queue_family);
-        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
-        let pool_guard = crate::util::OnDrop(|| unsafe { dev.destroy_command_pool(pool, None) });
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cb = unsafe { dev.allocate_command_buffers(&alloc) }?[0];
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { dev.begin_command_buffer(cb, &begin) }?;
-        let barrier = image_barrier(image)
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        barrier2(dev, cb, &[barrier]);
-        unsafe { dev.end_command_buffer(cb) }?;
-        let cbs = [cb];
-        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-        unsafe {
-            dev.queue_submit(self.core.queue, &[submit], vk::Fence::null())?;
-            dev.queue_wait_idle(self.core.queue)?;
-        }
-        drop(pool_guard);
-        Ok(())
     }
 
     /// fill a staging buffer for the next submit; `fill` writes tightly
@@ -2150,13 +2164,11 @@ impl Renderer {
             image: tex.image,
             width: tex.width,
             height: tex.height,
-            undefined: tex.undefined.get(),
             offset: 0,
             row_texels: 0,
             owned: true,
             pool: None,
         };
-        tex.undefined.set(false);
         Ok(up)
     }
 
@@ -2177,13 +2189,11 @@ impl Renderer {
             image: tex.image,
             width: tex.width,
             height: tex.height,
-            undefined: tex.undefined.get(),
             offset,
             row_texels,
             owned: false,
             pool: Some(pool.clone()),
         };
-        tex.undefined.set(false);
         up
     }
 
@@ -2577,11 +2587,8 @@ impl Renderer {
             )?;
         }
         let to_dst = [image_barrier(tex.image)
-            .old_layout(if tex.undefined.get() {
-                vk::ImageLayout::UNDEFINED
-            } else {
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-            })
+            // the copy covers the whole image: discard acquire, always
+            .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
@@ -2626,11 +2633,27 @@ impl Renderer {
             dev.queue_submit2(self.core.queue, &[submit], fence)
                 .inspect_err(|e| eprintln!("carrot: vulkan: texture upload submit failed: {e:?}"))?;
         }
-        tex.undefined.set(false);
         let seq = self.yard.submit_seq.get() + 1;
         self.yard.submit_seq.set(seq);
         Ok(seq)
     }
+}
+
+/// gpu-side layout of a sampled import. barriers derive from this, and
+/// only a successful submit advances it: a transition recorded into a cb
+/// whose submit failed never happened, and the texture re-queues instead
+/// of being sampled in a layout the gpu never reached
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum TexLayout {
+    Undefined,
+    Ready,
+}
+
+/// an imported image awaiting its first-use transition; the index of
+/// every texture whose layout is still Undefined
+pub(crate) struct PendingTransition {
+    image: vk::Image,
+    layout: Rc<std::cell::Cell<TexLayout>>,
 }
 
 pub struct Texture {
@@ -2639,7 +2662,9 @@ pub struct Texture {
     pub view: vk::ImageView,
     pub width: u32,
     pub height: u32,
-    undefined: std::cell::Cell<bool>,
+    /// shared with the pending index; upload-path textures are born Ready
+    /// (their transitions ride the staging barriers)
+    layout: Rc<std::cell::Cell<TexLayout>>,
     /// never reused; view handles can be, so identity checks go through this
     pub uid: u64,
 }
