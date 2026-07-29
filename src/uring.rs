@@ -540,4 +540,39 @@ mod tests {
         ring.run().unwrap();
         assert!(ok.get());
     }
+
+    #[test]
+    fn a_bounded_poll_times_out_on_a_silent_fd() {
+        let eng = Engine::new();
+        let ring = Ring::new(&eng, 32).unwrap();
+        // counter 0 - never readable; only the linked clock can resolve this
+        let efd = Rc::new(eventfd(0, EventfdFlags::empty()).unwrap());
+        let got = Rc::new(Cell::new(None));
+        let g = got.clone();
+        let r = ring.clone();
+        let _root = eng.spawn("test", async move {
+            let res = r.readable_by(&efd, Time::now() + Duration::from_millis(5)).await;
+            g.set(Some(matches!(res, Ok(false))));
+            r.stop();
+        });
+        ring.run().unwrap();
+        assert_eq!(got.get(), Some(true));
+    }
+
+    #[test]
+    fn a_bounded_poll_yields_to_a_ready_fd() {
+        let eng = Engine::new();
+        let ring = Ring::new(&eng, 32).unwrap();
+        let efd = Rc::new(eventfd(3, EventfdFlags::empty()).unwrap());
+        let got = Rc::new(Cell::new(None));
+        let g = got.clone();
+        let r = ring.clone();
+        let _root = eng.spawn("test", async move {
+            let res = r.readable_by(&efd, Time::now() + Duration::from_secs(5)).await;
+            g.set(Some(matches!(res, Ok(true))));
+            r.stop();
+        });
+        ring.run().unwrap();
+        assert_eq!(got.get(), Some(true));
+    }
 }

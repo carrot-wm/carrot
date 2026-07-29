@@ -191,6 +191,7 @@ pub(super) struct PollOp {
     id: OpId,
     fd: i32,
     events: u16,
+    link: bool,
     data: Option<PollData>,
 }
 
@@ -205,6 +206,7 @@ impl Default for PollOp {
             id: OpId::default(),
             fd: -1,
             events: 0,
+            link: false,
             data: None,
         }
     }
@@ -213,6 +215,10 @@ impl Default for PollOp {
 unsafe impl Op for PollOp {
     fn id(&self) -> OpId {
         self.id
+    }
+
+    fn has_link(&self) -> bool {
+        self.link
     }
 
     fn encode(&self, sqe: &mut io_uring_sqe) {
@@ -232,15 +238,32 @@ unsafe impl Op for PollOp {
 impl Ring {
     /// one-shot readiness; resolves with revents once the fd reports any requested event
     pub async fn readable(&self, fd: &Rc<OwnedFd>) -> Result<u16, RingError> {
-        self.poll_fd(fd, PollFlags::IN.bits() as u16).await
+        self.poll_fd(fd, PollFlags::IN.bits(), None).await
+    }
+
+    /// one-shot readiness with a deadline (absolute CLOCK_MONOTONIC).
+    /// Ok(true) = the fd woke first, Ok(false) = the clock did. the kernel
+    /// resolves the race via a linked timeout; expiry surfaces as ECANCELED
+    /// on the poll op, nothing stays armed either way
+    pub async fn readable_by(&self, fd: &Rc<OwnedFd>, deadline: Time) -> Result<bool, RingError> {
+        match self.poll_fd(fd, PollFlags::IN.bits(), Some(deadline)).await {
+            Ok(_) => Ok(true),
+            Err(RingError::Os(e)) if e == Errno::CANCELED || e == Errno::TIME => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     #[allow(dead_code)]
     pub async fn writable(&self, fd: &Rc<OwnedFd>) -> Result<u16, RingError> {
-        self.poll_fd(fd, PollFlags::OUT.bits() as u16).await
+        self.poll_fd(fd, PollFlags::OUT.bits(), None).await
     }
 
-    async fn poll_fd(&self, fd: &Rc<OwnedFd>, events: u16) -> Result<u16, RingError> {
+    async fn poll_fd(
+        &self,
+        fd: &Rc<OwnedFd>,
+        events: u16,
+        deadline: Option<Time>,
+    ) -> Result<u16, RingError> {
         self.check_destroyed()?;
         let guard = self.guard();
         let slot = Rc::new(Oneshot::default());
@@ -248,11 +271,16 @@ impl Ring {
         op.id = guard.id;
         op.fd = fd.as_raw_fd();
         op.events = events;
+        op.link = deadline.is_some();
         op.data = Some(PollData {
             _fd: fd.clone(),
             slot: slot.clone(),
         });
+        // scheduled back to back with no await between, so encode() sees them adjacent
         self.schedule(op);
+        if let Some(t) = deadline {
+            msg::schedule_link(self, t);
+        }
         let revents = CqeFuture(slot).await?;
         Ok(revents as u16)
     }

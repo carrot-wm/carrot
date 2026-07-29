@@ -2710,7 +2710,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         // fullscreen sealed shm becomes the frame with one copy into the
         // scanout buffer: the flip's fence covers just the copy, so an
         // async commit reaches the plane without paying a render pass
-        let frame = if let Some((surface, src, pool, offset, row_texels)) =
+        let (frame, sync) = if let Some((surface, src, pool, offset, row_texels)) =
             shm_fast_candidate(state, out)
         {
             crate::trace!("fb-fast: surface #{} t={}", surface.uid, Time::now().nsec());
@@ -2772,17 +2772,30 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         buf.undefined.set(false);
         let submit_ns = Time::now().nsec();
 
-        // render fence into the commit
-        let sync = frame.export_sync_file(&out.renderer).ok().map(Rc::new);
+        // the render's completion fd rides into the commit; it comes off
+        // the submit's export semaphore, never the fence - a sync-fd
+        // export RESETS its source, and a reset fence would park every
+        // frame in the yard for the session
         out.conn.vrr_want.set(vrr_wanted(state, out));
         out.inflight_vsync.set(true);
         let res = if tearing_wanted(state, out) && !out.conn.vrr_dirty() {
             // async commits are FB-only - no fence rides along, so the render
-            // has to be finished before the kernel sees the buffer
-            if let Some(fd) = &sync {
-                let _ = state.ring.readable(fd).await;
-            }
-            match out.conn.flip_async(&out.dev, buf.fb) {
+            // has to be finished before the kernel sees the buffer. a fence
+            // that misses the bound falls to the fenced flip below: the
+            // kernel then gates on it and the loop never hangs here
+            let ready = match &sync {
+                Some(fd) => {
+                    let deadline = Time::from_nsec(Time::now().nsec() + 500_000_000);
+                    state.ring.readable_by(fd, deadline).await.unwrap_or(false)
+                }
+                None => true,
+            };
+            let attempt = if ready {
+                out.conn.flip_async(&out.dev, buf.fb)
+            } else {
+                Err(crate::drm::device::DrmError::Op("tearing fence bound", rustix::io::Errno::AGAIN))
+            };
+            match attempt {
                 // the kernel can reject async for reasons of its own; the
                 // frame still has to land
                 Err(_) => out
@@ -3143,11 +3156,13 @@ async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
         // longer strand these, and the yard only frees on fence proof
         out.renderer.retire_textures_at(frame.seq(), retired);
         if let Some(fd) = &sync {
-            let _ = state.ring.readable(fd).await;
-            // the gpu-tail sample for the latch scheduler; capped so a
-            // stalled queue can't poison the estimate for seconds
-            let tail = Time::now().nsec().saturating_sub(submit_ns);
-            Sched::ewma(&out.sched.ewma_gpu, tail.min(50_000_000));
+            let deadline = Time::from_nsec(Time::now().nsec() + 500_000_000);
+            if matches!(state.ring.readable_by(fd, deadline).await, Ok(true)) {
+                // the gpu-tail sample for the latch scheduler; capped so a
+                // stalled queue can't poison the estimate for seconds
+                let tail = Time::now().nsec().saturating_sub(submit_ns);
+                Sched::ewma(&out.sched.ewma_gpu, tail.min(50_000_000));
+            }
         }
         // deliberate policy split: client buffers release even unproven
         // (withholding wedges swapchains; transient corruption under a

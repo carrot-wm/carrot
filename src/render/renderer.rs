@@ -348,7 +348,12 @@ struct FrameYard {
 struct FrameInner {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
+    /// imported client-fence semaphores; consumed by the submit, pooled
+    /// at recycle (TEMPORARY imports revert after one wait)
     waits: Vec<vk::Semaphore>,
+    /// the sync-fd export semaphore; its payload was exported away, it
+    /// is never reusable and dies at recycle
+    export_sem: Option<vk::Semaphore>,
     staging: Vec<PreUpload>,
     /// the pool a fast-path copy reads; pinned until the frame retires
     pool: Option<Rc<crate::clientmem::ClientMem>>,
@@ -381,14 +386,6 @@ impl Frame {
     /// submission number on the card's queue; texture retires key on it
     pub fn seq(&self) -> u64 {
         self.inner().seq
-    }
-
-    pub fn export_sync_file(&self, r: &Renderer) -> Result<OwnedFd, RenderError> {
-        let info = vk::FenceGetFdInfoKHR::default()
-            .fence(self.inner().fence)
-            .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-        let fd = unsafe { r.core.ext_fence_fd.get_fence_fd(&info) }?;
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     pub fn wait(mut self, r: &Renderer) -> Result<(), RenderError> {
@@ -434,6 +431,8 @@ pub struct Renderer {
     /// a transient stall costs dropped captures, never the session, and
     /// teardown can never destroy what the gpu still samples
     yard: Rc<FrameYard>,
+    /// the fence-export failure announces once, not per capture
+    fd_export_warned: Cell<bool>,
     format: vk::Format,
     sampler: vk::Sampler,
     tex_set_layout: vk::DescriptorSetLayout,
@@ -451,6 +450,10 @@ pub struct Renderer {
     free_cbs: RefCell<Vec<vk::CommandBuffer>>,
     tex_uid: Cell<u64>,
     capture: RefCell<Option<CaptureTarget>>,
+    /// recycled import semaphores: a TEMPORARY sync-fd import reverts
+    /// after its one wait, so the handle is reusable. one per fenced
+    /// dmabuf per compose at 480Hz made create/destroy real overhead
+    sem_pool: RefCell<Vec<vk::Semaphore>>,
     upload_slots: RefCell<Vec<UploadSlot>>,
     host_imports: RefCell<HashMap<usize, HostImport>>,
 }
@@ -614,6 +617,7 @@ impl Renderer {
                 frames: RefCell::new(Vec::new()),
                 textures: RefCell::new(Vec::new()),
             }),
+            fd_export_warned: Cell::new(false),
             format,
             sampler,
             tex_set_layout,
@@ -631,6 +635,7 @@ impl Renderer {
             free_cbs: RefCell::new(Vec::new()),
             tex_uid: Cell::new(0),
             capture: RefCell::new(None),
+            sem_pool: RefCell::new(Vec::new()),
             upload_slots: RefCell::new(Vec::new()),
             host_imports: RefCell::new(HashMap::new()),
         })
@@ -648,11 +653,16 @@ impl Renderer {
     /// import restores the semaphore after one use.
     pub fn import_wait(&self, fd: OwnedFd) -> Result<vk::Semaphore, RenderError> {
         use std::os::fd::{FromRawFd, IntoRawFd};
-        let sem = unsafe {
-            self.core
-                .device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        }?;
+        // pooled handles first: their TEMPORARY import was consumed by
+        // the submit that recycled them
+        let sem = match self.sem_pool.borrow_mut().pop() {
+            Some(s) => s,
+            None => unsafe {
+                self.core
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            }?,
+        };
         // the fd only changes hands on a successful import
         let raw = fd.into_raw_fd();
         let info = vk::ImportSemaphoreFdInfoKHR::default()
@@ -668,6 +678,64 @@ impl Renderer {
         Ok(sem)
     }
 
+    /// a dedicated semaphore rides each submit and carries completion out
+    /// as a sync fd. sync-fd export has copy transference and RESETS its
+    /// source: exporting from the fence leaves it lying unsignaled
+    /// forever, so every status check after it lies - the frame parks in
+    /// the yard for good and the card fills with everything it was
+    /// minding. the semaphore takes the reset and dies at recycle; the
+    /// fence stays truthful for everyone
+    fn export_semaphore(&self) -> Option<vk::Semaphore> {
+        let mut info = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let ci = vk::SemaphoreCreateInfo::default().push_next(&mut info);
+        unsafe { self.core.device.create_semaphore(&ci, None) }.ok()
+    }
+
+    /// the sync fd off an export semaphore; warns once on failure and
+    /// callers fall back to bounded fence waits
+    fn semaphore_fd(&self, sem: vk::Semaphore) -> Option<Rc<OwnedFd>> {
+        let info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(sem)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        match unsafe { self.core.ext_semaphore_fd.get_semaphore_fd(&info) } {
+            Ok(raw) => Some(Rc::new(unsafe { OwnedFd::from_raw_fd(raw) })),
+            Err(e) => {
+                if !self.fd_export_warned.replace(true) {
+                    eprintln!("carrot: sync export failed ({e}); bounded waits instead");
+                }
+                None
+            }
+        }
+    }
+
+    /// submit with a fresh export semaphore riding along; the semaphore
+    /// joins the frame's waits so recycle destroys it, and the fd (when
+    /// export works) is the frame's completion signal for the ring
+    fn submit_with_sync(
+        &self,
+        cb: vk::CommandBuffer,
+        waits: Vec<vk::Semaphore>,
+        staging: Vec<PreUpload>,
+        pool: Option<Rc<crate::clientmem::ClientMem>>,
+    ) -> Result<(Frame, Option<Rc<OwnedFd>>), RenderError> {
+        let export_sem = self.export_semaphore();
+        let mut frame = match self.submit_frame(cb, waits, staging, pool, export_sem) {
+            Ok(f) => f,
+            Err(e) => {
+                if let Some(sem) = export_sem {
+                    unsafe { self.core.device.destroy_semaphore(sem, None) };
+                }
+                return Err(e);
+            }
+        };
+        let sync = export_sem.and_then(|sem| {
+            frame.inner.as_mut().unwrap().export_sem = Some(sem);
+            self.semaphore_fd(sem)
+        });
+        Ok((frame, sync))
+    }
+
     pub fn render(
         &self,
         target: &FrameTarget,
@@ -675,7 +743,8 @@ impl Renderer {
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
-        self.render_frame(Vec::new(), Vec::new(), target, clear, ops, waits)
+        let (frame, _sync) = self.render_frame(Vec::new(), Vec::new(), target, clear, ops, waits)?;
+        Ok(frame)
     }
 
     /// the whole frame in one submit: staging copies, offscreen pre-passes
@@ -691,7 +760,7 @@ impl Renderer {
         clear: Option<[f32; 4]>,
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
-    ) -> Result<Frame, RenderError> {
+    ) -> Result<(Frame, Option<Rc<OwnedFd>>), RenderError> {
         let cb = self.open_batch(&waits, &uploads)?;
         self.record_pre(cb, &uploads, &passes);
 
@@ -719,7 +788,7 @@ impl Renderer {
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
             );
         self.record_pass(cb, target.view, target.width, target.height, clear, ops, acquire, release);
-        self.submit_frame(cb, waits, uploads, None)
+        self.submit_with_sync(cb, waits, uploads, None)
     }
 
     /// a fullscreen client buffer becomes the whole frame: one
@@ -733,7 +802,7 @@ impl Renderer {
         row_texels: u32,
         target: &FrameTarget,
         waits: Vec<vk::Semaphore>,
-    ) -> Result<Frame, RenderError> {
+    ) -> Result<(Frame, Option<Rc<OwnedFd>>), RenderError> {
         let dev = &self.core.device;
         let cb = self.open_batch(&waits, &[])?;
         // take the target from the display side, hand it back after
@@ -779,7 +848,7 @@ impl Renderer {
             .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
         barrier2(dev, cb, &release);
-        self.submit_frame(cb, waits, Vec::new(), Some(pool.clone()))
+        self.submit_with_sync(cb, waits, Vec::new(), Some(pool.clone()))
     }
 
     /// staging copies, then the offscreen pre-passes in list order
@@ -877,6 +946,7 @@ impl Renderer {
         waits: Vec<vk::Semaphore>,
         staging: Vec<PreUpload>,
         pool: Option<Rc<crate::clientmem::ClientMem>>,
+        signal: Option<vk::Semaphore>,
     ) -> Result<Frame, RenderError> {
         let dev = &self.core.device;
         // the cb closes here so every failure between recording and the
@@ -886,9 +956,10 @@ impl Renderer {
             self.abort_submit(cb, &waits, &staging, None);
             return Err(e.into());
         }
-        let mut export = vk::ExportFenceCreateInfo::default()
-            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-        let fence_info = vk::FenceCreateInfo::default().push_next(&mut export);
+        // plain, private fence: completion leaves the gpu only through the
+        // export semaphore. an exportable fence invites the copy-
+        // transference reset that once parked every frame for the session
+        let fence_info = vk::FenceCreateInfo::default();
         let fence = match unsafe { dev.create_fence(&fence_info, None) } {
             Ok(f) => f,
             Err(e) => {
@@ -906,9 +977,18 @@ impl Renderer {
                     .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             })
             .collect();
+        let signal_infos: Vec<_> = signal
+            .iter()
+            .map(|&s| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(s)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            })
+            .collect();
         let submit = vk::SubmitInfo2::default()
             .command_buffer_infos(&cbs)
-            .wait_semaphore_infos(&wait_infos);
+            .wait_semaphore_infos(&wait_infos)
+            .signal_semaphore_infos(&signal_infos);
         let res = unsafe { dev.queue_submit2(self.core.queue, &[submit], fence) };
         if let Err(e) = res {
             eprintln!("carrot: vulkan: frame queue_submit2 failed: {e:?}");
@@ -918,7 +998,7 @@ impl Renderer {
         let seq = self.yard.submit_seq.get() + 1;
         self.yard.submit_seq.set(seq);
         Ok(Frame {
-            inner: Some(FrameInner { cb, fence, waits, staging, pool, seq }),
+            inner: Some(FrameInner { cb, fence, waits, staging, pool, seq, export_sem: None }),
             yard: self.yard.clone(),
         })
     }
@@ -1493,9 +1573,20 @@ impl Renderer {
         }
         unsafe {
             self.core.device.destroy_fence(f.fence, None);
-            for s in &f.waits {
-                self.core.device.destroy_semaphore(*s, None);
+            if let Some(sem) = f.export_sem {
+                self.core.device.destroy_semaphore(sem, None);
             }
+            let mut pool = self.sem_pool.borrow_mut();
+            for s in &f.waits {
+                // the fence proved the wait consumed; the handle reverts
+                // to its permanent (empty) payload and pools
+                if pool.len() < 64 {
+                    pool.push(*s);
+                } else {
+                    self.core.device.destroy_semaphore(*s, None);
+                }
+            }
+            drop(pool);
             for u in &f.staging {
                 if u.owned {
                     self.core.device.destroy_buffer(u.buffer, None);
@@ -1972,7 +2063,7 @@ impl Renderer {
                 &[region],
             );
         }
-        let frame = self.submit_frame(cb, waits, uploads, None)?;
+        let frame = self.submit_frame(cb, waits, uploads, None, None)?;
         frame.wait(self)?;
 
         let size = (w as u64) * (h as u64) * 4;
@@ -2561,6 +2652,11 @@ impl Drop for Renderer {
         }
         if let Some(c) = self.capture.borrow_mut().take() {
             self.destroy_capture(&c);
+        }
+        for s in self.sem_pool.borrow_mut().drain(..) {
+            unsafe {
+                dev.destroy_semaphore(s, None);
+            }
         }
         // idle proven: everything the yard was minding is safe to free
         for f in self.yard.frames.borrow_mut().drain(..) {

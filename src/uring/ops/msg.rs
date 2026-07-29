@@ -422,7 +422,7 @@ unsafe impl Op for LinkTimeoutOp {
     }
 }
 
-fn schedule_link(ring: &Ring, deadline: Time) {
+pub(super) fn schedule_link(ring: &Ring, deadline: Time) {
     let mut op = ring.cached_links.pop().unwrap_or_default();
     op.id = ring.id_raw();
     op.ts = deadline.into();
