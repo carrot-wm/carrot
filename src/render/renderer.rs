@@ -456,6 +456,8 @@ pub struct Renderer {
     /// on this queue records it, and queue order puts it before every later
     /// sampler
     pending_sampled: RefCell<Vec<PendingTransition>>,
+    /// host-import verdict, settled at construction (env + device quirks)
+    host_import_ok: bool,
 }
 
 impl Renderer {
@@ -639,6 +641,7 @@ impl Renderer {
             upload_slots: RefCell::new(Vec::new()),
             host_imports: RefCell::new(HashMap::new()),
             pending_sampled: RefCell::new(Vec::new()),
+            host_import_ok: Self::decide_host_import(core),
         })
     }
 
@@ -2197,8 +2200,30 @@ impl Renderer {
         up
     }
 
+    /// decided once at construction: both env knobs and the device name
+    /// are fixed for the process, and this gate sits on the per-commit
+    /// upload path where an environ walk per call is pure waste
     pub fn host_import_supported(&self) -> bool {
-        self.core.ext_host.is_some()
+        self.host_import_ok
+    }
+
+    fn decide_host_import(core: &VkCore) -> bool {
+        // escape hatch while a driver misbehaves on imported host memory:
+        // the staged-copy path is always correct, just one copy slower
+        if std::env::var_os("CARROT_NO_HOST_IMPORT").is_some() {
+            return false;
+        }
+        // anv on xe advertises the extension but xe_vm_bind refuses our
+        // sealed-pool pages and the reject is a whole device loss (seen
+        // on battlemage, mesa 26.1.5: abort in anv_AllocateMemory ->
+        // xe_vm_bind_op). off by default there until mesa proves it;
+        // CARROT_HOST_IMPORT=1 forces it back on for testing
+        if core.device_name.contains("Intel")
+            && std::env::var_os("CARROT_HOST_IMPORT").is_none()
+        {
+            return false;
+        }
+        core.ext_host.is_some()
     }
 
     /// the vk buffer viewing a sealed client pool, importing on first
@@ -2208,6 +2233,12 @@ impl Renderer {
         &self,
         mem: &Rc<crate::clientmem::ClientMem>,
     ) -> Option<vk::Buffer> {
+        // one gate for every import site: the draw path used to consult
+        // only the extension bit here, which made the kill switch a lie
+        // and let anv bind host pages xe's vm refuses (device loss)
+        if !self.host_import_supported() {
+            return None;
+        }
         let key = Rc::as_ptr(mem) as usize;
         if let Some(e) = self.host_imports.borrow().get(&key) {
             // a null entry remembers a pool that can't import (write-sealed
