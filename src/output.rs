@@ -3264,6 +3264,37 @@ pub fn clamp_pointer(state: &Rc<State>, x: f64, y: f64) -> (f64, f64) {
     )
 }
 
+/// drop one cached texture on every output; the age sweep only sees draws,
+/// so wire destroys (wl_buffer, wl_surface) evict here instead of pinning
+/// dead imports for TEX_IDLE frames
+pub fn evict_texture(state: &Rc<State>, key: (ClientId, u64)) {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return };
+    for out in d.outputs.borrow().iter() {
+        if let Some(e) = out.textures.borrow_mut().remove(&key) {
+            // the frame in flight may still sample it; destroy after fence
+            out.retired_tex.borrow_mut().push(e.tex);
+        }
+        out.cast_keep.borrow_mut().remove(&key);
+    }
+}
+
+/// a disconnect sends no wire destroys; purge every key the client owned
+pub fn drop_client(state: &Rc<State>, id: ClientId) {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return };
+    for out in d.outputs.borrow().iter() {
+        let mut textures = out.textures.borrow_mut();
+        let gone: Vec<_> = textures.keys().filter(|k| k.0 == id).copied().collect();
+        for k in gone {
+            if let Some(e) = textures.remove(&k) {
+                out.retired_tex.borrow_mut().push(e.tex);
+            }
+        }
+        out.cast_keep.borrow_mut().retain(|k, _| k.0 != id);
+    }
+}
+
 /// per-output vrr policy: off unless configured; "always" holds it on,
 /// "automatic" follows a fullscreen window on the active workspace
 fn vrr_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {

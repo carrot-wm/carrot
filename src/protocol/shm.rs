@@ -321,6 +321,12 @@ impl wl_buffer::Handler for WlBuffer {
         // surfaces may keep displaying via their Rc; the flag only suppresses
         // events to the dead id
         self.destroyed.set(true);
+        // dmabuf textures key on the buffer uid; without this a resize
+        // stream would pin an import per discarded buffer until the age
+        // sweep. a still-attached buffer just reimports once next frame
+        if self.dmabuf().is_some() {
+            crate::output::evict_texture(&self.client.state, (self.client.id, self.uid));
+        }
         self.client.objects.forget_buffer(self.id);
         self.client.remove_obj(self.id)?;
         Ok(())

@@ -394,6 +394,9 @@ impl wl_surface::Handler for WlSurface {
         self.fire_frame_callbacks(now_ms());
         // uncommitted callbacks fire via Drop
         self.pending.borrow_mut().frame_callbacks.clear();
+        // the shm shadow texture keys on the surface uid, which never
+        // returns; closing-window seizure already pulled its keys above
+        crate::output::evict_texture(&self.client.state, (self.client.id, self.uid));
         self.client.objects.forget_surface(self.id);
         self.client.remove_obj(self.id)?;
         // the id is free for reuse once the client sees delete_id, but the

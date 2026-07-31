@@ -182,6 +182,9 @@ impl Drop for ClientHolder {
         crate::shell::layer::drop_client(&self.data.state, self.data.id);
         crate::protocol::foreign_toplevel::drop_client(&self.data.state, self.data.id);
         crate::protocol::ext_workspace::drop_client(&self.data.state, self.data.id);
+        // cached textures age by draw, not by lifetime; a gone client's
+        // keys must leave the caches now
+        crate::output::drop_client(&self.data.state, self.data.id);
         self.data.state.idle.drop_client(self.data.id);
         crate::protocol::session_lock::drop_client(&self.data.state, self.data.id);
         self.data.flush_request.clear();
