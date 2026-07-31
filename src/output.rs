@@ -376,8 +376,12 @@ pub struct Output {
     pub usable: Cell<Rect>,
     /// texture + the content generation it was uploaded at, keyed by uid
     /// (surface uid for shm shadows, buffer uid for dmabufs - wire ids
-    /// get reused, uids never); shm skips the re-upload while gen holds
-    textures: RefCell<HashMap<(ClientId, u64), (Texture, u64)>>,
+    /// get reused, uids never); shm skips the re-upload while gen holds.
+    /// entries age out after TEX_IDLE present sweeps, so a client rotating
+    /// buffers keeps its whole set imported
+    textures: RefCell<HashMap<(ClientId, u64), TexEntry>>,
+    /// monotonically counts present sweeps; ages texture cache entries
+    tex_tick: Cell<u64>,
     /// textures pulled from the cache this frame; destroyed only after
     /// the frame fence proves the last sampler is done
     retired_tex: RefCell<Vec<Texture>>,
@@ -757,6 +761,18 @@ struct ScanoutFb {
 
 /// cache entries idle this many scanout flips get evicted
 const SCANOUT_FB_IDLE: u64 = 600;
+
+/// a cached sampled texture: generation is the shm content generation it
+/// was uploaded at (dmabufs store 0), used the sweep tick that last drew it
+struct TexEntry {
+    tex: Texture,
+    generation: u64,
+    used: u64,
+}
+
+/// texture entries idle this many present sweeps get evicted; ages out
+/// textures of buffers the client stopped rotating through
+const TEX_IDLE: u64 = 600;
 
 /// how many misses in a row park late-latching, and how many met deadlines
 /// afterwards un-park it. at 480Hz a frame is ~2ms: parking on 4 was one
@@ -1662,8 +1678,8 @@ fn rescan(state: &Rc<State>) {
             }
             out.conn.pipe_torn_down();
         }
-        for (_, (t, _)) in out.textures.borrow_mut().drain() {
-            out.renderer.retire_texture(t);
+        for (_, e) in out.textures.borrow_mut().drain() {
+            out.renderer.retire_texture(e.tex);
         }
         for t in out.retired_tex.borrow_mut().drain(..) {
             out.renderer.retire_texture(t);
@@ -1985,6 +2001,7 @@ fn init_output(
         ws: Cell::new(0),
         usable: Cell::new(Rect::default()),
         textures: RefCell::new(HashMap::new()),
+        tex_tick: Cell::new(0),
         retired_tex: RefCell::new(Vec::new()),
         prepasses: RefCell::new(Vec::new()),
         preuploads: RefCell::new(Vec::new()),
@@ -3097,11 +3114,11 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
         let Some(entry) = textures.get_mut(&key) else {
             continue;
         };
-        if entry.0.width != bw || entry.0.height != bh {
+        if entry.tex.width != bw || entry.tex.height != bh {
             missed = true;
             continue;
         }
-        if entry.1 == cur {
+        if entry.generation == cur {
             uploaded += 1;
             continue;
         }
@@ -3121,7 +3138,7 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
             .and_then(|off| out.renderer.host_buffer_for(off.pool()).map(|b| (b, off)))
         {
             out.renderer.upload_now_from(
-                &entry.0,
+                &entry.tex,
                 hbuf,
                 off.pool(),
                 off.pool_offset() as u64,
@@ -3129,11 +3146,11 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
             )
         } else {
             out.renderer
-                .upload_now(&entry.0, |dst| fill_from_shm(&access, dst, bh, row, stride))
+                .upload_now(&entry.tex, |dst| fill_from_shm(&access, dst, bh, row, stride))
         };
         match res {
             Ok(true) => {
-                entry.1 = cur;
+                entry.generation = cur;
                 uploaded += 1;
             }
             Ok(false) => missed = true,
@@ -3440,8 +3457,8 @@ fn compose_scene(
             .copied()
             .collect();
         for k in stale {
-            if let Some((t, _)) = textures.remove(&k) {
-                out.retired_tex.borrow_mut().push(t);
+            if let Some(e) = textures.remove(&k) {
+                out.retired_tex.borrow_mut().push(e.tex);
             }
         }
         drop(textures);
@@ -3536,21 +3553,33 @@ fn compose_scene(
     if mode != DrawMode::Present {
         return;
     }
-    // textures for gone buffers don't outlive the frame, except cast
-    // sources fed within the last second
+    // textures age instead of dying with the frame: a client rotating
+    // through its buffer set keeps every import warm, and cast sources
+    // fed within the last second stay stamped too
     let now_ns = Time::now().nsec();
     let mut keep = out.cast_keep.borrow_mut();
     keep.retain(|_, t| now_ns.saturating_sub(*t) < CAST_KEEP_NS);
     let mut textures = out.textures.borrow_mut();
+    let tick = out.tex_tick.get() + 1;
+    out.tex_tick.set(tick);
+    // membership set once per sweep: the per-texture rescan of live went
+    // quadratic when TEX_IDLE started keeping idle entries around
+    let live_keys: std::collections::HashSet<(ClientId, u64)> =
+        live.iter().map(|(k, _)| *k).collect();
+    for (k, e) in textures.iter_mut() {
+        if live_keys.contains(k) || keep.contains_key(k) {
+            e.used = tick;
+        }
+    }
     let stale: Vec<_> = textures
-        .keys()
-        .filter(|k| !live.iter().any(|(lk, _)| lk == *k) && !keep.contains_key(*k))
-        .copied()
+        .iter()
+        .filter(|(_, e)| tick.saturating_sub(e.used) > TEX_IDLE)
+        .map(|(k, _)| *k)
         .collect();
     for k in stale {
-        if let Some((t, _)) = textures.remove(&k) {
+        if let Some(e) = textures.remove(&k) {
             // the frame in flight may still sample it; destroy after fence
-            out.retired_tex.borrow_mut().push(t);
+            out.retired_tex.borrow_mut().push(e.tex);
         }
     }
 }
@@ -3769,19 +3798,20 @@ fn draw_buffer(
         // renders never round-trip through the cpu
         let mut textures = out.textures.borrow_mut();
         let need_new = match textures.get(&key) {
-            Some((t, _)) => t.width != bw || t.height != bh,
+            Some(e) => e.tex.width != bw || e.tex.height != bh,
             None => true,
         };
         if need_new {
-            if let Some((old, _)) = textures.remove(&key) {
-                out.retired_tex.borrow_mut().push(old);
+            if let Some(old) = textures.remove(&key) {
+                out.retired_tex.borrow_mut().push(old.tex);
             }
             match out
                 .renderer
                 .import_dmabuf(&img.planes, img.modifier, bw, bh, opaque)
             {
                 Ok(t) => {
-                    textures.insert(key, (t, 0));
+                    textures
+                        .insert(key, TexEntry { tex: t, generation: 0, used: out.tex_tick.get() });
                 }
                 Err(e) => {
                     eprintln!("carrot: dmabuf import failed: {e}");
@@ -3796,17 +3826,24 @@ fn draw_buffer(
     } else {
         let mut textures = out.textures.borrow_mut();
         let need_new = match textures.get(&key) {
-            Some((t, _)) => t.width != bw || t.height != bh,
+            Some(e) => e.tex.width != bw || e.tex.height != bh,
             None => true,
         };
         if need_new {
-            if let Some((old, _)) = textures.remove(&key) {
-                out.retired_tex.borrow_mut().push(old);
+            if let Some(old) = textures.remove(&key) {
+                out.retired_tex.borrow_mut().push(old.tex);
             }
             match out.renderer.create_texture(bw, bh, opaque) {
                 Ok(t) => {
                     // gen behind the surface's: the first pass uploads
-                    textures.insert(key, (t, s.content_gen.get().wrapping_sub(1)));
+                    textures.insert(
+                        key,
+                        TexEntry {
+                            tex: t,
+                            generation: s.content_gen.get().wrapping_sub(1),
+                            used: out.tex_tick.get(),
+                        },
+                    );
                 }
                 Err(e) => {
                     eprintln!("carrot: texture alloc failed: {e}");
@@ -3818,7 +3855,7 @@ fn draw_buffer(
         // unchanged surface samples the texture it already has
         let cur = s.content_gen.get();
         let entry = textures.get_mut(&key).unwrap();
-        if entry.1 != cur {
+        if entry.generation != cur {
             // sealed pools sample in place: the gpu copies straight out of
             // the imported client pages, no cpu byte ever moves
             if let Some((hbuf, off)) = buf
@@ -3828,24 +3865,24 @@ fn draw_buffer(
                 .and_then(|off| out.renderer.host_buffer_for(off.pool()).map(|b| (b, off)))
             {
                 let up = out.renderer.external_pre_upload(
-                    &entry.0,
+                    &entry.tex,
                     hbuf,
                     off.pool(),
                     off.pool_offset() as u64,
                     (buf.stride / 4) as u32,
                 );
                 out.preuploads.borrow_mut().push(up);
-                entry.1 = cur;
+                entry.generation = cur;
             }
         }
-        if entry.1 != cur {
+        if entry.generation != cur {
             let shadow = s.shm_shadow.borrow();
             let row = (bw * 4) as usize;
             let need = row * bh as usize;
             let res = if let Some(px) = shadow.as_ref().filter(|p| p.len() >= need) {
                 // the commit-time shadow is the source of truth
                 out.renderer
-                    .stage_upload(&entry.0, |dst| dst[..need].copy_from_slice(&px[..need]))
+                    .stage_upload(&entry.tex, |dst| dst[..need].copy_from_slice(&px[..need]))
             } else {
                 // no shadow (capture failed): read the client buffer,
                 // zero-filling any short row instead of leaking staging
@@ -3854,7 +3891,7 @@ fn draw_buffer(
                     Some(a) => a,
                     None => return,
                 };
-                out.renderer.stage_upload(&entry.0, |dst| match access {
+                out.renderer.stage_upload(&entry.tex, |dst| match access {
                     ShmAccess::Ptr(p) => {
                         for yy in 0..bh as usize {
                             unsafe {
@@ -3894,11 +3931,11 @@ fn draw_buffer(
                     return;
                 }
             }
-            entry.1 = cur;
+            entry.generation = cur;
         }
     }
     let textures = out.textures.borrow();
-    let (tex, _) = textures.get(&key).unwrap();
+    let tex = &textures.get(&key).unwrap().tex;
     live.push((key, tex.uid));
     let (sw, sh) = s.size.get();
     let dst = Rect::new_sized_saturating(x, y, sw, sh);
@@ -4116,7 +4153,7 @@ fn blur_mask_op(out: &Rc<Output>, s: &Rc<WlSurface>, r: Rect, threshold: f32) ->
         (s.client.id, s.uid)
     };
     let textures = out.textures.borrow();
-    let (tex, _) = textures.get(&key)?;
+    let tex = &textures.get(&key)?.tex;
     let (gx, gy) = out.pos.get();
     let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
     let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
@@ -4403,7 +4440,7 @@ fn draw_resize_xfade(
             let t = out.textures.borrow();
             if keys
                 .iter()
-                .any(|(k, uid)| t.get(k).map(|(tex, _)| tex.uid) != Some(*uid))
+                .any(|(k, uid)| t.get(k).map(|e| e.tex.uid) != Some(*uid))
             {
                 crate::trace!("rz: stale batch textures #{}", win.ident);
                 return false;
@@ -4749,13 +4786,13 @@ pub fn seize_batch(
                 continue;
             }
             match textures.remove(k) {
-                Some((t, _)) if t.uid == *uid => {
-                    keep.push(t);
+                Some(e) if e.tex.uid == *uid => {
+                    keep.push(e.tex);
                     taken.push(*k);
                 }
                 // a replacement: the window is going away, retire it too
-                Some((t, _)) => {
-                    keep.push(t);
+                Some(e) => {
+                    keep.push(e.tex);
                     missing = true;
                 }
                 None => missing = true,
