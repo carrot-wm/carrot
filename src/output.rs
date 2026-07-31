@@ -433,6 +433,10 @@ pub struct Output {
     pub blur: RefCell<Option<BlurCache>>,
     /// the backdrop changed since the cache was built
     pub blur_dirty: Cell<bool>,
+    /// texture generation stamps earned by the current compose; they only
+    /// land if its submit does, so a dropped batch can never fake
+    /// freshness and starve a re-upload
+    pending_stamps: RefCell<Vec<((ClientId, u64), u64)>>,
     /// submitted frames whose gpu work may still be running; a side task
     /// waits each render fence and retires them off the present loop
     gpu_done: crate::util::AsyncQueue<CleanupJob>,
@@ -1169,6 +1173,7 @@ pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: boo
     let mut ops = Vec::new();
     let mut live = Vec::new();
     compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never }, None, &mut ops, &mut live);
+    let stamps = take_stamps(&out);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -1178,7 +1183,10 @@ pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: boo
     let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
     let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
     let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
-        Ok(px) => px,
+        Ok(px) => {
+            apply_stamps(&out, stamps);
+            px
+        }
         Err(e) => {
             eprintln!("carrot: screencopy render failed: {e}");
             return None;
@@ -1234,6 +1242,7 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, 0.0, &mut ops, &mut live);
     // hidden-window casts land here; spare their textures from the sweep
     note_cast_keys(&out, &live);
+    let stamps = take_stamps(&out);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -1243,7 +1252,10 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
     let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
     let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
-        Ok(px) => px,
+        Ok(px) => {
+            apply_stamps(&out, stamps);
+            px
+        }
         Err(e) => {
             eprintln!("carrot: window capture render failed: {e}");
             return None;
@@ -1277,6 +1289,7 @@ pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
     let mut ops = Vec::new();
     let mut live = Vec::new();
     compose_ops(state, &out, CapCursor::Never, Some(ws_index), &mut ops, &mut live);
+    let stamps = take_stamps(&out);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -1286,7 +1299,10 @@ pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
     let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
     let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
     match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
-        Ok(px) => Some(px),
+        Ok(px) => {
+            apply_stamps(&out, stamps);
+            Some(px)
+        }
         Err(e) => {
             eprintln!("carrot: workspace copy render failed: {e}");
             None
@@ -1684,6 +1700,7 @@ fn rescan(state: &Rc<State>) {
         for t in out.retired_tex.borrow_mut().drain(..) {
             out.renderer.retire_texture(t);
         }
+        out.pending_stamps.borrow_mut().clear();
         eprintln!("carrot: output {} disconnected", out.conn.name);
     }
 
@@ -2027,6 +2044,7 @@ fn init_output(
         closing_layers: RefCell::new(Vec::new()),
         blur: RefCell::new(None),
         blur_dirty: Cell::new(true),
+        pending_stamps: RefCell::new(Vec::new()),
         gpu_done: crate::util::AsyncQueue::default(),
         sched: Sched::default(),
         scanout: RefCell::new(ScanoutState::default()),
@@ -2759,6 +2777,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             // one submit: staged uploads, deferred offscreen passes, the scene
             let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
             let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
+            let stamps = take_stamps(out);
             let f = match out.renderer.render_frame(
                 uploads,
                 passes,
@@ -2767,7 +2786,10 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 &ops,
                 waits,
             ) {
-                Ok(f) => f,
+                Ok(f) => {
+                    apply_stamps(out, stamps);
+                    f
+                }
                 Err(e) => {
                     eprintln!("carrot: render failed: {e}");
                     ops.clear();
@@ -3392,6 +3414,22 @@ enum DrawMode {
     Rest,
 }
 
+/// the stamps ride with the batch: applied when its submit succeeds,
+/// dropped when it fails, so generation always tells the truth about
+/// what actually reached the gpu
+fn take_stamps(out: &Rc<Output>) -> Vec<((ClientId, u64), u64)> {
+    std::mem::take(&mut *out.pending_stamps.borrow_mut())
+}
+
+fn apply_stamps(out: &Rc<Output>, stamps: Vec<((ClientId, u64), u64)>) {
+    let mut texs = out.textures.borrow_mut();
+    for (key, generation) in stamps {
+        if let Some(e) = texs.get_mut(&key) {
+            e.generation = generation;
+        }
+    }
+}
+
 fn compose(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -3883,10 +3921,15 @@ fn draw_buffer(
             }
         }
         // the pixels only move on commit; a compose pass over an
-        // unchanged surface samples the texture it already has
+        // unchanged surface samples the texture it already has. one batch
+        // carries exactly one upload per texture: the generation used to
+        // advance inline here, and when stamping moved to post-submit the
+        // second test below re-tripped on the unchanged value - every
+        // zero-copy upload shipped a second time through a full cpu copy
         let cur = s.content_gen.get();
         let entry = textures.get_mut(&key).unwrap();
-        if entry.generation != cur {
+        let mut fresh = entry.generation == cur;
+        if !fresh {
             // sealed pools sample in place: the gpu copies straight out of
             // the imported client pages, no cpu byte ever moves
             if let Some((hbuf, off)) = buf
@@ -3903,10 +3946,11 @@ fn draw_buffer(
                     (buf.stride / 4) as u32,
                 );
                 out.preuploads.borrow_mut().push(up);
-                entry.generation = cur;
+                out.pending_stamps.borrow_mut().push((key, cur));
+                fresh = true;
             }
         }
-        if entry.generation != cur {
+        if !fresh {
             let shadow = s.shm_shadow.borrow();
             let row = (bw * 4) as usize;
             let need = row * bh as usize;
@@ -3962,7 +4006,7 @@ fn draw_buffer(
                     return;
                 }
             }
-            entry.generation = cur;
+            out.pending_stamps.borrow_mut().push((key, cur));
         }
     }
     let textures = out.textures.borrow();
