@@ -393,6 +393,12 @@ pub struct IccSession {
     /// last successful delivery; paces continuous captures below the
     /// present rate
     served: Cell<u64>,
+    /// a serve task is in flight; triggers coalesce instead of stacking
+    serving: Cell<bool>,
+    /// a trigger landed while a serve was mid-flight; the serve loop owes
+    /// another pass. without this memory the last commit of a burst
+    /// vanished and toplevel captures ran one frame behind
+    pending: Cell<bool>,
     /// the detached serve; held so the task survives, dropped on teardown
     serve_task: Cell<Option<crate::engine::SpawnedFuture<()>>>,
 }
@@ -422,17 +428,49 @@ fn new_session(
         size_debounce: Cell::new(false),
         paint_cursors,
         served: Cell::new(0),
+        serving: Cell::new(false),
+        pending: Cell::new(false),
         serve_task: Cell::new(None),
     })
 }
 
 /// captures serve from a spawned task so the fence await never blocks
-/// the loop; the task dies with the session
-fn spawn_serve(state: &Rc<State>, sess: &Rc<IccSession>) {
+/// the loop; one serve per session at a time. a trigger that finds a
+/// serve in flight marks pending instead of vanishing, and the loop
+/// runs again for it - every trigger is either served or coalesced into
+/// a serve, never dropped
+fn kick(state: &Rc<State>, sess: &Rc<IccSession>) {
+    if sess.stopped.get() {
+        return;
+    }
+    if sess.serving.get() {
+        sess.pending.set(true);
+        return;
+    }
+    sess.serving.set(true);
     let st = state.clone();
     let s = sess.clone();
     sess.serve_task.set(Some(state.eng.spawn("icc serve", async move {
-        service(&st, &s).await;
+        loop {
+            // continuous captures pace here, not at the trigger: a
+            // trigger inside the window waits the window out instead of
+            // being forgotten (the old check silently ate any commit
+            // landing within the gap of a completed serve)
+            let now = crate::util::Time::now().nsec();
+            let gap = SERVE_MIN_NS.saturating_sub(now.saturating_sub(s.served.get()));
+            if gap > 0 {
+                let deadline = crate::util::Time::from_nsec(now + gap);
+                let _ = st.ring.timeout(deadline).await;
+            }
+            service(&st, &s).await;
+            let again = s.pending.replace(false)
+                && !s.stopped.get()
+                && s.status.get() == FrameStatus::Capturing;
+            if !again {
+                break;
+            }
+        }
+        s.serving.set(false);
     })));
 }
 
@@ -559,8 +597,27 @@ async fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
     }
     // the write runs inside the capture's mapped-readback window: rows
     // pwrite straight from the mapping into the client buffer, no
-    // intermediate copy
-    let write = |px: &[u8], pw: u32, _ph: u32| -> bool {
+    // intermediate copy. the rechecks gate it - the capture awaited, and
+    // the client may have torn the frame down and legally started a new
+    // capture on a fresh frame since. frames are one-shot, so frame
+    // identity is the whole discriminator: without it the old serve
+    // wrote stale pixels into a detached buffer, sent ready on a
+    // destroyed object id, and marked the new frame's capture done
+    enum Wrote {
+        Ok,
+        Stale,
+        Failed,
+    }
+    let write = |px: &[u8], pw: u32, _ph: u32| -> Wrote {
+        if sess.stopped.get() || sess.status.get() != FrameStatus::Capturing {
+            return Wrote::Stale;
+        }
+        if !sess.frame.borrow().as_ref().is_some_and(|f| Rc::ptr_eq(f, &frame)) {
+            return Wrote::Stale;
+        }
+        if buf.destroyed.get() {
+            return Wrote::Failed;
+        }
         let src_stride = pw as usize * 4;
         // tight stride and full-width rows: the whole frame is one
         // contiguous span on both sides, one syscall instead of one per
@@ -569,18 +626,18 @@ async fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
             let span = row * ch as usize;
             if let Err(e) = rustix::io::pwrite(fd, &px[..span], base as u64) {
                 eprintln!("carrot: image copy write failed: {e}");
-                return false;
+                return Wrote::Failed;
             }
-            return true;
+            return Wrote::Ok;
         }
         for r in 0..ch as usize {
             let off = (base + r * stride) as u64;
             if let Err(e) = rustix::io::pwrite(fd, &px[r * src_stride..][..row], off) {
                 eprintln!("carrot: image copy write failed: {e}");
-                return false;
+                return Wrote::Failed;
             }
         }
-        true
+        Wrote::Ok
     };
     let wrote = match src {
         Src::Out(slot) => {
@@ -590,13 +647,22 @@ async fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
         Src::Win(win) => crate::output::window_capture(state, &win, write).await,
     };
     match wrote {
-        Some(true) => {
+        Some(Wrote::Ok) => {
             sess.status.set(FrameStatus::Ready);
             sess.force.set(false);
             sess.served.set(crate::util::Time::now().nsec());
             send_ready(sess, frame.id, bw, bh);
         }
-        _ => fail_frame(sess, REASON_UNKNOWN),
+        Some(Wrote::Stale) => {}
+        Some(Wrote::Failed) | None => {
+            // fail only the capture this serve began: a frame torn down
+            // mid-await must never fail its successor
+            if sess.frame.borrow().as_ref().is_some_and(|f| Rc::ptr_eq(f, &frame))
+                && sess.status.get() == FrameStatus::Capturing
+            {
+                fail_frame(sess, REASON_UNKNOWN);
+            }
+        }
     }
 }
 
@@ -677,6 +743,9 @@ impl frame_v1::Handler for IccFrame {
     fn destroy(&self, _req: frame_v1::destroy::Request) -> Result<(), Box<dyn std::error::Error>> {
         let sess = &self.session;
         if sess.frame.borrow().as_ref().is_some_and(|f| f.id == self.id) {
+            // destroying mid-capture cancels it: a serve still in flight
+            // for this frame turns inert at its identity recheck, and the
+            // session is free to capture again on a fresh frame
             sess.frame.borrow_mut().take();
             sess.buffer.borrow_mut().take();
             sess.status.set(FrameStatus::Unused);
@@ -741,7 +810,7 @@ impl frame_v1::Handler for IccFrame {
         sess.status.set(FrameStatus::Capturing);
         if sess.force.get() {
             // prompt first frame; later ones wait for the content to change
-            spawn_serve(&c.state, sess);
+            kick(&c.state, sess);
         }
         Ok(())
     }
@@ -842,17 +911,14 @@ pub fn output_presented(state: &Rc<State>, name: &str) {
     if state.icc_sessions.borrow().is_empty() {
         return;
     }
-    let now = crate::util::Time::now().nsec();
     let sessions = state.icc_sessions.borrow().clone();
     for sess in sessions {
         if sess.status.get() != FrameStatus::Capturing {
             continue;
         }
-        if now.saturating_sub(sess.served.get()) < SERVE_MIN_NS {
-            continue;
-        }
+        // pacing lives in the serve loop; a kick can never be too early
         if matches!(&sess.source, SourceKind::Output(n) if n == name) {
-            spawn_serve(state, &sess);
+            kick(state, &sess);
         }
     }
 }
@@ -863,22 +929,19 @@ pub fn content_changed(state: &Rc<State>, s: &WlSurface) {
     if state.icc_sessions.borrow().is_empty() {
         return;
     }
-    let now = crate::util::Time::now().nsec();
     let sessions = state.icc_sessions.borrow().clone();
     for sess in sessions {
         if sess.status.get() != FrameStatus::Capturing {
             continue;
         }
-        if now.saturating_sub(sess.served.get()) < SERVE_MIN_NS {
-            continue;
-        }
+        // pacing lives in the serve loop; a kick can never be too early
         let SourceKind::Toplevel(weak) = &sess.source else {
             continue;
         };
         let win = weak.borrow().upgrade();
         let Some(win) = win else { continue };
         if tree_contains(&win.surface(), s.uid) {
-            spawn_serve(state, &sess);
+            kick(state, &sess);
         }
     }
 }
