@@ -258,7 +258,7 @@ async fn tick_loop(state: Rc<State>) {
                     earliest = Some(earliest.map_or(due, |e: u64| e.min(due)));
                     continue;
                 }
-                if c.feed_hidden(&state) {
+                if c.feed_hidden(&state).await {
                     c.dirty.set(false);
                 } else {
                     // stream blocked (negotiation, mid-resize): stay dirty
@@ -440,7 +440,7 @@ fn shown_workspace(state: &Rc<State>, name: &str) -> Option<Rc<Workspace>> {
 }
 
 /// present tail: the frame just shown is what casts of this output stream
-pub fn output_presented(state: &Rc<State>, name: &str) {
+pub async fn output_presented(state: &Rc<State>, name: &str) {
     if state.casts.borrow().is_empty() {
         return;
     }
@@ -451,7 +451,7 @@ pub fn output_presented(state: &Rc<State>, name: &str) {
             sweep = true;
             continue;
         }
-        c.feed(state, name);
+        c.feed(state, name).await;
     }
     if sweep {
         state.casts.borrow_mut().retain(|c| !c.dead.get());
@@ -472,7 +472,7 @@ impl Cast {
         }
     }
 
-    fn feed(&self, state: &Rc<State>, presented: &str) {
+    async fn feed(&self, state: &Rc<State>, presented: &str) {
         let (cap, w, h) = match &self.source {
             Source::Output(name) => {
                 if name != presented {
@@ -531,12 +531,12 @@ impl Cast {
                 }
             }
         };
-        self.push_frame(state, cap, w, h);
+        self.push_frame(state, cap, w, h).await;
     }
 
     /// false = the stream couldn't take a frame right now (negotiation,
     /// mid-resize, failed capture); the tick retries those
-    fn push_frame(&self, state: &Rc<State>, cap: Cap, w: u32, h: u32) -> bool {
+    async fn push_frame(&self, state: &Rc<State>, cap: Cap, w: u32, h: u32) -> bool {
         {
             let n = self.node.borrow();
             if w != n.width || h != n.height {
@@ -563,15 +563,18 @@ impl Cast {
             // fresh enough counts as fed
             return true;
         }
+        // the sink runs over the capture's mapped readback; the pixels
+        // are copied out once, into a frame-sized Vec for produce below
+        let sink = |px: &[u8], _cw: u32, _ch: u32| px.to_vec();
         let px = match cap {
             Cap::Out(idx) => {
                 let Some(region) = crate::rect::Rect::new_sized(0, 0, w as i32, h as i32) else {
                     return false;
                 };
-                crate::output::screencopy(state, idx, region, self.cursor, crate::config::CaptureKind::Video)
+                crate::output::screencopy(state, idx, region, self.cursor, crate::config::CaptureKind::Video, sink).await
             }
-            Cap::Ws(index) => crate::output::workspace_copy(state, index),
-            Cap::Win(win) => crate::output::window_capture(state, &win),
+            Cap::Ws(index) => crate::output::workspace_copy(state, index, sink).await,
+            Cap::Win(win) => crate::output::window_capture(state, &win, sink).await,
         };
         crate::trace!("cast: frame {} t={}", px.is_some(), Time::now().nsec());
         let Some(px) = px else { return false };
@@ -604,7 +607,7 @@ impl Cast {
     /// tick-driven feed for a source that is off glass; false = blocked,
     /// the caller keeps it dirty and retries. the heartbeat fires either
     /// way so the hidden clients stay alive through stream negotiation
-    fn feed_hidden(&self, state: &Rc<State>) -> bool {
+    async fn feed_hidden(&self, state: &Rc<State>) -> bool {
         let ms = (Time::now().nsec() / 1_000_000) as u32;
         match &self.source {
             Source::Output(_) => true,
@@ -620,12 +623,9 @@ impl Cast {
                 if rect.is_empty() {
                     return true;
                 }
-                let fed = self.push_frame(
-                    state,
-                    Cap::Win(win.clone()),
-                    rect.width() as u32,
-                    rect.height() as u32,
-                );
+                let fed = self
+                    .push_frame(state, Cap::Win(win.clone()), rect.width() as u32, rect.height() as u32)
+                    .await;
                 fire_tree(&win.surface(), ms);
                 fed
             }
@@ -644,7 +644,7 @@ impl Cast {
                     (out.width, out.height)
                 };
                 crate::trace!("cast: tick ws {} feed", index);
-                let fed = self.push_frame(state, Cap::Ws(*index), w, h);
+                let fed = self.push_frame(state, Cap::Ws(*index), w, h).await;
                 ws.for_each(|win| fire_tree(&win.surface(), ms));
                 fed
             }

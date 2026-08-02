@@ -393,6 +393,8 @@ pub struct IccSession {
     /// last successful delivery; paces continuous captures below the
     /// present rate
     served: Cell<u64>,
+    /// the detached serve; held so the task survives, dropped on teardown
+    serve_task: Cell<Option<crate::engine::SpawnedFuture<()>>>,
 }
 
 /// continuous captures complete at most ~60 times a second; a skipped
@@ -420,7 +422,18 @@ fn new_session(
         size_debounce: Cell::new(false),
         paint_cursors,
         served: Cell::new(0),
+        serve_task: Cell::new(None),
     })
+}
+
+/// captures serve from a spawned task so the fence await never blocks
+/// the loop; the task dies with the session
+fn spawn_serve(state: &Rc<State>, sess: &Rc<IccSession>) {
+    let st = state.clone();
+    let s = sess.clone();
+    sess.serve_task.set(Some(state.eng.spawn("icc serve", async move {
+        service(&st, &s).await;
+    })));
 }
 
 impl IccSession {
@@ -491,7 +504,7 @@ fn send_ready(sess: &IccSession, frame_id: ObjectId, bw: u32, bh: u32) {
 }
 
 /// complete one pending capture: resolve the source, copy, report
-fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
+async fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
     if sess.status.get() != FrameStatus::Capturing {
         return;
     }
@@ -544,37 +557,47 @@ fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
         fail_frame(sess, REASON_UNKNOWN);
         return;
     }
-    let (px, src_stride) = match src {
+    // the write runs inside the capture's mapped-readback window: rows
+    // pwrite straight from the mapping into the client buffer, no
+    // intermediate copy
+    let write = |px: &[u8], pw: u32, _ph: u32| -> bool {
+        let src_stride = pw as usize * 4;
+        // tight stride and full-width rows: the whole frame is one
+        // contiguous span on both sides, one syscall instead of one per
+        // row (1440 pwrites per frame taught this lesson)
+        if stride == row && src_stride == row {
+            let span = row * ch as usize;
+            if let Err(e) = rustix::io::pwrite(fd, &px[..span], base as u64) {
+                eprintln!("carrot: image copy write failed: {e}");
+                return false;
+            }
+            return true;
+        }
+        for r in 0..ch as usize {
+            let off = (base + r * stride) as u64;
+            if let Err(e) = rustix::io::pwrite(fd, &px[r * src_stride..][..row], off) {
+                eprintln!("carrot: image copy write failed: {e}");
+                return false;
+            }
+        }
+        true
+    };
+    let wrote = match src {
         Src::Out(slot) => {
             let region = Rect::new_sized_saturating(0, 0, cw as i32, ch as i32);
-            match crate::output::screencopy(state, slot, region, sess.paint_cursors, crate::config::CaptureKind::Screenshot) {
-                Some(px) => (px, row),
-                None => {
-                    fail_frame(sess, REASON_UNKNOWN);
-                    return;
-                }
-            }
+            crate::output::screencopy(state, slot, region, sess.paint_cursors, crate::config::CaptureKind::Screenshot, write).await
         }
-        Src::Win(win) => match crate::output::window_capture(state, &win) {
-            Some(px) => (px, cur_w as usize * 4),
-            None => {
-                fail_frame(sess, REASON_UNKNOWN);
-                return;
-            }
-        },
+        Src::Win(win) => crate::output::window_capture(state, &win, write).await,
     };
-    for r in 0..ch as usize {
-        let off = (base + r * stride) as u64;
-        if let Err(e) = rustix::io::pwrite(fd, &px[r * src_stride..][..row], off) {
-            eprintln!("carrot: image copy write failed: {e}");
-            fail_frame(sess, REASON_UNKNOWN);
-            return;
+    match wrote {
+        Some(true) => {
+            sess.status.set(FrameStatus::Ready);
+            sess.force.set(false);
+            sess.served.set(crate::util::Time::now().nsec());
+            send_ready(sess, frame.id, bw, bh);
         }
+        _ => fail_frame(sess, REASON_UNKNOWN),
     }
-    sess.status.set(FrameStatus::Ready);
-    sess.force.set(false);
-    sess.served.set(crate::util::Time::now().nsec());
-    send_ready(sess, frame.id, bw, bh);
 }
 
 impl session_v1::Handler for IccSession {
@@ -718,7 +741,7 @@ impl frame_v1::Handler for IccFrame {
         sess.status.set(FrameStatus::Capturing);
         if sess.force.get() {
             // prompt first frame; later ones wait for the content to change
-            service(&c.state, sess);
+            spawn_serve(&c.state, sess);
         }
         Ok(())
     }
@@ -829,7 +852,7 @@ pub fn output_presented(state: &Rc<State>, name: &str) {
             continue;
         }
         if matches!(&sess.source, SourceKind::Output(n) if n == name) {
-            service(state, &sess);
+            spawn_serve(state, &sess);
         }
     }
 }
@@ -855,7 +878,7 @@ pub fn content_changed(state: &Rc<State>, s: &WlSurface) {
         let win = weak.borrow().upgrade();
         let Some(win) = win else { continue };
         if tree_contains(&win.surface(), s.uid) {
-            service(state, &sess);
+            spawn_serve(state, &sess);
         }
     }
 }

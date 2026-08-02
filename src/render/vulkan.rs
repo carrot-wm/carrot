@@ -327,6 +327,21 @@ impl VkCore {
         Ok(out)
     }
 
+    /// like find_memory_type, but shops for `preferred` extras first.
+    /// readback buffers live or die by this: the first host-visible type
+    /// a driver lists can be write-combined BAR memory, and cpu READS
+    /// from that run at fractions of a GB/s - every capture then stalls
+    /// the loop for the whole copy
+    pub fn find_memory_type_pref(
+        &self,
+        bits: u32,
+        required: vk::MemoryPropertyFlags,
+        preferred: vk::MemoryPropertyFlags,
+    ) -> Result<u32, RenderError> {
+        self.find_memory_type(bits, required | preferred)
+            .or_else(|_| self.find_memory_type(bits, required))
+    }
+
     pub fn find_memory_type(
         &self,
         bits: u32,

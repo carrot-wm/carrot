@@ -1167,16 +1167,35 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
     None
 }
 
-/// screenshot capture: compose the output like a present would, render
-/// offscreen, read back, crop to the output-local region. rows come back
-/// tightly packed (stride = width * 4).
-pub fn screencopy(
+/// once-per-second gate for capture diagnostics: quiet paths that fail
+/// silently otherwise (a black stream carries no error anywhere)
+pub(crate) fn cap_diag() -> bool {
+    thread_local! {
+        static GATE: crate::util::LogGate = Default::default();
+    }
+    GATE.with(|g| g.pass(Time::now().nsec()).is_some())
+}
+
+/// diagnosis knob, read once for the process: a capture that only works
+/// without waits names a poisoned client fence
+fn capture_no_waits() -> bool {
+    static KNOB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KNOB.get_or_init(|| std::env::var_os("CARROT_CAPTURE_NO_WAITS").is_some())
+}
+
+/// screenshot capture: compose the output like a present would, remap the
+/// ops region-local and render at the region's own size - no CPU crop
+/// pass, and parts past the output edge come out black from the clear.
+/// `sink` runs over the mapped readback (tightly packed width*4 rows,
+/// dims passed along); its return value rides out
+pub async fn screencopy<R>(
     state: &Rc<State>,
     out_index: usize,
     region: Rect,
     cursor: bool,
     kind: crate::config::CaptureKind,
-) -> Option<Vec<u8>> {
+    sink: impl FnOnce(&[u8], u32, u32) -> R,
+) -> Option<R> {
     let d = state.display.borrow();
     let out = d.as_ref()?.outputs.borrow().get(out_index)?.clone();
     drop(d);
@@ -1184,47 +1203,76 @@ pub fn screencopy(
     let mut ops = Vec::new();
     let mut live = Vec::new();
     compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never }, None, &mut ops, &mut live);
+    let (gx, gy) = out.pos.get();
+    let target = Rect::new_sized(gx + region.x1, gy + region.y1, region.width(), region.height())?;
+    remap_local(&mut ops, &out, target);
     let stamps = take_stamps(&out);
     let mut waits = Vec::new();
+    // this compose exported these fences for the buffers it samples; the
+    // batch consumes its own, and the next compose exports fresh ones.
+    // CARROT_CAPTURE_NO_WAITS drops them for diagnosis: a capture that
+    // only works without waits names a poisoned client fence
+    let skip_waits = capture_no_waits();
     for fence in out.frame_fences.borrow_mut().drain(..) {
+        if skip_waits {
+            continue;
+        }
         if let Ok(sem) = out.renderer.import_wait(fence) {
             waits.push(sem);
         }
     }
     let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
     let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
-    let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
-        Ok(px) => {
-            apply_stamps(&out, stamps);
-            px
-        }
+    let (rw, rh) = (region.width() as u32, region.height() as u32);
+    let pending = match out.renderer.read_frame_submit(rw, rh, uploads, passes, &ops, waits) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("carrot: screencopy render failed: {e}");
             return None;
         }
     };
-    let (rw, rh) = (region.width() as usize, region.height() as usize);
-    let src_stride = out.width as usize * 4;
-    let mut px = vec![0u8; rw * rh * 4];
-    // the region may predate a topology change and outsize the output now
-    // in the slot; rows past the live extent stay black instead of
-    // slicing past the readback
-    let vis = region.intersect(Rect::new_sized_saturating(0, 0, out.width as i32, out.height as i32));
-    let n = vis.width() as usize * 4;
-    for row in vis.y1..vis.y2 {
-        let s0 = row as usize * src_stride + vis.x1 as usize * 4;
-        let d0 = (row - region.y1) as usize * rw * 4 + (vis.x1 - region.x1) as usize * 4;
-        px[d0..d0 + n].copy_from_slice(&full[s0..s0 + n]);
+    // await the fence on the ring: the input reader keeps draining while
+    // the gpu finishes, which is what keeps fast mice from overflowing
+    // the kernel queue under capture load
+    apply_stamps(&out, stamps);
+    if let Some(fd) = pending.fd() {
+        let deadline = Time::from_nsec(Time::now().nsec() + 500_000_000);
+        match state.ring.readable_by(&fd, deadline).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // a poisoned client fence must cost this capture, never
+                // the task: dropping pending parks the frame in the yard
+                // and the slot reopens once a reap proves the fence
+                eprintln!("carrot: capture fence not ready in 500ms; capture dropped");
+                return None;
+            }
+            Err(e) => eprintln!("carrot: capture fence poll failed: {e:?}"),
+        }
     }
-    Some(px)
+    match pending.finish_with(|px| sink(px, rw, rh)) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("carrot: screencopy render failed: {e}");
+            None
+        }
+    }
 }
 
 /// window capture: compose only the toplevel's surface tree - subsurfaces
-/// included, popups/borders/opacity rules not - then read back and crop to
-/// its rect. rows come back tightly packed (stride = rect width * 4).
-pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Option<Vec<u8>> {
+/// included, popups/borders/opacity rules not - remapped rect-local and
+/// rendered at the rect's own size, so even parts hanging past the output
+/// edge capture whole. `sink` runs over the mapped readback (tightly
+/// packed rect-width*4 rows, dims passed along)
+pub async fn window_capture<R>(
+    state: &Rc<State>,
+    win: &Rc<crate::tree::Window>,
+    sink: impl FnOnce(&[u8], u32, u32) -> R,
+) -> Option<R> {
     let surface = win.surface();
     if !surface.mapped.get() {
+        if cap_diag() {
+            eprintln!("carrot: window capture: #{} source unmapped, no frame", win.ident);
+        }
         return None;
     }
     let ws = crate::tree::workspace_of(state, win)?;
@@ -1246,51 +1294,77 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
         for p in px.chunks_exact_mut(4) {
             p[3] = 0xff;
         }
-        return Some(px);
+        return Some(sink(&px, rect.width() as u32, rect.height() as u32));
     }
     let geo = win.geometry();
     let mut ops = Vec::new();
     let mut live = Vec::new();
     draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, 0.0, &mut ops, &mut live);
+    if ops.is_empty() && cap_diag() {
+        eprintln!(
+            "carrot: window capture: #{} composed no ops (rect {}x{}), frame is bare clear",
+            win.ident,
+            rect.width(),
+            rect.height()
+        );
+    }
+    remap_local(&mut ops, &out, rect);
     // hidden-window casts land here; spare their textures from the sweep
     note_cast_keys(&out, &live);
     let stamps = take_stamps(&out);
     let mut waits = Vec::new();
+    // this compose exported these fences for the buffers it samples; the
+    // batch consumes its own, and the next compose exports fresh ones.
+    // CARROT_CAPTURE_NO_WAITS drops them for diagnosis: a capture that
+    // only works without waits names a poisoned client fence
+    let skip_waits = capture_no_waits();
     for fence in out.frame_fences.borrow_mut().drain(..) {
+        if skip_waits {
+            continue;
+        }
         if let Ok(sem) = out.renderer.import_wait(fence) {
             waits.push(sem);
         }
     }
     let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
     let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
-    let full = match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
-        Ok(px) => {
-            apply_stamps(&out, stamps);
-            px
-        }
+    let (rw, rh) = (rect.width() as u32, rect.height() as u32);
+    let pending = match out.renderer.read_frame_submit(rw, rh, uploads, passes, &ops, waits) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("carrot: window capture render failed: {e}");
             return None;
         }
     };
-    let (rw, rh) = (rect.width() as usize, rect.height() as usize);
-    let mut px = vec![0u8; rw * rh * 4];
-    // a float can hang off the screen; rows outside the output stay black
-    let vis = rect.intersect(out.rect());
-    let (gx, gy) = out.pos.get();
-    let src_stride = out.width as usize * 4;
-    let n = vis.width() as usize * 4;
-    for row in vis.y1..vis.y2 {
-        let s0 = (row - gy) as usize * src_stride + (vis.x1 - gx) as usize * 4;
-        let d0 = (row - rect.y1) as usize * rw * 4 + (vis.x1 - rect.x1) as usize * 4;
-        px[d0..d0 + n].copy_from_slice(&full[s0..s0 + n]);
+    apply_stamps(&out, stamps);
+    if let Some(fd) = pending.fd() {
+        let deadline = Time::from_nsec(Time::now().nsec() + 500_000_000);
+        match state.ring.readable_by(&fd, deadline).await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("carrot: capture fence not ready in 500ms; capture dropped");
+                return None;
+            }
+            Err(e) => eprintln!("carrot: capture fence poll failed: {e:?}"),
+        }
     }
-    Some(px)
+    match pending.finish_with(|px| sink(px, rw, rh)) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("carrot: window capture render failed: {e}");
+            None
+        }
+    }
 }
 
-/// compose a workspace offscreen - shown or not - and read it back at its
-/// assigned output's size. hidden compose never embeds the cursor
-pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
+/// compose a workspace offscreen - shown or not - at its assigned
+/// output's size; `sink` runs over the mapped readback. hidden compose
+/// never embeds the cursor
+pub async fn workspace_copy<R>(
+    state: &Rc<State>,
+    ws_index: usize,
+    sink: impl FnOnce(&[u8], u32, u32) -> R,
+) -> Option<R> {
     let out_slot = state.workspaces.borrow().get(ws_index)?.output.get();
     let out = {
         let d = state.display.borrow();
@@ -1303,18 +1377,43 @@ pub fn workspace_copy(state: &Rc<State>, ws_index: usize) -> Option<Vec<u8>> {
     compose_ops(state, &out, CapCursor::Never, Some(ws_index), &mut ops, &mut live);
     let stamps = take_stamps(&out);
     let mut waits = Vec::new();
+    // this compose exported these fences for the buffers it samples; the
+    // batch consumes its own, and the next compose exports fresh ones.
+    // CARROT_CAPTURE_NO_WAITS drops them for diagnosis: a capture that
+    // only works without waits names a poisoned client fence
+    let skip_waits = capture_no_waits();
     for fence in out.frame_fences.borrow_mut().drain(..) {
+        if skip_waits {
+            continue;
+        }
         if let Ok(sem) = out.renderer.import_wait(fence) {
             waits.push(sem);
         }
     }
     let uploads = std::mem::take(&mut *out.preuploads.borrow_mut());
     let passes = std::mem::take(&mut *out.prepasses.borrow_mut());
-    match out.renderer.read_frame(out.width, out.height, uploads, passes, &ops, waits) {
-        Ok(px) => {
-            apply_stamps(&out, stamps);
-            Some(px)
+    let (rw, rh) = (out.width, out.height);
+    let pending = match out.renderer.read_frame_submit(rw, rh, uploads, passes, &ops, waits) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("carrot: workspace copy render failed: {e}");
+            return None;
         }
+    };
+    apply_stamps(&out, stamps);
+    if let Some(fd) = pending.fd() {
+        let deadline = Time::from_nsec(Time::now().nsec() + 500_000_000);
+        match state.ring.readable_by(&fd, deadline).await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("carrot: capture fence not ready in 500ms; capture dropped");
+                return None;
+            }
+            Err(e) => eprintln!("carrot: capture fence poll failed: {e:?}"),
+        }
+    }
+    match pending.finish_with(|px| sink(px, rw, rh)) {
+        Ok(r) => Some(r),
         Err(e) => {
             eprintln!("carrot: workspace copy render failed: {e}");
             None
@@ -2711,7 +2810,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                         // scanout frame still owes them the new-frame kick
                         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
                         crate::protocol::session_lock::output_presented(state, &out.conn.name);
-                        crate::portal::cast::output_presented(state, &out.conn.name);
+                        crate::portal::cast::output_presented(state, &out.conn.name).await;
                         continue;
                     }
                     Ok(FlipResult::NotPresented) => {
@@ -3225,7 +3324,7 @@ async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
         // pending output captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
         crate::protocol::session_lock::output_presented(state, &out.conn.name);
-        crate::portal::cast::output_presented(state, &out.conn.name);
+        crate::portal::cast::output_presented(state, &out.conn.name).await;
     }
 }
 

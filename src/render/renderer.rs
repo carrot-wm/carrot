@@ -312,8 +312,11 @@ struct HostImport {
     memory: vk::DeviceMemory,
 }
 
-/// offscreen target + readback buffer the captures reuse call to call
-struct CaptureTarget {
+/// one offscreen target + readback buffer in the capture pool. slots are
+/// size-keyed and reused call to call; per-slot busy means concurrent
+/// consumers (a cast, a screenshot, an icc session) never contend, they
+/// just hold different slots
+struct CaptureSlot {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
@@ -321,7 +324,19 @@ struct CaptureTarget {
     bmem: vk::DeviceMemory,
     width: u32,
     height: u32,
+    /// a readback rides this slot right now (or sits parked on it)
+    busy: Cell<bool>,
+    /// submit seq at last release; the pool evicts oldest-free first
+    last_used: Cell<u64>,
+    /// image + readback allocation size, for the pool budget
+    bytes: u64,
+    /// persistent map of the readback buffer
+    ptr: *mut u8,
 }
+
+/// free capture slots above this budget evict oldest-first; busy slots
+/// are demand and never count against it
+const CAPTURE_POOL_BYTES: u64 = 128 << 20;
 
 /// fence-proven deferred destruction, shared by every output on the card.
 /// passive storage only: destruction happens in Renderer methods, never
@@ -354,6 +369,9 @@ struct FrameInner {
     /// the pool a fast-path copy reads; pinned until the frame retires
     pool: Option<Rc<crate::clientmem::ClientMem>>,
     seq: u64,
+    /// the capture slot this readback rides; recycle releases it back
+    /// to the pool once the fence proves the copy done
+    slot: Option<Rc<CaptureSlot>>,
 }
 
 /// a submitted frame. wait() is for bring-up and captures; the present
@@ -405,6 +423,66 @@ impl Frame {
     }
 }
 
+/// a submitted readback. the fence rides out as a sync fd the caller
+/// awaits on the ring; pixels map in finish, after it signals. dropping
+/// without finish parks the frame in the yard (Frame::Drop), so a
+/// cancelled or timed-out serve can never leak it or block the loop;
+/// the capture slot reopens when a reap proves the fence
+pub struct PendingRead {
+    r: Rc<Renderer>,
+    frame: Option<Frame>,
+    fd: Option<Rc<OwnedFd>>,
+    /// the pool slot whose readback buffer this read maps; the frame
+    /// holds it too, and recycle hands it back to the pool
+    slot: Rc<CaptureSlot>,
+    w: u32,
+    h: u32,
+    /// how many imported client fences gated the submit; a park names
+    /// the count so a poisoned fence is visible in the log
+    n_waits: usize,
+}
+
+impl PendingRead {
+    pub fn fd(&self) -> Option<Rc<OwnedFd>> {
+        self.fd.clone()
+    }
+
+    /// wait (bounded), then run `sink` over the mapped readback: tightly
+    /// packed w*h*4 rows, valid only for the call. consumers copy or
+    /// pwrite rows straight out of the mapping - no frame-sized
+    /// intermediate Vec exists anywhere in the capture path
+    pub fn finish_with<R>(mut self, sink: impl FnOnce(&[u8]) -> R) -> Result<R, RenderError> {
+        let r = self.r.clone();
+        let frame = self.frame.take().unwrap();
+        // the fd path arrives signaled; the fd-less fallback gets a
+        // bounded wait. a wedged gpu must cost this one capture, never
+        // the loop - the old infinite wait here was a reboot
+        let waited = unsafe {
+            r.core
+                .device
+                .wait_for_fences(&[frame.inner().fence], true, 500_000_000)
+        };
+        if waited.is_err() {
+            eprintln!(
+                "carrot: capture fence not signaled in 500ms ({} wait semaphores \
+                 rode the submit); frame parked, captures resume when it clears",
+                self.n_waits
+            );
+            // the batch may still write the capture buffer: the dropped
+            // frame parks in the yard and the slot stays claimed instead
+            // of unmapping under it. a reap recycles it once it signals
+            drop(frame);
+            return Err(RenderError::Load("capture fence timeout".into()));
+        }
+        // recycle hands the slot back to the pool; the map/sink below
+        // runs before any task switch, so no new capture can race it
+        frame.wait(&r)?;
+        let size = (self.w as usize) * (self.h as usize) * 4;
+        let px = unsafe { std::slice::from_raw_parts(self.slot.ptr, size) };
+        Ok(sink(px))
+    }
+}
+
 // -- renderer --
 
 struct Pipelines {
@@ -445,7 +523,7 @@ pub struct Renderer {
     pool: vk::CommandPool,
     free_cbs: RefCell<Vec<vk::CommandBuffer>>,
     tex_uid: Cell<u64>,
-    capture: RefCell<Option<CaptureTarget>>,
+    captures: RefCell<Vec<Rc<CaptureSlot>>>,
     /// recycled import semaphores: a TEMPORARY sync-fd import reverts
     /// after its one wait, so the handle is reusable. one per fenced
     /// dmabuf per compose at 480Hz made create/destroy real overhead
@@ -636,7 +714,7 @@ impl Renderer {
             pool,
             free_cbs: RefCell::new(Vec::new()),
             tex_uid: Cell::new(0),
-            capture: RefCell::new(None),
+            captures: RefCell::new(Vec::new()),
             sem_pool: RefCell::new(Vec::new()),
             upload_slots: RefCell::new(Vec::new()),
             host_imports: RefCell::new(HashMap::new()),
@@ -1034,7 +1112,7 @@ impl Renderer {
         let seq = self.yard.submit_seq.get() + 1;
         self.yard.submit_seq.set(seq);
         Ok(Frame {
-            inner: Some(FrameInner { cb, fence, waits, staging, pool, seq, export_sem: None }),
+            inner: Some(FrameInner { cb, fence, waits, staging, pool, seq, slot: None, export_sem: None }),
             yard: self.yard.clone(),
         })
     }
@@ -1635,6 +1713,9 @@ impl Renderer {
             }
         }
         self.free_cbs.borrow_mut().push(f.cb);
+        if let Some(slot) = &f.slot {
+            self.release_capture(slot);
+        }
         self.drain_yard_textures();
     }
 
@@ -1950,18 +2031,58 @@ impl Renderer {
 
     /// the persistent capture target + readback buffer; rebuilt on a size
     /// change, gpu-idle by construction (read_frame waits before returning)
-    fn ensure_capture(&self, w: u32, h: u32) -> Result<(), RenderError> {
-        if self
-            .capture
+    /// claim a slot sized exactly (w, h): a free match reuses, anything
+    /// else allocates fresh. mixed consumers (full-output casts next to
+    /// window captures) each keep their own size warm instead of
+    /// reallocating the one target every alternation
+    fn acquire_capture(&self, w: u32, h: u32) -> Result<Rc<CaptureSlot>, RenderError> {
+        if let Some(slot) = self
+            .captures
             .borrow()
-            .as_ref()
-            .is_some_and(|c| c.width == w && c.height == h)
+            .iter()
+            .find(|s| !s.busy.get() && s.width == w && s.height == h)
+            .cloned()
         {
-            return Ok(());
+            slot.busy.set(true);
+            return Ok(slot);
         }
-        if let Some(old) = self.capture.borrow_mut().take() {
-            self.destroy_capture(&old);
+        let slot = Rc::new(self.create_capture(w, h)?);
+        slot.busy.set(true);
+        self.captures.borrow_mut().push(slot.clone());
+        self.evict_captures();
+        Ok(slot)
+    }
+
+    /// hand a slot back to the pool; recycle calls this once the frame's
+    /// fence proves the readback done
+    fn release_capture(&self, slot: &Rc<CaptureSlot>) {
+        slot.busy.set(false);
+        slot.last_used.set(self.yard.submit_seq.get());
+        self.evict_captures();
+    }
+
+    /// free slots above the byte budget evict oldest-first; busy slots
+    /// are live demand and never evict
+    fn evict_captures(&self) {
+        let mut pool = self.captures.borrow_mut();
+        loop {
+            let total: u64 = pool.iter().filter(|s| !s.busy.get()).map(|s| s.bytes).sum();
+            if total <= CAPTURE_POOL_BYTES {
+                return;
+            }
+            let oldest = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.busy.get())
+                .min_by_key(|(_, s)| s.last_used.get())
+                .map(|(i, _)| i);
+            let Some(i) = oldest else { return };
+            let slot = pool.swap_remove(i);
+            self.destroy_capture(&slot);
         }
+    }
+
+    fn create_capture(&self, w: u32, h: u32) -> Result<CaptureSlot, RenderError> {
         let dev = &self.core.device;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1996,20 +2117,27 @@ impl Renderer {
         let buffer = unsafe { dev.create_buffer(&binfo, None) }?;
         let buf_guard = crate::util::OnDrop(|| unsafe { dev.destroy_buffer(buffer, None) });
         let breqs = unsafe { dev.get_buffer_memory_requirements(buffer) };
-        let btype = self.core.find_memory_type(
+        // the cpu READS this buffer every frame: cached wins over
+        // whatever write-combined type the driver lists first
+        let btype = self.core.find_memory_type_pref(
             breqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            vk::MemoryPropertyFlags::HOST_CACHED,
         )?;
         let balloc = vk::MemoryAllocateInfo::default()
             .allocation_size(breqs.size)
             .memory_type_index(btype);
         let bmem = unsafe { dev.allocate_memory(&balloc, None) }?;
         unsafe { dev.bind_buffer_memory(buffer, bmem, 0) }?;
+        // persistent map: the slot's readback is consumed every frame,
+        // a map/unmap pair per capture is pure churn
+        let ptr = unsafe { dev.map_memory(bmem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?
+            as *mut u8;
         std::mem::forget(buf_guard);
         std::mem::forget(view_guard);
         std::mem::forget(mem_guard);
         std::mem::forget(img_guard);
-        *self.capture.borrow_mut() = Some(CaptureTarget {
+        Ok(CaptureSlot {
             image,
             memory,
             view,
@@ -2017,11 +2145,14 @@ impl Renderer {
             bmem,
             width: w,
             height: h,
-        });
-        Ok(())
+            busy: Cell::new(false),
+            last_used: Cell::new(self.yard.submit_seq.get()),
+            bytes: reqs.size + breqs.size,
+            ptr,
+        })
     }
 
-    fn destroy_capture(&self, c: &CaptureTarget) {
+    fn destroy_capture(&self, c: &CaptureSlot) {
         let dev = &self.core.device;
         unsafe {
             dev.destroy_image_view(c.view, None);
@@ -2032,6 +2163,10 @@ impl Renderer {
         }
     }
 
+    /// render pending uploads/pre-passes + ops offscreen and read the
+    /// pixels back as tightly packed rows. one submit, one fence wait;
+    /// the target and readback buffer persist across calls.
+    #[allow(clippy::too_many_arguments)]
     /// prove and destroy whatever the yard holds. upload-slot fences fold
     /// into done_seq too: a card whose last submission was a commit-time
     /// upload must still be able to drain its retired textures
@@ -2046,41 +2181,51 @@ impl Renderer {
         if !self.yard.frames.borrow().is_empty() {
             let lot: Vec<FrameInner> = self.yard.frames.borrow_mut().drain(..).collect();
             let mut still = Vec::new();
+            let mut resumed = false;
             for f in lot {
                 let done =
                     unsafe { self.core.device.get_fence_status(f.fence) }.unwrap_or(false);
                 if done {
+                    resumed |= f.slot.is_some();
                     self.recycle(f);
                 } else {
                     still.push(f);
                 }
             }
             self.yard.frames.borrow_mut().extend(still);
+            if resumed {
+                eprintln!("carrot: parked capture frame reclaimed; captures resume");
+            }
         }
         self.drain_yard_textures();
     }
 
-    /// render pending uploads/pre-passes + ops offscreen and read the
-    /// pixels back as tightly packed rows. one submit, one fence wait;
-    /// the target and readback buffer persist across calls.
-    #[allow(clippy::too_many_arguments)]
-    pub fn read_frame(
-        &self,
+    pub fn read_frame_submit(
+        self: &Rc<Self>,
         w: u32,
         h: u32,
         uploads: Vec<PreUpload>,
         passes: Vec<PrePass>,
         ops: &[RenderOp],
         waits: Vec<vk::Semaphore>,
-    ) -> Result<Vec<u8>, RenderError> {
+    ) -> Result<PendingRead, RenderError> {
+        self.reap();
+        let n_waits = waits.len();
         let dev = &self.core.device;
-        if let Err(e) = self.ensure_capture(w, h) {
-            self.release_batch(&waits, &uploads);
-            return Err(e);
-        }
-        let slot = self.capture.borrow();
-        let cap = slot.as_ref().unwrap();
-        let cb = self.open_batch(&waits, &uploads)?;
+        let cap = match self.acquire_capture(w, h) {
+            Ok(s) => s,
+            Err(e) => {
+                self.release_batch(&waits, &uploads);
+                return Err(e);
+            }
+        };
+        let cb = match self.open_batch(&waits, &uploads) {
+            Ok(cb) => cb,
+            Err(e) => {
+                self.release_capture(&cap);
+                return Err(e);
+            }
+        };
         let transitions = self.record_pre(cb, &uploads, &passes);
         // every capture clears, so the old contents can be discarded; the
         // previous read finished before the last call returned
@@ -2115,17 +2260,15 @@ impl Renderer {
                 &[region],
             );
         }
-        let frame = self.submit_frame(cb, waits, uploads, None, transitions, None)?;
-        frame.wait(self)?;
-
-        let size = (w as u64) * (h as u64) * 4;
-        let mut out = vec![0u8; size as usize];
-        unsafe {
-            let ptr = dev.map_memory(cap.bmem, 0, size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), size as usize);
-            dev.unmap_memory(cap.bmem);
-        }
-        Ok(out)
+        let (mut frame, fd) = match self.submit_with_sync(cb, waits, uploads, None, transitions) {
+            Ok(r) => r,
+            Err(e) => {
+                self.release_capture(&cap);
+                return Err(e);
+            }
+        };
+        frame.inner.as_mut().unwrap().slot = Some(cap.clone());
+        Ok(PendingRead { r: self.clone(), frame: Some(frame), fd, slot: cap, w, h, n_waits })
     }
 
     /// fill a staging buffer for the next submit; `fill` writes tightly
@@ -2706,8 +2849,8 @@ impl Drop for Renderer {
         unsafe {
             let _ = dev.device_wait_idle();
         }
-        if let Some(c) = self.capture.borrow_mut().take() {
-            self.destroy_capture(&c);
+        for slot in self.captures.borrow_mut().drain(..) {
+            self.destroy_capture(&slot);
         }
         for s in self.sem_pool.borrow_mut().drain(..) {
             unsafe {

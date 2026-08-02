@@ -59,6 +59,7 @@ impl ScreencopyManager {
             rect: Cell::new(Rect::default()),
             used: Cell::new(false),
             overlay_cursor,
+            task: Cell::new(None),
         });
         c.add_client_obj(frame.clone())?;
         let Some((_, ow, oh)) = geo else {
@@ -148,6 +149,9 @@ pub struct ScreencopyFrame {
     used: Cell<bool>,
     /// compose the pointer into the copy (the wlr overlay_cursor flag)
     overlay_cursor: bool,
+    /// the in-flight copy; the serve awaits its fence off-loop, and the
+    /// task dies with the frame object
+    task: Cell<Option<crate::engine::SpawnedFuture<()>>>,
 }
 
 impl ScreencopyFrame {
@@ -193,47 +197,69 @@ impl ScreencopyFrame {
             c.protocol_error(self.id, ERR_INVALID_BUFFER, "buffer does not fit the frame");
             return Ok(());
         }
-        let Some((fd, base)) = buf.shm_write_target() else {
+        if buf.shm_write_target().is_none() {
             c.protocol_error(self.id, ERR_INVALID_BUFFER, "copy needs an shm buffer");
             return Ok(());
-        };
-        let Some(px) = crate::output::screencopy(&c.state, slot, rect, self.overlay_cursor, crate::config::CaptureKind::Screenshot) else {
-            c.event(|o| zwlr_screencopy_frame_v1::failed::send(o, self.id));
-            return Ok(());
-        };
-        let row = w as usize * 4;
-        let mut ok = true;
-        for r in 0..h as usize {
-            let off = (base + r * stride) as u64;
-            if let Err(e) = rustix::io::pwrite(fd, &px[r * row..][..row], off) {
-                eprintln!("carrot: screencopy write failed: {e}");
-                ok = false;
-                break;
-            }
         }
+        // the capture awaits its fence on the ring; the whole serve rides
+        // a task so neither this handler nor the input reader blocks on
+        // the gpu. the task dies with the frame object
+        let state = c.state.clone();
+        let client = c.clone();
         let id = self.id;
-        if !ok {
-            c.event(|o| zwlr_screencopy_frame_v1::failed::send(o, id));
-            return Ok(());
-        }
-        let nsec = crate::util::Time::now().nsec();
-        let sec = nsec / 1_000_000_000;
-        let rem = (nsec % 1_000_000_000) as u32;
-        let (dw, dh) = (rect.width() as u32, rect.height() as u32);
-        c.event(|o| {
-            zwlr_screencopy_frame_v1::flags::send(o, id, 0);
-            // no damage tracking yet - report the whole frame dirty (always safe)
-            if with_damage {
-                zwlr_screencopy_frame_v1::damage::send(o, id, 0, 0, dw, dh);
+        let cursor = self.overlay_cursor;
+        self.task.set(Some(state.eng.clone().spawn("screencopy", async move {
+            // the sink runs over the capture's mapped readback: rows
+            // pwrite straight into the client buffer, no intermediate
+            // frame copy. the target re-resolves inside because the
+            // buffer may have died during the capture await
+            let wrote = crate::output::screencopy(&state, slot, rect, cursor, crate::config::CaptureKind::Screenshot, |px, cw, ch| {
+                let Some((fd, base)) = buf.shm_write_target() else {
+                    return false;
+                };
+                let row = cw as usize * 4;
+                // tight stride: one contiguous span, one syscall
+                if stride == row {
+                    let span = row * ch as usize;
+                    if let Err(e) = rustix::io::pwrite(&fd, &px[..span], base as u64) {
+                        eprintln!("carrot: screencopy write failed: {e}");
+                        return false;
+                    }
+                    return true;
+                }
+                for r in 0..ch as usize {
+                    let off = (base + r * stride) as u64;
+                    if let Err(e) = rustix::io::pwrite(&fd, &px[r * row..][..row], off) {
+                        eprintln!("carrot: screencopy write failed: {e}");
+                        return false;
+                    }
+                }
+                true
+            })
+            .await;
+            if !matches!(wrote, Some(true)) {
+                client.event(|o| zwlr_screencopy_frame_v1::failed::send(o, id));
+                return;
             }
-            zwlr_screencopy_frame_v1::ready::send(
-                o,
-                id,
-                (sec >> 32) as u32,
-                sec as u32,
-                rem,
-            );
-        });
+            let nsec = crate::util::Time::now().nsec();
+            let sec = nsec / 1_000_000_000;
+            let rem = (nsec % 1_000_000_000) as u32;
+            let (dw, dh) = (rect.width() as u32, rect.height() as u32);
+            client.event(|o| {
+                zwlr_screencopy_frame_v1::flags::send(o, id, 0);
+                // no damage tracking yet - the whole frame dirty is always safe
+                if with_damage {
+                    zwlr_screencopy_frame_v1::damage::send(o, id, 0, 0, dw, dh);
+                }
+                zwlr_screencopy_frame_v1::ready::send(
+                    o,
+                    id,
+                    (sec >> 32) as u32,
+                    sec as u32,
+                    rem,
+                );
+            });
+        })));
         Ok(())
     }
 }

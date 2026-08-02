@@ -204,6 +204,28 @@ impl<T> AsyncQueue<T> {
     }
 }
 
+/// once-per-second log gate: a failure that repeats per frame prints
+/// once, counts the rest, and the next permitted line names the count.
+/// 6754 identical lines taught this lesson
+#[derive(Default)]
+pub struct LogGate {
+    last_ns: std::cell::Cell<u64>,
+    dropped: std::cell::Cell<u32>,
+}
+
+impl LogGate {
+    /// Some(suppressed_since_last) when a line may print now
+    pub fn pass(&self, now_ns: u64) -> Option<u32> {
+        if now_ns.saturating_sub(self.last_ns.get()) >= 1_000_000_000 {
+            self.last_ns.set(now_ns);
+            Some(self.dropped.replace(0))
+        } else {
+            self.dropped.set(self.dropped.get() + 1);
+            None
+        }
+    }
+}
+
 pub struct Pop<'a, T>(&'a AsyncQueue<T>);
 
 impl<T> Future for Pop<'_, T> {
