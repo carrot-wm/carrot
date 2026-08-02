@@ -368,6 +368,70 @@ pub struct DeviceRule {
     pub dpi: Option<f64>,
 }
 
+/// which capture paths a surface is hidden from. two independent flags, so
+/// a window can be absent from a recording while still landing in a
+/// screenshot, which is the case a shell wants for private overlays.
+///
+/// "video" is the portal's pipewire screencast, what OBS, Discord and
+/// gpu-screen-recorder pull clips through. "screenshot" is wlr-screencopy
+/// and ext-image-copy-capture, the still paths. that split is by protocol,
+/// not by intent: a recorder driving wlr-screencopy in a loop counts as
+/// screenshots, because nothing on the wire says otherwise
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct NoCapture {
+    pub video: bool,
+    pub shot: bool,
+}
+
+/// who is asking for a frame. no-capture rules key off this, so one
+/// surface can be present in a screenshot and absent from a recording
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CaptureKind {
+    /// going to glass: not a capture, nothing is ever hidden
+    Present,
+    /// the portal's pipewire screencast, which is what recorders and
+    /// clip tools pull through
+    Video,
+    /// wlr-screencopy and ext-image-copy-capture: the still paths
+    Screenshot,
+}
+
+impl NoCapture {
+    /// does this rule hide the surface from that particular consumer
+    pub fn hides(self, k: CaptureKind) -> bool {
+        match k {
+            CaptureKind::Present => false,
+            CaptureKind::Video => self.video,
+            CaptureKind::Screenshot => self.shot,
+        }
+    }
+
+    pub fn all() -> Self {
+        NoCapture { video: true, shot: true }
+    }
+
+    pub fn any(self) -> bool {
+        self.video || self.shot
+    }
+
+    /// rules stack: the strictest wins per path
+    pub fn merge(&mut self, o: NoCapture) {
+        self.video |= o.video;
+        self.shot |= o.shot;
+    }
+
+    /// `true`/`false` for both, or a path name for one
+    pub fn parse(s: &str) -> Option<NoCapture> {
+        Some(match s {
+            "true" | "all" | "both" => NoCapture::all(),
+            "false" | "none" => NoCapture::default(),
+            "video" | "cast" | "screencast" => NoCapture { video: true, shot: false },
+            "screenshot" | "shot" | "still" => NoCapture { video: false, shot: true },
+            _ => return None,
+        })
+    }
+}
+
 /// selectors regex-match; a rule needs at least one match child. AND
 /// within a match node, OR across nodes, excludes veto
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -393,7 +457,7 @@ pub struct WindowRule {
     pub allow_tearing: bool,
     pub no_anim: bool,
     /// captures and casts see a black stand-in instead of the content
-    pub no_capture: bool,
+    pub no_capture: NoCapture,
     /// open/close style override, window-style grammar
     pub animation: Option<Style>,
     pub rounding: Option<i32>,
@@ -412,6 +476,9 @@ pub struct LayerRule {
     /// maps and unmaps appear instantly; shells that remap layers on
     /// state changes opt out of the open/close styles
     pub no_anim: bool,
+    /// keep this layer out of captures; a bar can be in screenshots and
+    /// absent from recordings, or the other way round
+    pub no_capture: NoCapture,
 }
 
 // -- animations: per-kind spring/ease motion plus visual styles --
@@ -1055,7 +1122,7 @@ pub struct RuleFx {
     pub size: Option<(i32, i32)>,
     pub center: bool,
     pub no_anim: bool,
-    pub no_capture: bool,
+    pub no_capture: NoCapture,
     pub animation: Option<Style>,
     pub rounding: Option<i32>,
     pub shadow: Option<bool>,
@@ -1120,7 +1187,7 @@ pub fn rule_effects(
         }
         fx.center |= r.open_centered;
         fx.no_anim |= r.no_anim;
-        fx.no_capture |= r.no_capture;
+        fx.no_capture.merge(r.no_capture);
         if let Some(a) = &r.animation {
             fx.animation = Some(a.clone());
         }
@@ -1353,7 +1420,7 @@ mod tests {
         assert_eq!(fx.floating, Some(true), "second rule stacked");
         assert_eq!(fx.size, Some((800, 600)));
         assert_eq!(fx.workspace, Some(2), "parser stores 0-based");
-        assert!(fx.no_capture, "flag accumulates like the other booleans");
+        assert_eq!(fx.no_capture, NoCapture::all(), "a bare true covers both paths");
         // non-matching app id gets nothing
         let fx = rule_effects(&cfg, "foot", "shell", false, false);
         assert_eq!(fx, RuleFx::default());
@@ -1494,5 +1561,38 @@ mod tests {
         assert_eq!(k, 99, "prtsc emits sysrq");
         assert!(chord("Mod+Shift").is_err(), "no key");
         assert!(chord("Q+W").is_err(), "two keys");
+    }
+
+    #[test]
+    fn no_capture_parses_a_bool_or_one_path() {
+        assert_eq!(NoCapture::parse("true"), Some(NoCapture::all()));
+        assert_eq!(NoCapture::parse("false"), Some(NoCapture::default()));
+        assert_eq!(
+            NoCapture::parse("video"),
+            Some(NoCapture { video: true, shot: false })
+        );
+        assert_eq!(
+            NoCapture::parse("screenshot"),
+            Some(NoCapture { video: false, shot: true })
+        );
+        // a typo must not silently mean "hide from nothing"
+        assert_eq!(NoCapture::parse("vidoe"), None);
+    }
+
+    #[test]
+    fn a_video_rule_still_lets_screenshots_through() {
+        let n = NoCapture { video: true, shot: false };
+        assert!(n.hides(CaptureKind::Video), "absent from recordings");
+        assert!(!n.hides(CaptureKind::Screenshot), "still in screenshots");
+        // and nothing is ever hidden from the screen itself
+        assert!(!n.hides(CaptureKind::Present));
+        assert!(!NoCapture::all().hides(CaptureKind::Present));
+    }
+
+    #[test]
+    fn stacked_rules_take_the_strictest_per_path() {
+        let mut n = NoCapture { video: true, shot: false };
+        n.merge(NoCapture { video: false, shot: true });
+        assert_eq!(n, NoCapture::all(), "two one-sided rules cover both");
     }
 }

@@ -262,4 +262,42 @@ mod tests {
         assert_eq!(fx.shadow, Some(false));
         assert_eq!(fx.dim, Some(false));
     }
+
+    #[test]
+    fn layer_rules_take_a_no_capture_path() {
+        let c = parse_ok(
+            r#"
+            layer-rule {
+                match namespace="waybar"
+                no-capture "video"
+            }
+            layer-rule {
+                match namespace="notifications"
+                no-capture #true
+            }
+            "#,
+        );
+        assert_eq!(
+            c.layer_rules[0].no_capture,
+            NoCapture { video: true, shot: false },
+            "a bar can be absent from recordings and present in screenshots"
+        );
+        assert_eq!(c.layer_rules[1].no_capture, NoCapture::all());
+    }
+
+    #[test]
+    fn window_rules_take_a_no_capture_path() {
+        let c = parse_ok(
+            r#"
+            window-rule {
+                match app-id="Signal"
+                no-capture "screenshot"
+            }
+            "#,
+        );
+        assert_eq!(
+            c.rules[0].no_capture,
+            NoCapture { video: false, shot: true }
+        );
+    }
 }

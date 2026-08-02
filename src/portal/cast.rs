@@ -568,7 +568,7 @@ impl Cast {
                 let Some(region) = crate::rect::Rect::new_sized(0, 0, w as i32, h as i32) else {
                     return false;
                 };
-                crate::output::screencopy(state, idx, region, self.cursor)
+                crate::output::screencopy(state, idx, region, self.cursor, crate::config::CaptureKind::Video)
             }
             Cap::Ws(index) => crate::output::workspace_copy(state, index),
             Cap::Win(win) => crate::output::window_capture(state, &win),

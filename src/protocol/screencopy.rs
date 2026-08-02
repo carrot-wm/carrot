@@ -197,7 +197,7 @@ impl ScreencopyFrame {
             c.protocol_error(self.id, ERR_INVALID_BUFFER, "copy needs an shm buffer");
             return Ok(());
         };
-        let Some(px) = crate::output::screencopy(&c.state, slot, rect, self.overlay_cursor) else {
+        let Some(px) = crate::output::screencopy(&c.state, slot, rect, self.overlay_cursor, crate::config::CaptureKind::Screenshot) else {
             c.event(|o| zwlr_screencopy_frame_v1::failed::send(o, self.id));
             return Ok(());
         };

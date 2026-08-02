@@ -547,7 +547,7 @@ fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
     let (px, src_stride) = match src {
         Src::Out(slot) => {
             let region = Rect::new_sized_saturating(0, 0, cw as i32, ch as i32);
-            match crate::output::screencopy(state, slot, region, sess.paint_cursors) {
+            match crate::output::screencopy(state, slot, region, sess.paint_cursors, crate::config::CaptureKind::Screenshot) {
                 Some(px) => (px, row),
                 None => {
                     fail_frame(sess, REASON_UNKNOWN);

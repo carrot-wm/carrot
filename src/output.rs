@@ -408,6 +408,10 @@ pub struct Output {
     /// implicit-sync fences of the dmabufs drawn this frame; the render
     /// submit waits them so client work lands before we sample
     frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
+    /// who the pass currently being composed is for. compose is
+    /// synchronous, so this is set at the top of one and read by the draw
+    /// walk, exactly like collect_fbs
+    cap_kind: Cell<crate::config::CaptureKind>,
     /// latched feedbacks drained here while composing for the display
     present_fbs: RefCell<Vec<crate::protocol::presentation::Feedback>>,
     collect_fbs: Cell<bool>,
@@ -1166,10 +1170,17 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
 /// screenshot capture: compose the output like a present would, render
 /// offscreen, read back, crop to the output-local region. rows come back
 /// tightly packed (stride = width * 4).
-pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: bool) -> Option<Vec<u8>> {
+pub fn screencopy(
+    state: &Rc<State>,
+    out_index: usize,
+    region: Rect,
+    cursor: bool,
+    kind: crate::config::CaptureKind,
+) -> Option<Vec<u8>> {
     let d = state.display.borrow();
     let out = d.as_ref()?.outputs.borrow().get(out_index)?.clone();
     drop(d);
+    out.cap_kind.set(kind);
     let mut ops = Vec::new();
     let mut live = Vec::new();
     compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never }, None, &mut ops, &mut live);
@@ -1227,8 +1238,9 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     if rect.is_empty() {
         return None;
     }
-    // rule-hidden: the stream gets an opaque black frame, never pixels
-    if win.rule_no_capture.get() {
+    // rule-hidden: the stream gets an opaque black frame, never pixels.
+    // this path only ever feeds the portal cast, so it is video
+    if win.rule_no_capture.get().hides(crate::config::CaptureKind::Video) {
         let n = rect.width() as usize * rect.height() as usize;
         let mut px = vec![0u8; n * 4];
         for p in px.chunks_exact_mut(4) {
@@ -2030,6 +2042,7 @@ fn init_output(
         theme_cursor: RefCell::new(None),
         rearm: RefCell::new(None),
         frame_fences: RefCell::new(Vec::new()),
+        cap_kind: Cell::new(crate::config::CaptureKind::Present),
         present_fbs: RefCell::new(Vec::new()),
         collect_fbs: Cell::new(false),
         ops_scratch: RefCell::new(Vec::new()),
@@ -3439,6 +3452,7 @@ fn compose(
     // presentation feedbacks are claimed only by display composes, never
     // by captures
     out.collect_fbs.set(true);
+    out.cap_kind.set(crate::config::CaptureKind::Present);
     compose_ops(state, out, CapCursor::Present, None, ops, live);
     out.collect_fbs.set(false);
 }
@@ -3762,6 +3776,12 @@ fn draw_layer(
             continue;
         }
         let r = ls.rect.get();
+        // a layer rule can keep a bar out of recordings while leaving it in
+        // screenshots, or the reverse
+        if layer_no_capture(&state.config.borrow(), &ls.namespace).hides(out.cap_kind.get()) {
+            push_blackout(out, r, 0.0, ops);
+            continue;
+        }
         let mark = ops.len();
         let lmark = live.len();
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, 0.0, ops, live);
@@ -4081,6 +4101,20 @@ fn draw_buffer(
             opaque: opaque && alpha >= 1.0,
         });
     }
+}
+
+/// the strictest no-capture across every layer rule the namespace hits
+pub(crate) fn layer_no_capture(
+    cfg: &crate::config::Config,
+    ns: &str,
+) -> crate::config::NoCapture {
+    let mut n = crate::config::NoCapture::default();
+    for r in cfg.layer_rules.iter() {
+        if r.no_capture.any() && r.matches.iter().any(|m| m.matches(ns)) {
+            n.merge(r.no_capture);
+        }
+    }
+    n
 }
 
 /// a layer surface whose namespace hits a blur rule samples the cache;
@@ -4665,8 +4699,9 @@ fn draw_window(
             .unwrap_or(cfg.decoration.rounding)
             .max(0) as f32
     };
-    // a rule-hidden window leaves the compositor only as a black stand-in
-    if mode != DrawMode::Present && win.rule_no_capture.get() {
+    // a rule-hidden window leaves the compositor only as a black stand-in,
+    // and only for the consumer its rule names
+    if mode != DrawMode::Present && win.rule_no_capture.get().hides(out.cap_kind.get()) {
         push_blackout(out, rect, round, ops);
         return None;
     }
@@ -4832,7 +4867,7 @@ pub struct ClosingWindow {
     pub anim: crate::anim::Anim,
     pub style: crate::config::Style,
     /// the window's capture rule survives it; captures skip the replay
-    pub no_capture: bool,
+    pub no_capture: crate::config::NoCapture,
 }
 
 /// wrap a cached final batch, taking ownership of its textures. a batch
@@ -4845,7 +4880,7 @@ pub fn seize_batch(
     rect: Rect,
     anim: crate::anim::Anim,
     style: crate::config::Style,
-    no_capture: bool,
+    no_capture: crate::config::NoCapture,
 ) -> Option<ClosingWindow> {
     let (ops, keys, _) = batch;
     if ops.is_empty() {
@@ -4949,7 +4984,7 @@ fn draw_closing_list(
         }
     }
     for c in list.iter() {
-        if c.no_capture && mode != DrawMode::Present {
+        if mode != DrawMode::Present && c.no_capture.hides(out.cap_kind.get()) {
             continue;
         }
         // presence runs 1 -> 0
@@ -5173,7 +5208,7 @@ mod tests {
             rect: Rect { x1: x, y1: 0, x2: x + 10, y2: 10 },
             anim: crate::anim::Anim::ease(&clock, 1.0, 0.0, 150, crate::anim::Curve::Linear),
             style: crate::config::Style::Fade,
-            no_capture: false,
+            no_capture: Default::default(),
         };
         let mut list: Vec<ClosingWindow> = (0..8).map(mk).collect();
         let evicted = cap_evict(&mut list);

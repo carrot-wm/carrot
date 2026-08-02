@@ -106,8 +106,8 @@ pub(super) fn window_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                 }
             }
             "no-capture" => {
-                if let Some(b) = cx.flag(c) {
-                    rule.no_capture = b;
+                if let Some(n) = no_capture_arg(c, cx) {
+                    rule.no_capture = n;
                 }
             }
             "rounding" => {
@@ -156,6 +156,28 @@ pub(super) fn window_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
     cfg.rules.push(rule);
 }
 
+
+/// `no-capture true` hides a surface from everything; `no-capture "video"`
+/// or `"screenshot"` hides it from one path only
+fn no_capture_arg(c: &KdlNode, cx: &mut Cx) -> Option<crate::config::NoCapture> {
+    if let Some(v) = c.entries().first().and_then(|e| e.value().as_string()) {
+        match crate::config::NoCapture::parse(v) {
+            Some(n) => return Some(n),
+            None => {
+                cx.at(c, "no-capture wants true, false, \"video\" or \"screenshot\"");
+                return None;
+            }
+        }
+    }
+    cx.flag(c).map(|b| {
+        if b {
+            crate::config::NoCapture::all()
+        } else {
+            crate::config::NoCapture::default()
+        }
+    })
+}
+
 pub(super) fn layer_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
     let mut rule = LayerRule::default();
     for c in children(node) {
@@ -181,6 +203,11 @@ pub(super) fn layer_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
             "no-anim" => {
                 if let Some(b) = cx.flag(c) {
                     rule.no_anim = b;
+                }
+            }
+            "no-capture" => {
+                if let Some(n) = no_capture_arg(c, cx) {
+                    rule.no_capture = n;
                 }
             }
             other => cx.at(c, &format!("unknown layer-rule key \"{other}\"")),

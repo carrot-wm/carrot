@@ -159,7 +159,7 @@ pub struct Window {
     pub rule_dim: Cell<Option<bool>>,
     pub rule_blur: Cell<bool>,
     /// captures and casts get a black stand-in instead of this window
-    pub rule_no_capture: Cell<bool>,
+    pub rule_no_capture: Cell<crate::config::NoCapture>,
     pub anims: RefCell<WinAnims>,
     /// the ops + texture keys/uids this window produced at its last compose,
     /// plus the subrange holding only the surface-tree ops; the close
@@ -222,7 +222,7 @@ impl Window {
             rule_shadow: Cell::new(None),
             rule_dim: Cell::new(None),
             rule_blur: Cell::new(false),
-            rule_no_capture: Cell::new(false),
+            rule_no_capture: Cell::new(Default::default()),
             anims: RefCell::new(WinAnims::default()),
             last_batch: RefCell::new((Vec::new(), Vec::new(), 0..0)),
         }

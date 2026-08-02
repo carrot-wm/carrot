@@ -448,7 +448,13 @@
                             default = null;
                           };
                           no_capture = mkOption {
-                            type = types.nullOr types.bool;
+                            # #true/#false for every capture path, or
+                            # "video" (the portal screencast recorders use)
+                            # or "screenshot" (wlr-screencopy and
+                            # ext-image-copy-capture) for one of them
+                            type = types.nullOr (types.either types.bool (
+                              types.enum [ "video" "screenshot" "all" "none" ]
+                            ));
                             default = null;
                           };
                           animation = mkOption {
@@ -480,6 +486,16 @@
                           };
                           no_anim = mkOption {
                             type = types.nullOr types.bool;
+                            default = null;
+                          };
+                          no_capture = mkOption {
+                            # #true/#false for every capture path, or
+                            # "video" (the portal screencast recorders use)
+                            # or "screenshot" (wlr-screencopy and
+                            # ext-image-copy-capture) for one of them
+                            type = types.nullOr (types.either types.bool (
+                              types.enum [ "video" "screenshot" "all" "none" ]
+                            ));
                             default = null;
                           };
                         };

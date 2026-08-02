@@ -719,7 +719,9 @@ fn capture_layer_close(state: &Rc<State>, ls: &Rc<LayerSurface>) {
     let anim =
         crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 1.0, 0.0, 0.0);
     let batch = std::mem::take(&mut *ls.last_batch.borrow_mut());
-    if let Some(cw) = crate::output::seize_batch(&out, batch, ls.rect.get(), anim, style, false) {
+    // the closing frame keeps whatever the layer's rule said
+    let nc = crate::output::layer_no_capture(&cfg, &ls.namespace);
+    if let Some(cw) = crate::output::seize_batch(&out, batch, ls.rect.get(), anim, style, nc) {
         crate::output::push_closing_layer(&out, cw);
         state.damage.trigger();
     }

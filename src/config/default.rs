@@ -203,6 +203,12 @@ prefer-no-csd
 //     no-capture
 // }
 // window-rule {
+//     match app-id=#"^Signal$"#
+//     // out of recordings and screenshares, but screenshots still work.
+//     // "screenshot" is the other way round; a bare #true is both
+//     no-capture "video"
+// }
+// window-rule {
 //     match title=#"(?i)picture.in.picture"#
 //     open-floating #true
 //     open-centered
@@ -211,6 +217,9 @@ prefer-no-csd
 // The full rule vocabulary: open-floating, open-on-workspace,
 // open-centered, default-size, opacity, allow-tearing, rounding,
 // shadow, dim, blur, no-anim, no-capture, animation.
+// no-capture takes #true/#false for every path, or "video" (the portal's
+// screencast, what recorders use) or "screenshot" (wlr-screencopy and
+// ext-image-copy-capture) for one.
 
 // layer-rule {
 //     match namespace=#"^launcher$"#
@@ -218,6 +227,9 @@ prefer-no-csd
 //     // backdrop only where the surface's own alpha reaches the gate;
 //     // argb surfaces only (xrgb reads as fully opaque)
 //     ignore-alpha 0.1
+//     // layers take no-capture too: keep a bar out of recordings while
+//     // it still shows up in screenshots
+//     // no-capture "video"
 //     // shells that remap layers on state changes: skip open/close styles
 //     no-anim
 // }

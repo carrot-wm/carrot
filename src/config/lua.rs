@@ -1123,7 +1123,7 @@ fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                     rule.allow_tearing = need_bool(&v, &key).map_err(whine)?;
                 }
                 "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
-                "no_capture" => rule.no_capture = need_bool(&v, &key).map_err(whine)?,
+                "no_capture" => rule.no_capture = no_capture_val(&v, &key).map_err(whine)?,
                 "rounding" => {
                     rule.rounding = Some(
                         super::int_in(need_int(&v, &key).map_err(whine)?, "rounding", 0, 200)
@@ -1148,6 +1148,21 @@ fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
     Ok(())
 }
 
+/// `no_capture` takes a bool for every capture path, or a path name for
+/// one. shared by window and layer rules so the two cannot drift
+fn no_capture_val(v: &Value, key: &str) -> Result<crate::config::NoCapture, String> {
+    match need_str(v, key) {
+        Ok(t) => crate::config::NoCapture::parse(&t)
+            .ok_or_else(|| "no_capture wants true, false, \"video\" or \"screenshot\"".to_string()),
+        // not a string: the plain bool form covers both paths
+        Err(_) => Ok(if need_bool(v, key)? {
+            crate::config::NoCapture::all()
+        } else {
+            crate::config::NoCapture::default()
+        }),
+    }
+}
+
 fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
     for (n, item) in indexed_entries(v, "layer_rules")?.into_iter().enumerate() {
         let whine = |e: String| format!("layer rule {}: {e}", n + 1);
@@ -1168,6 +1183,7 @@ fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                     )
                 }
                 "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
+                "no_capture" => rule.no_capture = no_capture_val(&v, &key).map_err(whine)?,
                 other => return Err(whine(format!("unknown key `{other}`"))),
             }
         }
@@ -1362,5 +1378,38 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errs.len(), 2, "both sections report: {errs:?}");
+    }
+
+    #[test]
+    fn lua_takes_no_capture_on_both_rule_kinds() {
+        let c = parse(
+            r##"
+            carrot = {
+                window_rules = { { match = { { app_id = "Signal" } }, no_capture = "video" } },
+                layer_rules  = { { match = { "waybar" }, no_capture = "screenshot" } },
+            }
+            "##,
+        )
+        .unwrap();
+        assert_eq!(
+            c.rules[0].no_capture,
+            crate::config::NoCapture { video: true, shot: false }
+        );
+        assert_eq!(
+            c.layer_rules[0].no_capture,
+            crate::config::NoCapture { video: false, shot: true },
+            "layer rules were the half with no parser at all"
+        );
+    }
+
+    #[test]
+    fn lua_still_takes_a_bare_bool_for_no_capture() {
+        let c = parse(
+            r##"
+            carrot = { window_rules = { { match = { { app_id = "x" } }, no_capture = true } } }
+            "##,
+        )
+        .unwrap();
+        assert_eq!(c.rules[0].no_capture, crate::config::NoCapture::all());
     }
 }
