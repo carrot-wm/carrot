@@ -217,20 +217,28 @@ nix build github:carrot-wm/carrot
 ### From crates.io
 
 ```sh
-cargo install carrot
+RUSTFLAGS="-C target-feature=+crt-static" \
+  cargo install carrot --target x86_64-unknown-linux-gnu
 sudo ~/.cargo/bin/carrot install
 ```
 
-One step per line: the manifest carries the static-PIE flags itself, so no
-RUSTFLAGS - just a nightly toolchain active. The second line registers the
-display-manager session.
+Stable toolchain. Registry installs never see the repo's cargo config, so
+the two link knobs ride the command line: `RUSTFLAGS` makes the binary the
+static-PIE the loader design requires (build.rs refuses anything else),
+and the explicit `--target` keeps that flag off host proc-macros, which
+cannot be crt-static. The second line registers the display-manager
+session. On NixOS skip this path and use the flake above: a rustup
+toolchain there cannot see the system C runtime and falls back to
+self-contained linking, which drags in startup objects the pure-Rust libc
+deliberately does not implement (`rust-lld: undefined symbol:
+__libc_start_main` is that failure).
 
 ### With Cargo
 
 ```sh
 git clone https://github.com/carrot-wm/carrot
 cd carrot
-nix develop   # pins the toolchain; or rustup with the pinned nightly
+nix develop   # pins the toolchain; or any recent stable rustup toolchain
 cargo build --release
 sudo ./target/x86_64-unknown-linux-gnu/release/carrot install
 ```

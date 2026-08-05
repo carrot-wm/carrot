@@ -89,8 +89,12 @@ fn main() {
     if !features.split(',').any(|f| f == "crt-static") {
         panic!(
             "carrot links as a static-PIE; build with \
-             RUSTFLAGS=\"-C target-feature=+crt-static\" (the repo's \
-             .cargo/config.toml sets this for clone builds)"
+             RUSTFLAGS=\"-C target-feature=+crt-static\" AND \
+             --target x86_64-unknown-linux-gnu. the explicit --target keeps \
+             the flag off host proc-macros, which cannot be crt-static \
+             (without it the build dies at ctor-proc-macro before this \
+             message can print). the repo's .cargo/config.toml sets both \
+             for clone builds"
         );
     }
 }
