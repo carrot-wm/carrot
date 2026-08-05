@@ -388,22 +388,32 @@ fn entry_for_icd(path: &Path) -> Result<ash::Entry, String> {
 
     // the khronos loader negotiates the icd interface version before anything
     // else; we stand in for it, and without this the icd won't enumerate
+    let mut ver: u32 = 5; // the newest loader<->icd interface we speak
     if let Ok(neg) = unsafe {
         lib.get::<unsafe extern "C" fn(*mut u32) -> vk::Result>(
             "vk_icdNegotiateLoaderICDInterfaceVersion",
         )
     } {
-        let mut ver: u32 = 5; // the newest loader<->icd interface we speak
         let _ = unsafe { neg(&mut ver) };
+        eprintln!("carrot: vulkan: icd interface v{ver}");
     }
 
     let gipa = unsafe { lib.get::<IcdGipa>("vk_icdGetInstanceProcAddr") }
         .map_err(|e| format!("{}: vk_icdGetInstanceProcAddr: {e}", path.display()))?;
-    let static_fn = ash::StaticFn {
-        get_instance_proc_addr: unsafe {
-            std::mem::transmute::<IcdGipa, vk::PFN_vkGetInstanceProcAddr>(*gipa)
-        },
-    };
+    // probe before handing ash the table loader: ash panics on a NULL
+    // vkCreateInstance, and a driver whose initializers failed quietly
+    // (nvidia's blob does this) must fail this one icd, not the session
+    let probe = unsafe { (*gipa)(vk::Instance::null(), c"vkCreateInstance".as_ptr()) };
+    if probe.is_none() {
+        return Err(format!(
+            "{}: the driver serves no vkCreateInstance (interface v{ver}); \
+             its initializers likely failed under the preloaded libc",
+            path.display()
+        ));
+    }
+    // IcdGipa and PFN_vkGetInstanceProcAddr are the same signature; the
+    // icd's global entry stands in for the loader's directly
+    let static_fn = ash::StaticFn { get_instance_proc_addr: *gipa };
     let entry = unsafe { ash::Entry::from_static_fn(static_fn) };
     std::mem::forget(lib);
     cache.push((path.to_path_buf(), entry.clone()));
