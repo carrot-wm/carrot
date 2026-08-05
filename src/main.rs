@@ -37,6 +37,7 @@ mod config;
 mod dbus;
 mod ei;
 mod input;
+mod family;
 mod install;
 mod ipc;
 mod pipewire;

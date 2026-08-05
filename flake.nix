@@ -946,6 +946,9 @@
             '';
             cargoExtraArgs = "-p taproot -p taproot-stub";
             doCheck = false;
+            # the cdylib is the driver's libc: exported .dynsym, self-
+            # relocating; nothing may strip or rewrite it
+            dontStrip = true;
             nativeBuildInputs = [ pkgs.binutils ];
             installPhaseCommand = ''
               mkdir -p $out/lib
@@ -980,6 +983,11 @@
             # production. the suite is validated on the dev shell
             # (build-std + panic-abort-tests) and in CI, not here.
             doCheck = false;
+
+            # the binary is its own libc (exported .dynsym) and self-
+            # relocates, and the staged family libs are the gpu driver's
+            # libc: nothing may strip or rewrite any of them
+            dontStrip = true;
 
             # crane's dummy crate must link like the real one: libc arrives
             # via `extern crate eyra`, so the stub mains get the same line

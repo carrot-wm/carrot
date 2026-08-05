@@ -147,6 +147,10 @@ pub(crate) fn pairing_check(lib: &ElfLibrary, p: &Path) -> Result<(), String> {
 pub(crate) fn preload() -> Result<(), String> {
     static DONE: OnceLock<Result<(), String>> = OnceLock::new();
     DONE.get_or_init(|| {
+        // a dev build heals a missing family before resolution proper: a
+        // cache hit is a copy, a miss builds taproot once. packaged trees
+        // resolve immediately and never take the branch
+        crate::family::ensure_dev_family();
         elf_loader::tls::set_static_tls_allocator(alloc_static_tls);
         // a driver's closure (mesa->llvm->ncurses) references glibc
         // symbols taproot does not export - fortify __*_chk wrappers, C23
