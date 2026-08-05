@@ -35,6 +35,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut prefix = PathBuf::from("/usr/local");
     let mut root = PathBuf::from("/");
     let mut build_taproot_flag = false;
+    let mut explicit_paths = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let value = match a.as_str() {
@@ -48,11 +49,32 @@ pub fn run(args: &[String]) -> i32 {
             },
             _ => return usage(),
         };
+        explicit_paths = true;
         if a == "--prefix" {
             prefix = value;
         } else {
             root = value;
         }
+    }
+    // a default-path install on NixOS writes fine and then nothing ever
+    // reads it: the display manager, PATH, udev, and the portal frontend
+    // all resolve from the system closure, never /usr/local. refuse with
+    // the real path forward instead of succeeding into a dead session.
+    // explicit --prefix/--root is a packager staging on purpose
+    if !explicit_paths && is_nixos() {
+        eprintln!(
+            "carrot: install: this is NixOS - files under {} would be invisible \
+             to the display manager, udev, and the portal frontend",
+            prefix.display()
+        );
+        eprintln!(
+            "carrot: install: use the flake instead: `nix build \
+             github:carrot-wm/carrot`, or its NixOS module / home-manager \
+             option, wire the session and portal through the system closure. \
+             for just the gpu libc family cache, running ./carrot once is \
+             enough"
+        );
+        return 1;
     }
     let stage = |p: &Path| root.join(p.strip_prefix("/").unwrap_or(p));
     let bin = prefix.join("bin/carrot");
@@ -163,3 +185,13 @@ fn usage() -> i32 {
     1
 }
 
+/// NixOS marks itself with /etc/NIXOS; os-release seconds it. either
+/// alone counts - minimal containers sometimes ship only one
+fn is_nixos() -> bool {
+    if Path::new("/etc/NIXOS").exists() {
+        return true;
+    }
+    std::fs::read_to_string("/etc/os-release")
+        .map(|s| s.lines().any(|l| l.trim() == "ID=nixos"))
+        .unwrap_or(false)
+}
