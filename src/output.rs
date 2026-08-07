@@ -24,6 +24,27 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd};
 use std::rc::Rc;
 
+/// one gpu: its drm device, its vulkan stack, and the recovery state that
+/// operates on both. Display holds a list of these; multi-card bring-up
+/// grows it past one, and every Output points at the card it scans out on
+/// and the card it composites on
+pub struct Card {
+    pub dev: Rc<DrmDevice>,
+    /// swapped whole by gpu recovery; everything long-lived reads through
+    /// here, everything in-flight holds its own Rc and drains out
+    pub core: RefCell<Rc<VkCore>>,
+    pub renderer: RefCell<Rc<Renderer>>,
+    /// drains this card's drm event fd; a dead pump is a dead card
+    _pump: SpawnedFuture<()>,
+}
+
+impl Card {
+    /// dev_t, matching logind pause/resume and dmabuf feedback devices
+    pub fn devnum(&self) -> u64 {
+        self.dev.devnum
+    }
+}
+
 pub struct Display {
     pub outputs: RefCell<Vec<Rc<Output>>>,
     /// current cursor image when compositing in software: pixels, w, h
@@ -33,11 +54,9 @@ pub struct Display {
     sw: Cell<bool>,
     /// bumps when sw_image changes; outputs rebuild their texture on it
     sw_gen: Cell<u64>,
-    dev: Rc<DrmDevice>,
-    core: Rc<VkCore>,
-    renderer: Rc<Renderer>,
-    devnum: u64,
-    _pump: SpawnedFuture<()>,
+    /// every gpu this session drives, in /dev/dri order. index 0 is the
+    /// primary: the default render target and the head of dmabuf feedback
+    cards: RefCell<Vec<Rc<Card>>>,
     _presents: RefCell<Vec<SpawnedFuture<()>>>,
     _fanout: SpawnedFuture<()>,
     /// armed once the display lands in state; watches netlink for hotplug
@@ -87,7 +106,7 @@ impl Display {
     pub fn prepare_vt_switch(&self, state: &Rc<State>, vt: u32) {
         for out in self.outputs.borrow().iter() {
             out.cursor_locked.set(true);
-            out.conn.cursor_hide(&out.dev);
+            out.conn.cursor_hide(out.dev());
             let o = out.clone();
             let st = state.clone();
             *out.rearm.borrow_mut() = Some(state.eng.spawn("vt rearm", async move {
@@ -294,7 +313,7 @@ fn cursor_commit_idle(out: &Rc<Output>) -> bool {
         out.cursor_flush.trigger();
         return true;
     }
-    out.conn.cursor_commit(&out.dev)
+    out.conn.cursor_commit(out.dev())
 }
 
 /// lands cursor state the gate skipped: once the output has sat idle for
@@ -348,9 +367,30 @@ struct OutBuf {
     dumb: Option<u32>,
 }
 
+impl Output {
+    /// the drm device the flip goes to
+    fn dev(&self) -> &Rc<DrmDevice> {
+        &self.scanout_card.dev
+    }
+
+    /// dev_t of the card that composites this output; the device a client
+    /// on it should allocate for
+    pub fn render_devnum(&self) -> u64 {
+        self.render_card.devnum()
+    }
+}
+
 pub struct Output {
-    dev: Rc<DrmDevice>,
+    /// the card that owns this connector: where the flip lands. fixed by
+    /// physical wiring, never configurable
+    scanout_card: Rc<Card>,
+    /// the card that composites this output. equal to scanout_card until
+    /// per-output gpu assignment lands
+    render_card: Rc<Card>,
     pub conn: Rc<Connector>,
+    /// pinned at construction, deliberately NOT read through render_card's
+    /// cell: recovery swaps a card's renderer, and an output still draining
+    /// must keep the one its in-flight frames were recorded against
     renderer: Rc<Renderer>,
     bufs: [OutBuf; 2],
     front: Cell<usize>,
@@ -392,8 +432,6 @@ pub struct Output {
     /// keys captures sampled recently, with the feed time; the sweep
     /// spares them so cast ticks stop re-importing every frame
     cast_keep: RefCell<HashMap<(ClientId, u64), u64>>,
-    /// card's dev_t, matches logind pause/resume signals
-    devnum: u64,
     /// vt elsewhere; render but never commit until resume
     paused: Cell<bool>,
     /// queued motion must not re-arm the cursor while the vt is leaving
@@ -841,21 +879,176 @@ impl Output {
 }
 
 /// bring up a display if a card is reachable, else run headless
-pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Option<Display> {
-    let mut cards: Vec<_> = match std::fs::read_dir("/dev/dri") {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or(false)
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+/// bring one card up: its vulkan stack, its outputs, and the modeset that
+/// lights them. a card with no connected head still comes back, because it
+/// is a valid render target for an output that scans out elsewhere
+async fn bring_up_card(
+    state: &Rc<State>,
+    path: &std::path::Path,
+    session: Option<&Rc<LogindSession>>,
+    prefer: &dyn Fn(&str) -> Option<(u32, u32, Option<u32>)>,
+    first_index: usize,
+    x: &mut i32,
+) -> Option<(Rc<Card>, Vec<Rc<Output>>)> {
+    let dev = match init_card(path, session, prefer).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("carrot: {}: {e} - skipping card", path.display());
+            return None;
+        }
     };
-    cards.sort();
+    // every connected connector with a pipe becomes an output, tiled left
+    // to right in global space across every card
+    let conns: Vec<Rc<Connector>> = dev
+        .connectors
+        .borrow()
+        .iter()
+        .filter(|c| c.pipe.borrow().is_some())
+        .cloned()
+        .collect();
+    // a card with nothing plugged in drives nothing and, until cross-card
+    // import and render offload exist, can composite for nobody either.
+    // keeping it cost a 71-resume storm on this machine: every probe woke
+    // the gpu for a full PSP/SMU/GART reinit, and the pcie and power churn
+    // took usb, nvme, wifi and the OTHER gpu down with it. it comes back
+    // when there is something for it to render
+    if conns.is_empty() {
+        eprintln!(
+            "carrot: {}: no connected display; left alone (no render target \
+until cross-card offload lands)",
+            path.display()
+        );
+        return None;
+    }
+    let (core, renderer) = match init_render(&dev) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("carrot: {}: {e} - skipping card", path.display());
+            return None;
+        }
+    };
+    // the card exists before its outputs do: each one is born pointing at
+    // the card it scans out on and the card it composites on
+    let card = Rc::new(Card {
+        dev: dev.clone(),
+        core: RefCell::new(core.clone()),
+        renderer: RefCell::new(renderer.clone()),
+        _pump: dev.spawn_flip_pump(&state.eng, &state.ring),
+    });
+    let mut outputs: Vec<Rc<Output>> = Vec::new();
+    for conn in conns {
+        let name = conn.name.clone();
+        match init_output(&card, &card, conn) {
+            Ok(out) => {
+                let out = Rc::new(out);
+                out.pos.set((*x, 0));
+                out.usable.set(out.rect());
+                out.ws.set((first_index + outputs.len()).min(8));
+                *x += out.width as i32;
+                seed_cursor(state, &out);
+                let refresh = out
+                    .conn
+                    .pipe
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.mode.vrefresh)
+                    .unwrap_or(0);
+                eprintln!(
+                    "carrot: output {} on {}: {}x{}@{} at {:?} vrr_capable={}",
+                    out.conn.name,
+                    path.display(),
+                    out.width,
+                    out.height,
+                    refresh,
+                    out.pos.get(),
+                    out.conn.vrr_capable
+                );
+                outputs.push(out);
+            }
+            Err(e) => eprintln!("carrot: {name}: {e} - skipping connector"),
+        }
+    }
+    if outputs.is_empty() {
+        return Some((card, Vec::new()));
+    }
+    // linear dumb-buffer scanout is the display engine's worst case; two
+    // high-refresh heads of it starve the FIFO on intel even though the
+    // kernel accepts the config. cap unconfigured secondaries.
+    if outputs.len() > 1 && outputs.iter().any(|o| o.bufs[0].dumb.is_some()) {
+        for o in outputs.iter().skip(1) {
+            if prefer(&o.conn.name).is_some() {
+                continue; // explicit config wins, whatever it costs
+            }
+            let mut hz = o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh).unwrap_or(0);
+            while hz > 144 && o.conn.step_down_mode() {
+                hz = o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh).unwrap_or(0);
+            }
+        }
+        let hot = outputs
+            .first()
+            .and_then(|o| o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh))
+            .unwrap_or(0);
+        if hot > 240 {
+            eprintln!(
+                "carrot: linear scanout at {hot}Hz plus a second head may underrun; set output {{ mode }} to cap one if the screen flashes"
+            );
+        }
+    }
+    // every head in one commit, per card: the driver validates the combined
+    // bandwidth of its own pipes, and the ladder steps refreshes down until
+    // the set fits. a head that cannot fit at all is dropped rather than
+    // flashing
+    loop {
+        let heads: Vec<(Rc<Connector>, u32)> = outputs
+            .iter()
+            .map(|o| (o.conn.clone(), o.bufs[0].fb))
+            .collect();
+        match dev.modeset_heads(&heads) {
+            Ok(()) => break,
+            Err(e) => {
+                // out of refresh steps: dropping the newest head only helps
+                // when the kernel rejected the combination
+                let bandwidth = matches!(
+                    e,
+                    crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::INVAL)
+                        | crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::NOSPC)
+                        | crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::RANGE)
+                );
+                if !bandwidth {
+                    eprintln!(
+                        "carrot: {}: modeset failed: {e}; card dropped",
+                        path.display()
+                    );
+                    return None;
+                }
+                match outputs.pop() {
+                    Some(o) => eprintln!(
+                        "carrot: {}: no mode fits alongside the other heads; head dropped",
+                        o.conn.name
+                    ),
+                    None => break,
+                }
+            }
+        }
+    }
+    // heads the ladder dropped leave a hole in the tiling cursor; recompute
+    let mut cursor = *x;
+    for o in outputs.iter().rev() {
+        cursor -= o.width as i32;
+    }
+    let mut at = cursor;
+    for o in &outputs {
+        o.pos.set((at, 0));
+        o.usable.set(o.rect());
+        at += o.width as i32;
+    }
+    *x = at;
+    Some((card, outputs))
+}
+
+/// bring up every reachable card, else run headless
+pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Option<Display> {
+    let paths = crate::drm::device::card_paths().unwrap_or_default();
     let cfg_state = state.clone();
     let prefer = move |name: &str| -> Option<(u32, u32, Option<u32>)> {
         cfg_state
@@ -866,305 +1059,222 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
             .find(|o| o.name == name)
             .and_then(|o| o.mode)
     };
-    for path in cards {
-        let (dev, core, renderer, devnum) = match init_card(&path, session, &prefer).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("carrot: {}: {e} - trying next card", path.display());
-                continue;
-            }
+    let mut cards: Vec<Rc<Card>> = Vec::new();
+    let mut outputs: Vec<Rc<Output>> = Vec::new();
+    let mut x = 0i32;
+    for path in paths {
+        let Some((card, mine)) =
+            bring_up_card(state, &path, session, &prefer, outputs.len(), &mut x).await
+        else {
+            continue;
         };
-        state.host_import.set(renderer.host_import_supported());
-        // every connected connector with a pipe becomes an output,
-        // tiled left to right in global space
-        let conns: Vec<Rc<Connector>> = dev
-            .connectors
-            .borrow()
-            .iter()
-            .filter(|c| c.pipe.borrow().is_some())
-            .cloned()
-            .collect();
-        if conns.is_empty() {
-            eprintln!("carrot: {}: no connected display - trying next card", path.display());
-            continue;
-        }
-        let mut outputs: Vec<Rc<Output>> = Vec::new();
-        let mut x = 0i32;
-        for conn in conns {
-            let name = conn.name.clone();
-            match init_output(&dev, &core, &renderer, conn, devnum) {
-                Ok(out) => {
-                    let out = Rc::new(out);
-                    out.pos.set((x, 0));
-                    out.usable.set(out.rect());
-                    out.ws.set(outputs.len().min(8));
-                    x += out.width as i32;
-                    seed_cursor(state, &out);
-                    let refresh = out
-                        .conn
-                        .pipe
-                        .borrow()
-                        .as_ref()
-                        .map(|p| p.mode.vrefresh)
-                        .unwrap_or(0);
-                    eprintln!(
-                        "carrot: output {}: {}x{}@{} at {:?} vrr_capable={}",
-                        out.conn.name,
-                        out.width,
-                        out.height,
-                        refresh,
-                        out.pos.get(),
-                        out.conn.vrr_capable
-                    );
-                    outputs.push(out);
-                }
-                Err(e) => eprintln!("carrot: {name}: {e} - skipping connector"),
-            }
-        }
-        if outputs.is_empty() {
-            continue;
-        }
-        // every head in one commit: the driver validates the combined
-        // bandwidth, the ladder steps refreshes down until it fits, and a
-        // head that can't fit at all is dropped rather than flashing
-        // linear dumb-buffer scanout is the display engine's worst case;
-        // two high-refresh heads of it starve the FIFO on intel even though
-        // the kernel accepts the config. cap unconfigured secondaries.
-        if outputs.len() > 1 && outputs.iter().any(|o| o.bufs[0].dumb.is_some()) {
-            for o in outputs.iter().skip(1) {
-                if prefer(&o.conn.name).is_some() {
-                    continue; // explicit config wins, whatever it costs
-                }
-                let mut hz = o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh).unwrap_or(0);
-                while hz > 144 && o.conn.step_down_mode() {
-                    hz = o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh).unwrap_or(0);
-                }
-            }
-            let hot = outputs
-                .first()
-                .and_then(|o| o.conn.pipe.borrow().as_ref().map(|p| p.mode.vrefresh))
-                .unwrap_or(0);
-            if hot > 240 {
-                eprintln!(
-                    "carrot: linear scanout at {hot}Hz plus a second head may underrun; set output {{ mode }} to cap one if the screen flashes"
-                );
-            }
-        }
-        let mut card_dead = false;
-        loop {
-            let heads: Vec<(Rc<Connector>, u32)> = outputs
-                .iter()
-                .map(|o| (o.conn.clone(), o.bufs[0].fb))
-                .collect();
-            match dev.modeset_heads(&heads) {
-                Ok(()) => break,
-                Err(e) => {
-                    // out of refresh steps: dropping the newest head only
-                    // helps when the kernel rejected the combination
-                    let bandwidth = matches!(
-                        e,
-                        crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::INVAL)
-                            | crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::NOSPC)
-                            | crate::drm::device::DrmError::Op("modeset", rustix::io::Errno::RANGE)
-                    );
-                    if !bandwidth {
-                        eprintln!("carrot: {}: modeset failed: {e} - trying next card", path.display());
-                        card_dead = true;
-                        break;
-                    }
-                    match outputs.pop() {
-                        Some(o) => eprintln!(
-                            "carrot: {}: no mode fits alongside the other heads; head dropped",
-                            o.conn.name
-                        ),
-                        None => break,
-                    }
-                }
-            }
-        }
-        if card_dead || outputs.is_empty() {
-            continue;
-        }
-        for (i, out) in outputs.iter().enumerate() {
-            out.index.set(i);
-        }
-        // a workspace per output up front, bound to it
-        {
-            let mut list = state.workspaces.borrow_mut();
-            while list.len() < outputs.len().min(9) {
-                list.push(crate::tree::new_workspace(&state));
-            }
-            for i in 0..outputs.len().min(9) {
-                list[i].output.set(i);
-            }
-        }
-        let pump = dev.spawn_flip_pump(&state.eng, &state.ring);
-        // one logind pause/resume handler per card; it walks the live output
-        // list so hotplugged outputs are covered too. the boot set rides
-        // along until the display lands in state.
-        if let Some(s) = session {
-            let boot = outputs.clone();
-            let st = state.clone();
-            s.on_device(
-                devnum,
-                Rc::new(move |ev| {
-                    let outs: Vec<Rc<Output>> = match st.display.borrow().as_ref() {
-                        Some(d) => d.outputs.borrow().clone(),
-                        None => boot.clone(),
-                    };
-                    match ev {
-                        // no KMS work: logind already revoked master
-                        DeviceEvent::Pause { .. } => {
-                            for o in &outs {
-                                o.paused.set(true);
-                                o.rearm.take();
-                            }
-                        }
-                        DeviceEvent::Resume { .. } => {
-                            let sw = st
-                                .display
-                                .borrow()
-                                .as_ref()
-                                .is_some_and(|d| d.software_cursor());
-                            let mut heads = Vec::new();
-                            for o in &outs {
-                                o.paused.set(false);
-                                o.cursor_locked.set(false);
-                                o.rearm.take();
-                                // an in-flight flip never completes when the
-                                // vt left; unwedge the gate
-                                o.conn.flip_pending.set(false);
-                                if let Some(p) = o.conn.pipe.borrow().as_ref() {
-                                    if let Some(cur) = &p.cursor {
-                                        // software mode keeps planes benched
-                                        cur.set_enabled(!sw && !o.cursor_client_hidden.get());
-                                    }
-                                }
-                                heads.push((o.conn.clone(), o.bufs[o.front.get()].fb));
-                            }
-                            if let Some(o) = outs.first() {
-                                if let Err(e) = o.dev.modeset_heads(&heads) {
-                                    eprintln!("carrot: resume modeset: {e}");
-                                }
-                            }
-                            st.damage.trigger();
-                        }
-                        DeviceEvent::Gone { .. } => {
-                            for o in &outs {
-                                o.paused.set(true);
-                            }
-                        }
-                    }
-                }),
-            );
-        }
-        let presents: Vec<SpawnedFuture<()>> = outputs
-            .iter()
-            .map(|out| {
-                let st = state.clone();
-                let o = out.clone();
-                state.eng.spawn("present", async move {
-                    present_loop(&st, &o).await;
-                })
-            })
-            .collect();
-        // the dmabuf global speaks for this device from here on
-        {
-            let rdev = rustix::fs::fstat(dev.fd.as_fd())
-                .map(|st| st.st_rdev)
-                .unwrap_or(0);
-            let mut formats = Vec::new();
-            match core.sample_modifiers(vk::Format::B8G8R8A8_UNORM) {
-                Ok(mods) => {
-                    for &(m, pc) in &mods {
-                        formats.push((crate::format::XRGB8888.drm, m, pc));
-                        formats.push((crate::format::ARGB8888.drm, m, pc));
-                    }
-                }
-                Err(e) => eprintln!("carrot: dmabuf modifier probe failed: {e}"),
-            }
-            if formats.is_empty() {
-                formats.push((crate::format::XRGB8888.drm, 0, 1));
-                formats.push((crate::format::ARGB8888.drm, 0, 1));
-            }
-            eprintln!(
-                "carrot: dmabuf: {} format+modifier pairs, main device {rdev:#x}",
-                formats.len()
-            );
-            *state.dmabuf_info.borrow_mut() = Some(crate::protocol::dmabuf::DmabufInfo {
-                main_device: rdev,
-                formats,
-            });
-        }
-        // one consumer per AsyncEvent: mirror global damage into each output.
-        // the boot set only covers the window before the display lands in
-        // state; from then on the live list is the sole authority - it
-        // shrinks and grows with hotplug, so any fixed prefix assumption
-        // strands an output added after a removal
-        let mut fan_outs = outputs.clone();
-        let st = state.clone();
-        let fanout = state.eng.spawn("damage fanout", async move {
-            loop {
-                st.damage.triggered().await;
-                if let Some(d) = st.display.borrow().as_ref() {
-                    // the boot pins drop with the handoff
-                    fan_outs.clear();
-                    for o in d.outputs.borrow().iter() {
-                        o.damage.trigger();
-                    }
-                } else {
-                    for o in &fan_outs {
-                        o.damage.trigger();
-                    }
-                }
-            }
-        });
-        // union extent: pointer clamping + xdg_output fall back to it
-        let uw = outputs.iter().map(|o| o.pos.get().0 + o.width as i32).max().unwrap_or(0);
-        let uh = outputs.iter().map(|o| o.pos.get().1 + o.height as i32).max().unwrap_or(0);
-        state.output_size.set((uw as u32, uh as u32));
-        let display = Display {
-            outputs: RefCell::new(outputs),
-            sw_image: RefCell::new(None),
-            sw_hot: Cell::new((0, 0)),
-            sw_hidden: Cell::new(false),
-            sw: Cell::new(false),
-            sw_gen: Cell::new(1),
-            dev,
-            core,
-            renderer,
-            devnum,
-            _pump: pump,
-            _presents: RefCell::new(presents),
-            _fanout: fanout,
-            hotplug: RefCell::new(None),
-        };
-        for out in display.outputs.borrow().iter() {
-            register_output_global(state, &display, out);
-        }
-        {
-            let seed = display
-                .outputs
-                .borrow()
-                .first()
-                .and_then(|o| o.theme_cursor.borrow().clone());
-            if let Some((px, w, h, hot)) = seed {
-                *display.sw_image.borrow_mut() = Some((px, w, h));
-                display.sw_hot.set(hot);
-            }
-        }
-        if state.config.borrow().cursor.software {
-            display.set_software_cursor(state, true);
-        }
-        // heads on OTHER cards are a phase-11 (multi-gpu) problem; say so
-        // instead of leaving a black monitor unexplained
-        warn_other_cards(&path);
-        // paint over the modesets' uninitialized first buffers
-        state.damage.trigger();
-        return Some(display);
+        cards.push(card);
+        outputs.extend(mine);
     }
-    eprintln!("carrot: no usable output, running headless");
-    None
+    if cards.is_empty() || outputs.is_empty() {
+        eprintln!("carrot: no usable output, running headless");
+        return None;
+    }
+    for (i, out) in outputs.iter().enumerate() {
+        out.index.set(i);
+    }
+    // an shm shadow is needed unless EVERY card can host-import: a surface
+    // can be drawn by any of them
+    state.host_import.set(
+        cards
+            .iter()
+            .all(|c| c.renderer.borrow().host_import_supported()),
+    );
+    eprintln!(
+        "carrot: {} card(s), {} output(s)",
+        cards.len(),
+        outputs.len()
+    );
+    // a workspace per output up front, bound to it
+    {
+        let mut list = state.workspaces.borrow_mut();
+        while list.len() < outputs.len().min(9) {
+            list.push(crate::tree::new_workspace(&state));
+        }
+        for i in 0..outputs.len().min(9) {
+            list[i].output.set(i);
+        }
+    }
+    // one logind pause/resume handler per card. each walks only its own
+    // card's live outputs: a pause for card A must not bench card B, and
+    // the resume modeset is a per-device commit
+    for card in &cards {
+        let Some(s) = session else { break };
+        let devnum = card.devnum();
+        // the boot set rides only until the display lands in state;
+        // holding it for the session would pin the boot outputs (and
+        // through them the boot renderer) past any gpu recovery
+        let boot = RefCell::new(
+            outputs
+                .iter()
+                .filter(|o| o.scanout_card.devnum() == devnum)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let st = state.clone();
+        s.on_device(
+            devnum,
+            Rc::new(move |ev| {
+                let outs: Vec<Rc<Output>> = match st.display.borrow().as_ref() {
+                    Some(d) => {
+                        boot.borrow_mut().clear();
+                        d.outputs
+                            .borrow()
+                            .iter()
+                            .filter(|o| o.scanout_card.devnum() == devnum)
+                            .cloned()
+                            .collect()
+                    }
+                    None => boot.borrow().clone(),
+                };
+                match ev {
+                    // no KMS work: logind already revoked master
+                    DeviceEvent::Pause { .. } => {
+                        for o in &outs {
+                            o.paused.set(true);
+                            o.rearm.take();
+                        }
+                    }
+                    DeviceEvent::Resume { .. } => {
+                        let sw = st
+                            .display
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|d| d.software_cursor());
+                        let mut heads = Vec::new();
+                        for o in &outs {
+                            o.paused.set(false);
+                            o.cursor_locked.set(false);
+                            o.rearm.take();
+                            // an in-flight flip never completes when the
+                            // vt left; unwedge the gate
+                            o.conn.flip_pending.set(false);
+                            if let Some(p) = o.conn.pipe.borrow().as_ref() {
+                                if let Some(cur) = &p.cursor {
+                                    // software mode keeps planes benched
+                                    cur.set_enabled(!sw && !o.cursor_client_hidden.get());
+                                }
+                            }
+                            heads.push((o.conn.clone(), o.bufs[o.front.get()].fb));
+                        }
+                        if let Some(o) = outs.first() {
+                            if let Err(e) = o.dev().modeset_heads(&heads) {
+                                eprintln!("carrot: resume modeset: {e}");
+                            }
+                        }
+                        st.damage.trigger();
+                    }
+                    DeviceEvent::Gone { .. } => {
+                        for o in &outs {
+                            o.paused.set(true);
+                        }
+                    }
+                }
+            }),
+        );
+    }
+    let presents: Vec<SpawnedFuture<()>> = outputs
+        .iter()
+        .map(|out| {
+            let st = state.clone();
+            let o = out.clone();
+            state.eng.spawn("present", async move {
+                present_loop(&st, &o).await;
+            })
+        })
+        .collect();
+    // the dmabuf global speaks for the primary card until per-card
+    // tranches land
+    {
+        let card = &cards[0];
+        let mut formats = Vec::new();
+        match card.core.borrow().sample_modifiers(vk::Format::B8G8R8A8_UNORM) {
+            Ok(mods) => {
+                for &(m, pc) in &mods {
+                    formats.push((crate::format::XRGB8888.drm, m, pc));
+                    formats.push((crate::format::ARGB8888.drm, m, pc));
+                }
+            }
+            Err(e) => eprintln!("carrot: dmabuf modifier probe failed: {e}"),
+        }
+        if formats.is_empty() {
+            formats.push((crate::format::XRGB8888.drm, 0, 1));
+            formats.push((crate::format::ARGB8888.drm, 0, 1));
+        }
+        eprintln!(
+            "carrot: dmabuf: {} format+modifier pairs, main device {:#x}",
+            formats.len(),
+            card.devnum()
+        );
+        *state.dmabuf_info.borrow_mut() = Some(crate::protocol::dmabuf::DmabufInfo {
+            main_device: card.devnum(),
+            formats,
+        });
+    }
+    // one consumer per AsyncEvent: mirror global damage into each output.
+    // the boot set only covers the window before the display lands in
+    // state; from then on the live list is the sole authority - it
+    // shrinks and grows with hotplug, so any fixed prefix assumption
+    // strands an output added after a removal
+    let mut fan_outs = outputs.clone();
+    let st = state.clone();
+    let fanout = state.eng.spawn("damage fanout", async move {
+        loop {
+            st.damage.triggered().await;
+            if let Some(d) = st.display.borrow().as_ref() {
+                // the boot pins drop with the handoff
+                fan_outs.clear();
+                for o in d.outputs.borrow().iter() {
+                    o.damage.trigger();
+                }
+            } else {
+                for o in &fan_outs {
+                    o.damage.trigger();
+                }
+            }
+        }
+    });
+    // union extent: pointer clamping + xdg_output fall back to it
+    let uw = outputs.iter().map(|o| o.pos.get().0 + o.width as i32).max().unwrap_or(0);
+    let uh = outputs.iter().map(|o| o.pos.get().1 + o.height as i32).max().unwrap_or(0);
+    state.output_size.set((uw as u32, uh as u32));
+    let display = Display {
+        outputs: RefCell::new(outputs),
+        sw_image: RefCell::new(None),
+        sw_hot: Cell::new((0, 0)),
+        sw_hidden: Cell::new(false),
+        sw: Cell::new(false),
+        sw_gen: Cell::new(1),
+        cards: RefCell::new(cards),
+        _presents: RefCell::new(presents),
+        _fanout: fanout,
+        hotplug: RefCell::new(None),
+    };
+    for out in display.outputs.borrow().iter() {
+        register_output_global(state, &display, out);
+    }
+    {
+        let seed = display
+            .outputs
+            .borrow()
+            .first()
+            .and_then(|o| o.theme_cursor.borrow().clone());
+        if let Some((px, w, h, hot)) = seed {
+            *display.sw_image.borrow_mut() = Some((px, w, h));
+            display.sw_hot.set(hot);
+        }
+    }
+    if state.config.borrow().cursor.software {
+        display.set_software_cursor(state, true);
+    }
+    // paint over the modesets' uninitialized first buffers
+    state.damage.trigger();
+    Some(display)
 }
 
 /// once-per-second gate for capture diagnostics: quiet paths that fail
@@ -1592,26 +1702,6 @@ fn xe_tiled_buf(
     })
 }
 
-/// sysfs peek: connected connectors on cards we did NOT bring up
-fn warn_other_cards(active: &std::path::Path) {
-    let Ok(rd) = std::fs::read_dir("/sys/class/drm") else { return };
-    let active = active.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        // card1-DP-2 style entries only, skipping the active card's
-        let Some((card, conn)) = name.split_once('-') else { continue };
-        if card == active || !card.starts_with("card") {
-            continue;
-        }
-        let status = std::fs::read_to_string(e.path().join("status")).unwrap_or_default();
-        if status.trim() == "connected" {
-            eprintln!(
-                "carrot: {card} {conn} is connected but multi-gpu output is not built yet (phase 11); that monitor stays dark"
-            );
-        }
-    }
-}
-
 /// seed the cursor plane: system theme, else built-in arrow
 fn seed_cursor(state: &Rc<State>, out: &Rc<Output>) {
     if let Some(p) = out.conn.pipe.borrow().as_ref() {
@@ -1634,11 +1724,15 @@ fn seed_cursor(state: &Rc<State>, out: &Rc<Output>) {
     }
 }
 
+/// open the card and route its pipes. the vulkan half is deliberately NOT
+/// built here: a card with nothing plugged into it must not get a logical
+/// device, because holding one keeps the gpu out of runtime suspend and
+/// every touch after that is a full PSP/SMU/GART resume
 async fn init_card(
     path: &std::path::Path,
     session: Option<&Rc<LogindSession>>,
     prefer: &dyn Fn(&str) -> Option<(u32, u32, Option<u32>)>,
-) -> Result<(Rc<DrmDevice>, Rc<VkCore>, Rc<Renderer>, u64), String> {
+) -> Result<Rc<DrmDevice>, String> {
     let devnum = rustix::fs::stat(path)
         .map_err(|e| format!("stat: {e}"))?
         .st_rdev;
@@ -1653,6 +1747,13 @@ async fn init_card(
         None => DrmDevice::open(path).map_err(|e| format!("open: {e}"))?,
     };
     dev.assign_pipes(prefer).map_err(|e| format!("pipes: {e}"))?;
+    Ok(dev)
+}
+
+/// the vulkan half of a card, alone: recovery rebuilds this against the
+/// surviving drm fd (the fd and its logind lease outlive a gpu reset and
+/// must never be re-taken)
+fn init_render(dev: &DrmDevice) -> Result<(Rc<VkCore>, Rc<Renderer>), String> {
     let core = Rc::new(VkCore::new(dev.fd.as_fd()).map_err(|e| format!("vulkan: {e}"))?);
     println!("carrot: rendering on {}", core.device_name);
     let renderer = Rc::new(
@@ -1661,7 +1762,7 @@ async fn init_card(
     if renderer.host_import_supported() {
         println!("carrot: sealed shm pools sample in place (host import)");
     }
-    Ok((dev, core, renderer, devnum))
+    Ok((core, renderer))
 }
 
 /// register (or re-register) an output's wl_output global
@@ -1738,21 +1839,24 @@ pub fn start_hotplug(state: &Rc<State>) {
     }
 }
 
-/// something changed on the card: re-probe every connector, tear down what
-/// left, bring up what arrived, then rebuild the global layout
+/// something changed on a card: re-probe its connectors, tear down what
+/// left, bring up what arrived, then rebuild the global layout.
 fn rescan(state: &Rc<State>) {
     let dref = state.display.borrow();
     let Some(d) = dref.as_ref() else { return };
+    let cards: Vec<Rc<Card>> = d.cards.borrow().clone();
     let old: Vec<Rc<Output>> = d.outputs.borrow().clone();
 
-    for conn in d.dev.connectors.borrow().iter() {
-        let Ok(info) = sys::connector(d.dev.fd.as_fd(), conn.id.0, true) else {
-            continue;
-        };
-        let now = info.connection == 1;
-        conn.connected.set(now);
-        if now {
-            *conn.modes.borrow_mut() = info.modes;
+    for card in &cards {
+        for conn in card.dev.connectors.borrow().iter() {
+            let Ok(info) = sys::connector(card.dev.fd.as_fd(), conn.id.0, true) else {
+                continue;
+            };
+            let now = info.connection == 1;
+            conn.connected.set(now);
+            if now {
+                *conn.modes.borrow_mut() = info.modes;
+            }
         }
     }
 
@@ -1790,7 +1894,7 @@ fn rescan(state: &Rc<State>) {
                 cur.clear_routing(&mut ch);
             }
             if let Err(e) = ch.commit(
-                d.dev.fd.as_fd(),
+                out.scanout_card.dev.fd.as_fd(),
                 crate::drm::atomic::ALLOW_MODESET,
                 0,
             ) {
@@ -1798,7 +1902,7 @@ fn rescan(state: &Rc<State>) {
             }
             p.crtc.connector.set(crate::drm::ObjId(0));
             // free a joiner-slave reservation held next door
-            for c in d.dev.crtcs.iter() {
+            for c in out.scanout_card.dev.crtcs.iter() {
                 if c.connector.get() == out.conn.id && c.id != p.crtc.id {
                     c.connector.set(crate::drm::ObjId(0));
                 }
@@ -1820,12 +1924,24 @@ fn rescan(state: &Rc<State>) {
         let prefer = |name: &str| -> Option<(u32, u32, Option<u32>)> {
             cfg.outputs.iter().find(|o| o.name == name).and_then(|o| o.mode)
         };
-        if let Err(e) = d.dev.assign_pipes(&prefer) {
-            eprintln!("carrot: hotplug pipe assignment: {e}");
+        for card in &cards {
+            if let Err(e) = card.dev.assign_pipes(&prefer) {
+                eprintln!("carrot: hotplug pipe assignment: {e}");
+            }
         }
     }
-    let known: Vec<Rc<Connector>> = d.dev.connectors.borrow().clone();
-    for conn in known {
+    let known: Vec<(Rc<Card>, Rc<Connector>)> = cards
+        .iter()
+        .flat_map(|c| {
+            c.dev
+                .connectors
+                .borrow()
+                .iter()
+                .map(|conn| (c.clone(), conn.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for (card, conn) in known {
         if conn.pipe.borrow().is_none() {
             continue;
         }
@@ -1834,7 +1950,7 @@ fn rescan(state: &Rc<State>) {
             continue;
         }
         let name = conn.name.clone();
-        match init_output(&d.dev, &d.core, &d.renderer, conn, d.devnum) {
+        match init_output(&card, &card, conn) {
             Ok(out) => {
                 let out = Rc::new(out);
                 seed_cursor(state, &out);
@@ -1850,15 +1966,21 @@ fn rescan(state: &Rc<State>) {
             Err(e) => eprintln!("carrot: {name}: {e} - connector skipped"),
         }
     }
-    // one commit over the full head set; the ladder steps the newest down
-    {
+    // one commit per card over that card's head set: combined-bandwidth
+    // validation is a property of one device, and a connector on card A
+    // cannot ride card B's commit
+    for card in &cards {
         let heads: Vec<(Rc<Connector>, u32)> = d
             .outputs
             .borrow()
             .iter()
+            .filter(|o| Rc::ptr_eq(&o.scanout_card, card))
             .map(|o| (o.conn.clone(), o.bufs[o.front.get()].fb))
             .collect();
-        if let Err(e) = d.dev.modeset_heads(&heads) {
+        if heads.is_empty() {
+            continue;
+        }
+        if let Err(e) = card.dev.modeset_heads(&heads) {
             eprintln!("carrot: hotplug modeset: {e}");
         }
     }
@@ -1980,15 +2102,15 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
 
 /// scanout buffers + modeset for one connector
 fn init_output(
-    dev: &Rc<DrmDevice>,
-    core: &Rc<VkCore>,
-    renderer: &Rc<Renderer>,
+    scanout: &Rc<Card>,
+    render: &Rc<Card>,
     conn: Rc<Connector>,
-    devnum: u64,
 ) -> Result<Output, String> {
-    let dev = dev.clone();
-    let core = core.clone();
-    let renderer = renderer.clone();
+    let dev = scanout.dev.clone();
+    // buffers are allocated by whoever composites; with offload that is a
+    // different card than the one that scans them out
+    let core = render.core.borrow().clone();
+    let renderer = render.renderer.borrow().clone();
     let (width, height, primary) = {
         let pipe = conn.pipe.borrow();
         let p = pipe.as_ref().unwrap();
@@ -2112,7 +2234,8 @@ fn init_output(
     );
 
     Ok(Output {
-        dev,
+        scanout_card: scanout.clone(),
+        render_card: render.clone(),
         conn,
         renderer,
         bufs,
@@ -2134,7 +2257,6 @@ fn init_output(
         prepasses: RefCell::new(Vec::new()),
         preuploads: RefCell::new(Vec::new()),
         cast_keep: RefCell::new(HashMap::new()),
-        devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
         cursor_client_hidden: Cell::new(false),
@@ -2458,7 +2580,7 @@ fn scanout_fb(out: &Rc<Output>, buf: &Rc<crate::protocol::shm::WlBuffer>) -> Opt
         return Some(e.fb);
     }
     let img = buf.dmabuf()?;
-    let fd = out.dev.fd.as_fd();
+    let fd = out.dev().fd.as_fd();
     let mut handles = Vec::new();
     let mut pitches = Vec::new();
     let mut offsets = Vec::new();
@@ -2780,7 +2902,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             if let Some(fb) = scanout_fb(out, &buf) {
                 let fence = buf.dmabuf().and_then(|img| img.read_fence());
                 out.conn.vrr_want.set(vrr_wanted(state, out));
-                let flip_res = out.conn.flip(&out.dev, fb, fence.as_ref().map(|f| f.as_raw_fd()));
+                let flip_res = out.conn.flip(out.dev(), fb, fence.as_ref().map(|f| f.as_raw_fd()));
                 service_cursor_fault(state, out);
                 match flip_res {
                     Ok(FlipResult::Queued) => {
@@ -2942,7 +3064,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 None => true,
             };
             let attempt = if ready {
-                out.conn.flip_async(&out.dev, buf.fb)
+                out.conn.flip_async(out.dev(), buf.fb)
             } else {
                 Err(crate::drm::device::DrmError::Op("tearing fence bound", rustix::io::Errno::AGAIN))
             };
@@ -2951,7 +3073,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 // frame still has to land
                 Err(_) => out
                     .conn
-                    .flip(&out.dev, buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd())),
+                    .flip(out.dev(), buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd())),
                 res => {
                     out.inflight_vsync.set(false);
                     res
@@ -2959,7 +3081,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             }
         } else {
             out.conn
-                .flip(&out.dev, buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd()))
+                .flip(out.dev(), buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd()))
         };
         service_cursor_fault(state, out);
         match res {
@@ -3346,7 +3468,7 @@ pub fn dpms(state: &Rc<State>, on: bool) {
         if let Some(o) = outs.first() {
             // modeset_heads(&[]) is a no-op by design; off needs the
             // dedicated disable commit or the panels keep scanning
-            if let Err(e) = o.dev.disable_all_heads() {
+            if let Err(e) = o.dev().disable_all_heads() {
                 eprintln!("carrot: dpms off: {e}");
             }
         }
@@ -3361,7 +3483,7 @@ pub fn dpms(state: &Rc<State>, on: bool) {
         heads.push((o.conn.clone(), o.bufs[o.front.get()].fb));
     }
     if let Some(o) = outs.first() {
-        if let Err(e) = o.dev.modeset_heads(&heads) {
+        if let Err(e) = o.dev().modeset_heads(&heads) {
             eprintln!("carrot: dpms on: {e}");
         }
     }
@@ -3473,7 +3595,7 @@ fn tearing_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
         .iter()
         .find(|o| o.name == out.conn.name)
         .is_some_and(|o| o.allow_tearing);
-    if !out.dev.supports_async_flip || !allowed {
+    if !out.dev().supports_async_flip || !allowed {
         return false;
     }
     if out.conn.cursor_changed() {
