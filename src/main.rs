@@ -195,6 +195,9 @@ fn main() {
         std::process::exit(drm::device::probe_dump());
     }
     if std::env::args().any(|a| a == "render-probe") {
+        if std::env::args().any(|a| a == "--all-cards") {
+            std::process::exit(render::renderer::probe_all_cards());
+        }
         std::process::exit(render::renderer::probe());
     }
     if std::env::args().any(|a| a == "dbus-probe") {

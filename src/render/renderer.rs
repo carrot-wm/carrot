@@ -3132,3 +3132,242 @@ fn create_pipeline(
     }?;
     Ok(pipes[0])
 }
+
+/// one cell of the cross-import matrix: can the column's card import a
+/// dma-buf the row's card allocated?
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Cross {
+    /// zero copy: direct import works
+    Yes,
+    /// needs the blit path
+    No,
+    /// same card, nothing to cross
+    Same,
+    /// one side has no vulkan device
+    Unknown,
+}
+
+impl Cross {
+    fn glyph(self) -> &'static str {
+        match self {
+            Cross::Yes => "yes",
+            Cross::No => "no",
+            Cross::Same => "-",
+            Cross::Unknown => "?",
+        }
+    }
+}
+
+/// rows allocate, columns import. square, padded to the widest label so the
+/// answer to "will offload be zero-copy here" is readable at a glance
+fn render_matrix(labels: &[String], cells: &[Vec<Cross>]) -> String {
+    let w = labels
+        .iter()
+        .map(|l| l.len())
+        .chain(std::iter::once(3))
+        .max()
+        .unwrap_or(3);
+    let mut out = format!("{:>w$} |", "", w = w);
+    for l in labels {
+        out.push_str(&format!(" {l:>w$}"));
+    }
+    out.push('\n');
+    for (label, row) in labels.iter().zip(cells) {
+        out.push_str(&format!("{label:>w$} |"));
+        for c in row {
+            out.push_str(&format!(" {:>w$}", c.glyph()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// one card as the multi-gpu code will see it
+struct ProbedCard {
+    label: String,
+    devnum: u64,
+    pci: Option<String>,
+    driver: String,
+    core: Option<Rc<VkCore>>,
+    device_name: String,
+    sample_mods: usize,
+    scanout_mods: usize,
+    host_import: bool,
+}
+
+/// `carrot render-probe --all-cards`: every card's identity plus the
+/// cross-import matrix. answers "will render offload be zero copy on this
+/// machine" without starting a session
+pub fn probe_all_cards() -> i32 {
+    use crate::allocator::{create_scanout_bo, import_bo};
+    use rustix::fs::{Mode, OFlags, open};
+    use std::os::fd::AsFd;
+
+    const W: u32 = 256;
+    const H: u32 = 256;
+    const FMT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+
+    let paths = match crate::drm::device::card_paths() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot read /dev/dri: {e}");
+            return 1;
+        }
+    };
+    if paths.is_empty() {
+        eprintln!("no drm cards found");
+        return 1;
+    }
+
+    let mut cards: Vec<ProbedCard> = Vec::new();
+    for path in &paths {
+        let label = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let fd = match open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                println!("{label}: open failed: {e}");
+                continue;
+            }
+        };
+        let devnum = rustix::fs::fstat(fd.as_fd())
+            .map(|st| st.st_rdev)
+            .unwrap_or(0);
+        let driver = crate::drm::sys::driver_name(fd.as_fd()).unwrap_or_default();
+        let pci = crate::drm::device::pci_address(devnum);
+        let core = match VkCore::new(fd.as_fd()) {
+            Ok(c) => Some(Rc::new(c)),
+            Err(e) => {
+                println!("{label}: no vulkan device: {e}");
+                None
+            }
+        };
+        let (device_name, sample_mods, scanout_mods, host_import) = match &core {
+            Some(c) => (
+                c.device_name.clone(),
+                c.sample_modifiers(FMT).map(|m| m.len()).unwrap_or(0),
+                c.scanout_modifiers(FMT).map(|m| m.len()).unwrap_or(0),
+                c.ext_host.is_some(),
+            ),
+            None => (String::new(), 0, 0, false),
+        };
+        cards.push(ProbedCard {
+            label,
+            devnum,
+            pci,
+            driver,
+            core,
+            device_name,
+            sample_mods,
+            scanout_mods,
+            host_import,
+        });
+    }
+
+    println!("=== cards ===");
+    for c in &cards {
+        println!(
+            "{}: devnum {:#x} driver {:?} pci {} vulkan {:?}",
+            c.label,
+            c.devnum,
+            c.driver,
+            c.pci.as_deref().unwrap_or("(none)"),
+            c.device_name
+        );
+        println!(
+            "    sample modifiers {} scanout modifiers {} host_import {}",
+            c.sample_mods, c.scanout_mods, c.host_import
+        );
+    }
+    if cards.len() < 2 {
+        println!("\nonly one card: nothing to cross-import");
+        return 0;
+    }
+
+    // rows allocate, columns import. linear is the blit path's landing
+    // format, so a no there means even the fallback has to go through
+    // system memory
+    let labels: Vec<String> = cards.iter().map(|c| c.label.clone()).collect();
+    for (title, linear) in [("preferred modifier", false), ("linear", true)] {
+        let mut rows: Vec<Vec<Cross>> = Vec::new();
+        for src in &cards {
+            let mut row = vec![Cross::Unknown; cards.len()];
+            let Some(score) = src.core.as_ref() else {
+                rows.push(row);
+                continue;
+            };
+            let candidates: Vec<(u64, u32)> = if linear {
+                vec![(0, 1)]
+            } else {
+                score.scanout_modifiers(FMT).unwrap_or_default()
+            };
+            if candidates.is_empty() {
+                rows.push(row);
+                continue;
+            }
+            let bo = match create_scanout_bo(score, W, H, FMT, &candidates) {
+                Ok(bo) => bo,
+                Err(_) => {
+                    rows.push(row);
+                    continue;
+                }
+            };
+            let size = rustix::fs::seek(&bo.fd, rustix::fs::SeekFrom::End(0)).unwrap_or(0);
+            let pitch = bo.planes.first().map(|p| p.pitch as u32).unwrap_or(0);
+            for (j, dst) in cards.iter().enumerate() {
+                if dst.devnum == src.devnum {
+                    row[j] = Cross::Same;
+                    continue;
+                }
+                let Some(dcore) = dst.core.as_ref() else {
+                    continue;
+                };
+                let Ok(dup) = bo.fd.try_clone() else {
+                    continue;
+                };
+                row[j] = match import_bo(dcore, dup, W, H, pitch, size, FMT, bo.modifier) {
+                    Ok(img) => {
+                        img.destroy(dcore);
+                        Cross::Yes
+                    }
+                    Err(_) => Cross::No,
+                };
+            }
+            bo.destroy(score);
+            rows.push(row);
+        }
+        println!("\n=== cross-import: {title} (row allocates, column imports) ===");
+        print!("{}", render_matrix(&labels, &rows));
+    }
+    println!("\nyes = direct import, zero copy. no = blit path. ? = no vulkan device.");
+    0
+}
+
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn the_matrix_is_square_and_aligned() {
+        let labels = vec!["card0".to_string(), "card1".to_string()];
+        let cells = vec![
+            vec![Cross::Same, Cross::Yes],
+            vec![Cross::No, Cross::Same],
+        ];
+        let out = render_matrix(&labels, &cells);
+        let lines: Vec<&str> = out.lines().collect();
+        // header plus one row per card
+        assert_eq!(lines.len(), 3);
+        // every line is the same width, so columns line up
+        assert_eq!(lines[1].len(), lines[0].len());
+        assert_eq!(lines[2].len(), lines[0].len());
+        assert!(lines[0].contains("card0") && lines[0].contains("card1"));
+        // card1 cannot import card0's buffers: that is the blit path
+        assert!(lines[2].trim_start().starts_with("card1 |"));
+        assert!(lines[2].contains("no"));
+    }
+}
