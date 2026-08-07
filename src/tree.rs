@@ -783,6 +783,7 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
         focus_window(state, next.as_ref());
     }
     crate::protocol::foreign_toplevel::output_changed(state, &win);
+    crate::protocol::dmabuf::output_changed(state, &win);
     // the sent window may have landed on a hidden workspace
     sync_x_visibility(state);
 }
@@ -830,6 +831,7 @@ pub fn move_workspace_to_output(state: &Rc<State>, ws_idx: usize, dst: usize) {
         send_surface_output(state, &w.surface(), src, false);
         send_surface_output(state, &w.surface(), dst, true);
         crate::protocol::foreign_toplevel::output_changed(state, w);
+        crate::protocol::dmabuf::output_changed(state, w);
     });
     // the fullscreen slot spans the destination rect now
     if let Some(w) = ws.fullscreen.borrow().clone() {

@@ -74,6 +74,20 @@ impl DmabufInfo {
     }
 }
 
+/// which cards to emit tranches for, in order. `prefer` is the devnum of
+/// the card that composites the surface this feedback belongs to; it leads,
+/// and everything else keeps primary order behind it
+fn tranche_order(info: &DmabufInfo, prefer: Option<u64>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..info.cards.len()).collect();
+    if let Some(want) = prefer
+        && let Some(pos) = info.cards.iter().position(|c| c.devnum == want)
+    {
+        order.remove(pos);
+        order.insert(0, pos);
+    }
+    order
+}
+
 fn linear_fallback() -> Vec<(u32, u64, u32)> {
     vec![(XRGB8888.drm, MOD_LINEAR, 1), (ARGB8888.drm, MOD_LINEAR, 1)]
 }
@@ -170,24 +184,47 @@ impl zwp_linux_dmabuf_v1::Handler for Dmabuf {
         &self,
         req: zwp_linux_dmabuf_v1::get_default_feedback::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        feedback(&self.client, req.id, self.version)
+        // no surface to follow, so the primary leads
+        feedback(&self.client, req.id, self.version, None)
     }
 
     fn get_surface_feedback(
         &self,
         req: zwp_linux_dmabuf_v1::get_surface_feedback::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        feedback(&self.client, req.id, self.version)
+        // the card composing this surface's output leads its tranches, so a
+        // client that follows the hint allocates where we sample
+        let surface = self.client.objects.surface(req.surface);
+        feedback(&self.client, req.id, self.version, surface)
     }
 }
 
 /// feedback is static per card set, so send the whole state up front and be
-/// done. one tranche per card, all flagged sampling, in card order
-fn feedback(c: &Rc<Client>, id: ObjectId, version: u32) -> Result<(), Box<dyn std::error::Error>> {
-    c.add_client_obj(Rc::new(Feedback {
+/// done. one tranche per card, all flagged sampling, in `prefer` order
+fn feedback(
+    c: &Rc<Client>,
+    id: ObjectId,
+    version: u32,
+    surface: Option<Rc<crate::surface::WlSurface>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fb = Rc::new(Feedback {
         id,
         client: c.clone(),
-    }))?;
+        version,
+        last_order: RefCell::new(Vec::new()),
+        surface: surface.as_ref().map(Rc::downgrade),
+    });
+    c.add_client_obj(fb.clone())?;
+    let prefer = surface.and_then(|s| card_of_surface(&c.state, &s));
+    if fb.surface.is_some() {
+        c.state.dmabuf_feedbacks.borrow_mut().push(Rc::downgrade(&fb));
+    }
+    send_feedback(&fb, prefer)
+}
+
+/// the parameter set itself, re-sendable when the surface's card changes
+fn send_feedback(fb: &Feedback, prefer: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    let (c, id, version) = (&fb.client, fb.id, fb.version);
     let guard = c.state.dmabuf_info.borrow();
     // no probe yet: one nameless linear tranche, which is what a client can
     // always fall back to
@@ -201,7 +238,14 @@ fn feedback(c: &Rc<Client>, id: ObjectId, version: u32) -> Result<(), Box<dyn st
         Some(i) if !i.cards.is_empty() => (i, true),
         _ => (&fallback, false),
     };
-    let order: Vec<usize> = (0..info.cards.len()).collect();
+    let order = tranche_order(info, prefer);
+    // identical parameters twice in a row are exactly what the spec asks
+    // compositors to avoid; a surface moving within one card changes nothing
+    let devnums: Vec<u64> = order.iter().map(|&i| info.cards[i].devnum).collect();
+    if *fb.last_order.borrow() == devnums {
+        return Ok(());
+    }
+    *fb.last_order.borrow_mut() = devnums;
 
     // one table for every card; each tranche indexes its own slice of it
     let mut table = Vec::new();
@@ -264,6 +308,72 @@ fn feedback(c: &Rc<Client>, id: ObjectId, version: u32) -> Result<(), Box<dyn st
 pub struct Feedback {
     pub id: ObjectId,
     pub client: Rc<Client>,
+    pub version: u32,
+    /// devnums in the order last sent. the spec asks compositors not to
+    /// send the exact same parameters twice in a row, so a surface moving
+    /// between outputs on one card re-sends nothing
+    last_order: RefCell<Vec<u64>>,
+    /// the surface this feedback speaks for; None for the default object,
+    /// which has no output to follow
+    surface: Option<std::rc::Weak<crate::surface::WlSurface>>,
+}
+
+impl Feedback {
+    /// re-send unless the card order is unchanged; send_feedback holds the
+    /// "not the same parameters twice" rule
+    fn resend(&self, prefer: Option<u64>) {
+        if let Err(e) = send_feedback(self, prefer) {
+            crate::trace!("dmabuf: feedback resend failed: {e}");
+        }
+    }
+}
+
+/// the card composing the output this window currently sits on
+fn card_of_window(
+    state: &Rc<crate::state::State>,
+    win: &Rc<crate::tree::Window>,
+) -> Option<u64> {
+    let slot = crate::tree::workspace_of(state, win)?.output.get();
+    let d = state.display.borrow();
+    let out = d.as_ref()?.outputs.borrow().get(slot)?.clone();
+    Some(out.render_devnum())
+}
+
+fn card_of_surface(
+    state: &Rc<crate::state::State>,
+    s: &Rc<crate::surface::WlSurface>,
+) -> Option<u64> {
+    let win = crate::tree::window_for_surface_any(state, s)?;
+    card_of_window(state, &win)
+}
+
+/// a window crossed to an output on a different card: its surfaces should
+/// start allocating there. dead entries are swept on the way through
+pub fn output_changed(state: &Rc<crate::state::State>, win: &Rc<crate::tree::Window>) {
+    let live: Vec<Rc<Feedback>> = {
+        let mut reg = state.dmabuf_feedbacks.borrow_mut();
+        reg.retain(|w| w.strong_count() > 0);
+        reg.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    if live.is_empty() {
+        return;
+    }
+    // the caller already has the window, so resolve the card from it
+    // rather than walking every workspace back from the surface
+    let Some(dev) = card_of_window(state, win) else {
+        return;
+    };
+    // the toplevel's own surface: that is what a client asks surface
+    // feedback for. a subsurface keeps whatever order it was created with
+    let root = win.surface();
+    for fb in live {
+        let Some(fs) = fb.surface.as_ref().and_then(|w| w.upgrade()) else {
+            continue;
+        };
+        if Rc::ptr_eq(&root, &fs) {
+            fb.resend(Some(dev));
+        }
+    }
 }
 
 impl zwp_linux_dmabuf_feedback_v1::Handler for Feedback {
@@ -290,7 +400,7 @@ impl Object for Feedback {
         opcode: u32,
         r: &mut MsgReader<'_>,
     ) -> Result<(), DispatchError> {
-        zwp_linux_dmabuf_feedback_v1::dispatch(&*self, 4, opcode, r)
+        zwp_linux_dmabuf_feedback_v1::dispatch(&*self, self.version, opcode, r)
     }
 }
 
@@ -732,7 +842,7 @@ mod tests {
                 (XRGB8888.drm, 42, 1),
                 (ARGB8888.drm, 42, 1),
             ]));
-        feedback(&client, ObjectId(90), 4).unwrap();
+        feedback(&client, ObjectId(90), 4, None).unwrap();
         let bytes = client.queued_out_bytes();
         assert_eq!(count_events(&bytes, ObjectId(90), 1), 1, "format_table");
         assert_eq!(count_events(&bytes, ObjectId(90), 2), 1, "main_device");
@@ -958,7 +1068,7 @@ mod tests {
     fn v6_feedback_drops_main_device_and_flags_the_tranche() {
         let (state, client) = test_client();
         *state.dmabuf_info.borrow_mut() = Some(one_card(0xe280, vec![(XRGB8888.drm, 0, 1)]));
-        feedback(&client, ObjectId(90), 6).unwrap();
+        feedback(&client, ObjectId(90), 6, None).unwrap();
         let bytes = client.queued_out_bytes();
         // v6 retired main_device entirely
         assert_eq!(count_events(&bytes, ObjectId(90), 2), 0, "main_device");
@@ -1124,4 +1234,102 @@ mod tests {
         assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 1);
     }
 
+    #[test]
+    fn the_surfaces_card_leads_the_tranches() {
+        let info = DmabufInfo {
+            cards: vec![
+                CardFormats { devnum: 0xe200, formats: vec![] },
+                CardFormats { devnum: 0xe201, formats: vec![] },
+                CardFormats { devnum: 0xe202, formats: vec![] },
+            ],
+        };
+        // nothing to go on: primary first, the order bring-up found
+        assert_eq!(tranche_order(&info, None), vec![0, 1, 2]);
+        // a surface composited on the second card promotes it, and the
+        // others keep their relative order behind it
+        assert_eq!(tranche_order(&info, Some(0xe201)), vec![1, 0, 2]);
+        // a device no card owns is not a reason to reshuffle
+        assert_eq!(tranche_order(&info, Some(0xdead)), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn every_card_gets_its_own_sampling_tranche() {
+        let (state, client) = test_client();
+        *state.dmabuf_info.borrow_mut() = Some(DmabufInfo {
+            cards: vec![
+                CardFormats {
+                    devnum: 0xe200,
+                    formats: vec![(XRGB8888.drm, MOD_LINEAR, 1)],
+                },
+                CardFormats {
+                    devnum: 0xe201,
+                    formats: vec![(XRGB8888.drm, 42, 1), (ARGB8888.drm, 42, 1)],
+                },
+            ],
+        });
+        feedback(&client, ObjectId(90), 6, None).unwrap();
+        let b = client.queued_out_bytes();
+        // one table for the whole set, one done at the end
+        assert_eq!(count_events(&b, ObjectId(90), 1), 1, "format_table");
+        assert_eq!(count_events(&b, ObjectId(90), 0), 1, "done");
+        // v6 never sends main_device
+        assert_eq!(count_events(&b, ObjectId(90), 2), 0, "main_device");
+        // and one full tranche per card
+        assert_eq!(count_events(&b, ObjectId(90), 4), 2, "tranche_target_device");
+        assert_eq!(count_events(&b, ObjectId(90), 6), 2, "tranche_flags");
+        assert_eq!(count_events(&b, ObjectId(90), 5), 2, "tranche_formats");
+        assert_eq!(count_events(&b, ObjectId(90), 3), 2, "tranche_done");
+        // in card order, each naming its own device
+        let devs = event_arrays(&b, ObjectId(90), 4);
+        assert_eq!(devs[0], 0xe200u64.to_ne_bytes().to_vec());
+        assert_eq!(devs[1], 0xe201u64.to_ne_bytes().to_vec());
+        // the second card's indices point past the first card's entries
+        let idx = event_arrays(&b, ObjectId(90), 5);
+        assert_eq!(idx[0], 0u16.to_ne_bytes().to_vec(), "card0 owns entry 0");
+        let mut want = 1u16.to_ne_bytes().to_vec();
+        want.extend_from_slice(&2u16.to_ne_bytes());
+        assert_eq!(idx[1], want, "card1 owns entries 1 and 2");
+    }
+
+    #[test]
+    fn identical_feedback_is_not_re_sent() {
+        let (state, client) = test_client();
+        *state.dmabuf_info.borrow_mut() = Some(DmabufInfo {
+            cards: vec![
+                CardFormats {
+                    devnum: 0xe200,
+                    formats: vec![(XRGB8888.drm, MOD_LINEAR, 1)],
+                },
+                CardFormats {
+                    devnum: 0xe201,
+                    formats: vec![(XRGB8888.drm, 42, 1)],
+                },
+            ],
+        });
+        let fb = Feedback {
+            id: ObjectId(90),
+            client: client.clone(),
+            version: 6,
+            last_order: RefCell::new(Vec::new()),
+            surface: None,
+        };
+        send_feedback(&fb, None).unwrap();
+        let after_first = client.queued_out_bytes().len();
+        assert!(after_first > 0, "first send says something");
+
+        // same card order: the spec asks us not to repeat it
+        send_feedback(&fb, None).unwrap();
+        assert_eq!(
+            client.queued_out_bytes().len(),
+            after_first,
+            "identical parameters were re-sent"
+        );
+
+        // the surface moved to the other card: that is a real change
+        send_feedback(&fb, Some(0xe201)).unwrap();
+        assert!(
+            client.queued_out_bytes().len() > after_first,
+            "a new lead card must re-send"
+        );
+    }
 }

@@ -95,6 +95,11 @@ pub struct State {
     /// the render device + (fourcc, modifier) set the dmabuf global speaks
     /// for; filled when the display comes up
     pub dmabuf_info: RefCell<Option<crate::protocol::dmabuf::DmabufInfo>>,
+    /// live per-surface dmabuf feedback objects. a window crossing to an
+    /// output on another card re-sends through these, which is how v6
+    /// steers the next allocation to the right gpu
+    pub dmabuf_feedbacks:
+        RefCell<Vec<std::rc::Weak<crate::protocol::dmabuf::Feedback>>>,
     /// frozen at each output's predicted present; all sampling agrees on
     /// when the frame will glass
     pub anim_clock: crate::anim::AnimClock,
@@ -159,6 +164,7 @@ impl State {
             frames_in_flight: std::cell::Cell::new(0),
             host_import: std::cell::Cell::new(false),
             dmabuf_info: RefCell::new(None),
+            dmabuf_feedbacks: RefCell::new(Vec::new()),
             anim_clock: crate::anim::AnimClock::new(),
             retire_tex: RefCell::new(Vec::new()),
             grab_active: std::cell::Cell::new(false),
