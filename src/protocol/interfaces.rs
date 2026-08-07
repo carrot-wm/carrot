@@ -470,7 +470,7 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
-    interface zwp_linux_dmabuf_v1, version = 4;
+    interface zwp_linux_dmabuf_v1, version = 6;
     request destroy();
     request create_params(params_id: new_id);
     request get_default_feedback(id: new_id) since 4;
@@ -480,7 +480,9 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
-    interface zwp_linux_dmabuf_feedback_v1, version = 4;
+    // main_device is deprecated since 6: v6 binds get the device from the
+    // sampling tranche instead, so it stays declared for v4/v5 clients only
+    interface zwp_linux_dmabuf_feedback_v1, version = 6;
     request destroy();
     event done();
     event format_table(fd: fd, size: uint);
@@ -492,11 +494,12 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
-    interface zwp_linux_buffer_params_v1, version = 4;
+    interface zwp_linux_buffer_params_v1, version = 6;
     request destroy();
     request add(fd: fd, plane_idx: uint, offset: uint, stride: uint, modifier_hi: uint, modifier_lo: uint);
     request create(width: int, height: int, format: uint, flags: uint);
     request create_immed(buffer_id: new_id, width: int, height: int, format: uint, flags: uint) since 2;
+    request set_sampling_device(device: array) since 6;
     event created(buffer: new_id);
     event failed();
 }
@@ -931,6 +934,7 @@ mod tests {
         assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
         assert_eq!(zwp_linux_buffer_params_v1::create::OPCODE, 2);
         assert_eq!(zwp_linux_buffer_params_v1::create_immed::OPCODE, 3);
+        assert_eq!(zwp_linux_buffer_params_v1::set_sampling_device::OPCODE, 4);
         assert_eq!(zwp_linux_buffer_params_v1::created::OPCODE, 0);
         assert_eq!(zwp_linux_buffer_params_v1::failed::OPCODE, 1);
         assert_eq!(zwp_relative_pointer_manager_v1::get_relative_pointer::OPCODE, 1);

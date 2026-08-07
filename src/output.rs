@@ -879,6 +879,65 @@ impl Output {
 }
 
 /// bring up a display if a card is reachable, else run headless
+/// the cards dmabuf feedback may advertise, in preference order.
+///
+/// ONLY cards whose buffers we can actually put on a screen. advertising a
+/// card we cannot import from tells a client to allocate somewhere its
+/// frames die: cross-card import (direct, then blit) is not built yet, and
+/// on real hardware here amdgpu's preferred modifiers do not import on xe at
+/// all. a client that believed the hint drew white and black flashes.
+///
+/// widen this to every card once Card::import_client and the blit fallback
+/// land; until then the extra tranche is a trap, not a hint
+fn advertisable(cards: &[Rc<Card>], outputs: &[Rc<Output>]) -> Vec<Rc<Card>> {
+    cards
+        .iter()
+        .filter(|c| outputs.iter().any(|o| Rc::ptr_eq(&o.render_card, c)))
+        .cloned()
+        .collect()
+}
+
+/// every advertisable card's sampleable format+modifier set, in card order.
+/// the primary leads, which is what a client with no surface to go on
+/// allocates for
+fn dmabuf_info(cards: &[Rc<Card>]) -> crate::protocol::dmabuf::DmabufInfo {
+    use crate::protocol::dmabuf::{CardFormats, DmabufInfo};
+    let mut out = Vec::new();
+    for card in cards {
+        let mut formats = Vec::new();
+        match card
+            .core
+            .borrow()
+            .sample_modifiers(vk::Format::B8G8R8A8_UNORM)
+        {
+            Ok(mods) => {
+                for &(m, pc) in &mods {
+                    formats.push((crate::format::XRGB8888.drm, m, pc));
+                    formats.push((crate::format::ARGB8888.drm, m, pc));
+                }
+            }
+            Err(e) => eprintln!(
+                "carrot: {:?}: dmabuf modifier probe failed: {e}",
+                card.dev.pci
+            ),
+        }
+        if formats.is_empty() {
+            formats.push((crate::format::XRGB8888.drm, 0, 1));
+            formats.push((crate::format::ARGB8888.drm, 0, 1));
+        }
+        eprintln!(
+            "carrot: dmabuf: device {:#x}: {} format+modifier pairs",
+            card.devnum(),
+            formats.len()
+        );
+        out.push(CardFormats {
+            devnum: card.devnum(),
+            formats,
+        });
+    }
+    DmabufInfo { cards: out }
+}
+
 /// bring one card up: its vulkan stack, its outputs, and the modeset that
 /// lights them. a card with no connected head still comes back, because it
 /// is a valid render target for an output that scans out elsewhere
@@ -1188,34 +1247,18 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
             })
         })
         .collect();
-    // the dmabuf global speaks for the primary card until per-card
-    // tranches land
-    {
-        let card = &cards[0];
-        let mut formats = Vec::new();
-        match card.core.borrow().sample_modifiers(vk::Format::B8G8R8A8_UNORM) {
-            Ok(mods) => {
-                for &(m, pc) in &mods {
-                    formats.push((crate::format::XRGB8888.drm, m, pc));
-                    formats.push((crate::format::ARGB8888.drm, m, pc));
-                }
-            }
-            Err(e) => eprintln!("carrot: dmabuf modifier probe failed: {e}"),
-        }
-        if formats.is_empty() {
-            formats.push((crate::format::XRGB8888.drm, 0, 1));
-            formats.push((crate::format::ARGB8888.drm, 0, 1));
-        }
+    // one feedback tranche per card, in card order: the primary leads, and
+    // a surface on another card gets its own card promoted to the front
+    let shown = advertisable(&cards, &outputs);
+    if shown.len() < cards.len() {
         eprintln!(
-            "carrot: dmabuf: {} format+modifier pairs, main device {:#x}",
-            formats.len(),
-            card.devnum()
+            "carrot: dmabuf: advertising {} of {} card(s); a card with no output of its own \
+cannot take a client buffer until cross-card import lands",
+            shown.len(),
+            cards.len()
         );
-        *state.dmabuf_info.borrow_mut() = Some(crate::protocol::dmabuf::DmabufInfo {
-            main_device: card.devnum(),
-            formats,
-        });
     }
+    *state.dmabuf_info.borrow_mut() = Some(dmabuf_info(&shown));
     // one consumer per AsyncEvent: mirror global damage into each output.
     // the boot set only covers the window before the display lands in
     // state; from then on the live list is the sole authority - it
