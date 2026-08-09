@@ -1974,19 +1974,59 @@ pub fn start_hotplug(state: &Rc<State>) {
             use crate::input::evdev::AddOutcome;
             loop {
                 let req = aq.pop().await;
-                let HotplugAdd::Node(devname) = &req else {
-                    continue;
-                };
-                let deadline = Time::from_nsec(Time::now().nsec() + 250_000_000);
-                let _ = ast.ring.timeout(deadline).await;
+                if let HotplugAdd::Node(devname) = &req {
+                    let path = std::path::PathBuf::from(format!("/dev/{devname}"));
+                    // fresh nodes lag their uevent: udev permissions land late,
+                    // and 8k mice enumerate in stages, so a single shot at a
+                    // fixed beat stranded them. back off and retry; a node
+                    // that classifies as not-ours gets a couple of chances to
+                    // finish growing its capability bits, then stands
+                    let mut wait = 250_000_000u64;
+                    for attempt in 0..6u32 {
+                        let deadline = Time::from_nsec(Time::now().nsec() + wait);
+                        let _ = ast.ring.timeout(deadline).await;
+                        let session = ast.session.borrow().clone();
+                        let mgr = ast.input.borrow().as_ref().map(|i| i.mgr.clone());
+                        let (Some(session), Some(mgr)) = (session, mgr) else {
+                            break;
+                        };
+                        match mgr.add_device(&ast, &session, &path).await {
+                            AddOutcome::New(dev) => {
+                                println!("carrot: input: {} added", dev.name);
+                                break;
+                            }
+                            AddOutcome::Known => break,
+                            AddOutcome::Skip if attempt >= 2 => break,
+                            _ if attempt == 5 => {
+                                eprintln!(
+                                    "carrot: input: {} never came up; replug it",
+                                    path.display()
+                                );
+                            }
+                            _ => wait *= 2,
+                        }
+                    }
+                }
+                // uevent storms overflow the socket and drop datagrams;
+                // any survivor sweeps once for stranded siblings
                 let session = ast.session.borrow().clone();
                 let mgr = ast.input.borrow().as_ref().map(|i| i.mgr.clone());
-                let (Some(session), Some(mgr)) = (session, mgr) else {
-                    continue;
-                };
-                let path = std::path::PathBuf::from(format!("/dev/{devname}"));
-                if let AddOutcome::New(dev) = mgr.add_device(&ast, &session, &path).await {
-                    println!("carrot: input: {} added", dev.name);
+                if let (Some(session), Some(mgr)) = (session, mgr)
+                    && let Ok(rd) = std::fs::read_dir("/dev/input")
+                {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let is_event = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("event"));
+                        if !is_event {
+                            continue;
+                        }
+                        if let AddOutcome::New(dev) = mgr.add_device(&ast, &session, &p).await {
+                            println!("carrot: input: {} added (swept)", dev.name);
+                        }
+                    }
                 }
             }
         });
