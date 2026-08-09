@@ -34,8 +34,16 @@ pub struct Card {
     /// here, everything in-flight holds its own Rc and drains out
     pub core: RefCell<Rc<VkCore>>,
     pub renderer: RefCell<Rc<Renderer>>,
+    /// this card's recovery coordinator, shared into every Output it serves
+    pub health: Rc<CardHealth>,
     /// drains this card's drm event fd; a dead pump is a dead card
     _pump: SpawnedFuture<()>,
+    /// the recovery task; single consumer of this card's health trips
+    recovery: RefCell<Option<SpawnedFuture<()>>>,
+    /// after an output removal: polls this card's yard until every parked
+    /// frame and retired texture proves out, then retires itself. without
+    /// it, a card left idle by the removal would never drain
+    reaper: RefCell<Option<SpawnedFuture<()>>>,
 }
 
 impl Card {
@@ -373,6 +381,12 @@ impl Output {
         &self.scanout_card.dev
     }
 
+    /// recovery coordinator of the card that composites us: vulkan device
+    /// loss happens on the render side
+    fn health(&self) -> &Rc<CardHealth> {
+        &self.render_card.health
+    }
+
     /// dev_t of the card that composites this output; the device a client
     /// on it should allocate for
     pub fn render_devnum(&self) -> u64 {
@@ -392,6 +406,13 @@ pub struct Output {
     /// cell: recovery swaps a card's renderer, and an output still draining
     /// must keep the one its in-flight frames were recorded against
     renderer: Rc<Renderer>,
+    /// recovery epoch this output was built in: a trip carrying an older
+    /// epoch is an echo from a torn-down output and is ignored
+    epoch: u64,
+    /// consecutive failed presents; success resets, an oom streak sheds
+    vk_fail_streak: Cell<u32>,
+    /// per-second gate for the per-frame failure lines
+    fail_log: crate::util::LogGate,
     bufs: [OutBuf; 2],
     front: Cell<usize>,
     pub width: u32,
@@ -820,6 +841,62 @@ struct TexEntry {
 /// textures of buffers the client stopped rotating through
 const TEX_IDLE: u64 = 600;
 
+// -- gpu recovery --
+
+/// consecutive oom presents on one output before shedding caches
+const OOM_FAIL_STREAK: u32 = 3;
+/// an oom streak this soon after a shed means the shed did not hold;
+/// escalate to a full rebuild instead of shedding again
+const OOM_SHED_HOLD_NS: u64 = 10_000_000_000;
+/// rebuild attempts before exiting loud; backoff 250ms, 1s, 4s
+const REBUILD_ATTEMPTS: u32 = 3;
+/// pace between failed-present retries so a fail loop never runs hot
+const RENDER_FAIL_BACKOFF_NS: u64 = 50_000_000;
+
+const RUNG_SHED: u8 = 1;
+const RUNG_REBUILD: u8 = 2;
+
+/// per-card recovery coordinator: many edge-triggered producers (any
+/// task that sees a device error), one consumer (the recovery task).
+/// trips max-merge into the worst requested rung and coalesce across
+/// every output on the card, which is what makes recovery exactly-once
+pub(crate) struct CardHealth {
+    /// worst rung requested since the last drain: 0 none, 1 shed, 2 rebuild
+    rung: Cell<u8>,
+    kick: crate::util::AsyncEvent,
+    /// bumped per completed recovery; outputs stamp their build epoch
+    epoch: Cell<u64>,
+    /// last shed instant, for the escalation ladder
+    shed_ns: Cell<u64>,
+    /// what tripped the pending rung, for the recovery log line
+    why: Cell<&'static str>,
+}
+
+impl Default for CardHealth {
+    fn default() -> Self {
+        CardHealth {
+            rung: Cell::new(0),
+            kick: Default::default(),
+            epoch: Cell::new(0),
+            shed_ns: Cell::new(0),
+            why: Cell::new(""),
+        }
+    }
+}
+
+impl CardHealth {
+    fn trip(&self, epoch: u64, rung: u8, why: &'static str) {
+        if epoch != self.epoch.get() {
+            return;
+        }
+        if rung > self.rung.get() {
+            self.rung.set(rung);
+            self.why.set(why);
+        }
+        self.kick.trigger();
+    }
+}
+
 /// how many misses in a row park late-latching, and how many met deadlines
 /// afterwards un-park it. at 480Hz a frame is ~2ms: parking on 4 was one
 /// bad batch, and half a second to forgive kept whole passes degraded
@@ -986,18 +1063,22 @@ until cross-card offload lands)",
             return None;
         }
     };
+    let health: Rc<CardHealth> = Rc::new(Default::default());
     // the card exists before its outputs do: each one is born pointing at
     // the card it scans out on and the card it composites on
     let card = Rc::new(Card {
         dev: dev.clone(),
         core: RefCell::new(core.clone()),
         renderer: RefCell::new(renderer.clone()),
+        health,
         _pump: dev.spawn_flip_pump(&state.eng, &state.ring),
+        recovery: RefCell::new(None),
+        reaper: RefCell::new(None),
     });
     let mut outputs: Vec<Rc<Output>> = Vec::new();
     for conn in conns {
         let name = conn.name.clone();
-        match init_output(&card, &card, conn) {
+        match init_output(&card, &card, conn, 0) {
             Ok(out) => {
                 let out = Rc::new(out);
                 out.pos.set((*x, 0));
@@ -1320,6 +1401,38 @@ cannot take a client buffer until cross-card import lands",
     Some(display)
 }
 
+/// present-side failure accounting: classify the error, trip the card's
+/// recovery coordinator on the right rung, and pace the retry so a
+/// fail loop never runs hot. device loss rebuilds immediately; an oom
+/// streak sheds first and escalates when a recent shed did not hold
+async fn vk_present_failure(state: &Rc<State>, out: &Rc<Output>, e: &crate::render::vulkan::RenderError) {
+    if e.device_lost() {
+        out.health().trip(out.epoch, RUNG_REBUILD, "device lost");
+    } else if e.oom() {
+        let streak = out.vk_fail_streak.get() + 1;
+        out.vk_fail_streak.set(streak);
+        if streak >= OOM_FAIL_STREAK {
+            let now = Time::now().nsec();
+            let rung = if now.saturating_sub(out.health().shed_ns.get()) < OOM_SHED_HOLD_NS {
+                RUNG_REBUILD
+            } else {
+                RUNG_SHED
+            };
+            out.health().trip(out.epoch, rung, "device memory exhausted");
+        }
+    }
+    let deadline = Time::from_nsec(Time::now().nsec() + RENDER_FAIL_BACKOFF_NS);
+    let _ = state.ring.timeout(deadline).await;
+}
+
+/// a device error from a capture or upload path: only loss trips (oom
+/// there is a soft skip; the present streak is the oom authority)
+fn vk_side_failure(out: &Output, e: &crate::render::vulkan::RenderError) {
+    if e.device_lost() {
+        out.health().trip(out.epoch, RUNG_REBUILD, "device lost");
+    }
+}
+
 /// once-per-second gate for capture diagnostics: quiet paths that fail
 /// silently otherwise (a black stream carries no error anywhere)
 pub(crate) fn cap_diag() -> bool {
@@ -1380,6 +1493,7 @@ pub async fn screencopy<R>(
     let pending = match out.renderer.read_frame_submit(rw, rh, uploads, passes, &ops, waits) {
         Ok(p) => p,
         Err(e) => {
+            vk_side_failure(&out, &e);
             eprintln!("carrot: screencopy render failed: {e}");
             return None;
         }
@@ -1405,6 +1519,7 @@ pub async fn screencopy<R>(
     match pending.finish_with(|px| sink(px, rw, rh)) {
         Ok(r) => Some(r),
         Err(e) => {
+            vk_side_failure(&out, &e);
             eprintln!("carrot: screencopy render failed: {e}");
             None
         }
@@ -1485,6 +1600,7 @@ pub async fn window_capture<R>(
     let pending = match out.renderer.read_frame_submit(rw, rh, uploads, passes, &ops, waits) {
         Ok(p) => p,
         Err(e) => {
+            vk_side_failure(&out, &e);
             eprintln!("carrot: window capture render failed: {e}");
             return None;
         }
@@ -1504,6 +1620,7 @@ pub async fn window_capture<R>(
     match pending.finish_with(|px| sink(px, rw, rh)) {
         Ok(r) => Some(r),
         Err(e) => {
+            vk_side_failure(&out, &e);
             eprintln!("carrot: window capture render failed: {e}");
             None
         }
@@ -1549,6 +1666,7 @@ pub async fn workspace_copy<R>(
     let pending = match out.renderer.read_frame_submit(rw, rh, uploads, passes, &ops, waits) {
         Ok(p) => p,
         Err(e) => {
+            vk_side_failure(&out, &e);
             eprintln!("carrot: workspace copy render failed: {e}");
             return None;
         }
@@ -1568,6 +1686,7 @@ pub async fn workspace_copy<R>(
     match pending.finish_with(|px| sink(px, rw, rh)) {
         Ok(r) => Some(r),
         Err(e) => {
+            vk_side_failure(&out, &e);
             eprintln!("carrot: workspace copy render failed: {e}");
             None
         }
@@ -1623,7 +1742,8 @@ fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>, 
         let tex = match out.renderer.create_texture(w, h, false) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("carrot: cursor texture failed: {e}");
+                vk_side_failure(&out, &e);
+            eprintln!("carrot: cursor texture failed: {e}");
                 return;
             }
         };
@@ -1634,11 +1754,14 @@ fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>, 
         match res {
             Ok(up) => out.preuploads.borrow_mut().push(up),
             Err(e) => {
-                eprintln!("carrot: cursor upload failed: {e}");
+                vk_side_failure(&out, &e);
+            eprintln!("carrot: cursor upload failed: {e}");
                 return;
             }
         }
         if let Some(old) = out.cursor_tex.borrow_mut().replace(tex) {
+            // the frame in flight may still sample the old image; the
+            // yard destroys it once its fence proves out
             out.renderer.retire_texture(old);
         }
         out.cursor_gen.set(d.sw_gen.get());
@@ -1882,6 +2005,386 @@ pub fn start_hotplug(state: &Rc<State>) {
     }
 }
 
+/// arm the card's recovery task; called once the display is in state
+pub fn start_recovery(state: &Rc<State>) {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return };
+    // one consumer per card: a trip on one gpu must not rebuild another
+    for card in d.cards.borrow().iter() {
+        let st = state.clone();
+        let c = card.clone();
+        *card.recovery.borrow_mut() = Some(state.eng.spawn("gpu recovery", async move {
+            recovery_loop(st, c).await;
+        }));
+    }
+}
+
+/// single consumer of health trips: shed on rung 1, rebuild on rung 2,
+/// exit loud when the device refuses to come back. shed and rebuild are
+/// fully synchronous - the single-threaded engine makes each atomic,
+/// the same contract rescan relies on
+async fn recovery_loop(state: Rc<State>, card: Rc<Card>) {
+    let health = card.health.clone();
+    loop {
+        health.kick.triggered().await;
+        let rung = health.rung.replace(0);
+        if rung == 0 {
+            continue;
+        }
+        let why = health.why.get();
+        if rung == RUNG_SHED {
+            eprintln!("carrot: gpu recovery: shedding caches ({why})");
+            shed_card(&state, &card);
+            continue;
+        }
+        let mut attempt = 0u32;
+        loop {
+            match rebuild_card(&state, &card, why) {
+                Ok(()) => break,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= REBUILD_ATTEMPTS {
+                        eprintln!(
+                            "carrot: FATAL: gpu recovery failed after {REBUILD_ATTEMPTS} attempts: {e}"
+                        );
+                        eprintln!(
+                            "carrot: the render device is unusable; exiting instead of freezing the session"
+                        );
+                        std::process::exit(2);
+                    }
+                    eprintln!("carrot: gpu rebuild attempt {attempt} failed: {e}; retrying");
+                    let wait = 250_000_000u64 << ((attempt - 1) * 2);
+                    let deadline = Time::from_nsec(Time::now().nsec() + wait);
+                    let _ = state.ring.timeout(deadline).await;
+                }
+            }
+        }
+    }
+}
+
+/// oom rung 1: drop everything reconstructible and let the next frames
+/// rebuild it from client buffers. no device teardown, nothing client-
+/// visible; the frame after this is expensive and the session survives
+fn shed_card(state: &Rc<State>, card: &Rc<Card>) {
+    let dref = state.display.borrow();
+    let Some(d) = dref.as_ref() else { return };
+    let renderer = card.renderer.borrow().clone();
+    // only the outputs this card composites: a texture belongs to the
+    // renderer that made it, and retiring it into another card's yard
+    // would hand that yard a handle from a foreign device
+    for out in d
+        .outputs
+        .borrow()
+        .iter()
+        .filter(|o| Rc::ptr_eq(&o.render_card, card))
+    {
+        if let Some(b) = out.blur.borrow_mut().take() {
+            for t in b.levels {
+                renderer.retire_texture(t);
+            }
+        }
+        out.blur_dirty.set(true);
+        if let Some(t) = out.cursor_tex.borrow_mut().take() {
+            renderer.retire_texture(t);
+        }
+        for (_, e) in out.textures.borrow_mut().drain() {
+            renderer.retire_texture(e.tex);
+        }
+        for t in out.retired_tex.borrow_mut().drain(..) {
+            renderer.retire_texture(t);
+        }
+        for cw in out.closing_layers.borrow_mut().drain(..) {
+            for t in cw.keep {
+                renderer.retire_texture(t);
+            }
+        }
+        renderer.release_uploads(std::mem::take(&mut *out.preuploads.borrow_mut()));
+        out.prepasses.borrow_mut().clear();
+        out.pending_stamps.borrow_mut().clear();
+        out.cast_keep.borrow_mut().clear();
+        out.vk_fail_streak.set(0);
+    }
+    shed_session_stashes(state, &renderer);
+    renderer.shed();
+    card.health.shed_ns.set(Time::now().nsec());
+    state.damage.trigger();
+}
+
+/// texture stashes that live outside any output: the global retire list,
+/// resize-xfade snapshots, close-animation keeps. the owners all tolerate
+/// eviction (xfades re-bake, close anims end early)
+fn shed_session_stashes(state: &Rc<State>, renderer: &Rc<Renderer>) {
+    for ws in state.workspaces.borrow().iter() {
+        ws.for_each(|win| {
+            let mut m = win.anims.borrow_mut();
+            if let Some(rz) = &mut m.resize {
+                let mut q = state.retire_tex.borrow_mut();
+                q.extend(rz.snapshot.take());
+                q.extend(rz.live.take());
+            }
+        });
+        for cw in ws.closing.borrow_mut().drain(..) {
+            for t in cw.keep {
+                renderer.retire_texture(t);
+            }
+        }
+    }
+    for t in state.retire_tex.borrow_mut().drain(..) {
+        renderer.retire_texture(t);
+    }
+}
+
+/// rung 2: rebuild the card's whole render stack against a fresh device,
+/// transplant every output's identity so clients observe nothing, and
+/// let the old stack drain out through the yard. the drm fd and its
+/// logind lease survive a gpu reset and are never re-taken
+fn rebuild_card(state: &Rc<State>, card: &Rc<Card>, why: &'static str) -> Result<(), String> {
+    let dref = state.display.borrow();
+    let Some(d) = dref.as_ref() else { return Ok(()) };
+    let old_renderer = card.renderer.borrow().clone();
+    let old_core = card.core.borrow().clone();
+    let lost = why == "device lost";
+    eprintln!("carrot: gpu recovery: rebuilding the render stack ({why})");
+    if lost {
+        // loss is proof: everything parked destroys immediately, every
+        // later submit on the old renderer fails fast
+        old_renderer.poison();
+    }
+    // the yard reaper pins the old renderer; on a lost device it would
+    // poll a fence that errors forever
+    card.reaper.borrow_mut().take();
+    // only what this card composites is torn down. outputs rendered by
+    // another card keep running, and _presents stays index-aligned with
+    // outputs, so the untouched slots hand their task straight back
+    let all_outputs: Vec<Rc<Output>> = d.outputs.borrow().clone();
+    let mine: Vec<bool> = all_outputs
+        .iter()
+        .map(|o| Rc::ptr_eq(&o.render_card, card))
+        .collect();
+    let mut kept: Vec<Option<SpawnedFuture<()>>> = Vec::with_capacity(all_outputs.len());
+    for (i, present) in d._presents.borrow_mut().drain(..).enumerate() {
+        if mine[i] {
+            quiesce_output(state, &all_outputs[i], Some(present));
+            // an in-flight flip never completes across a reset; unwedge the
+            // gate exactly like a vt resume does
+            all_outputs[i].conn.flip_pending.set(false);
+            kept.push(None);
+        } else {
+            kept.push(Some(present));
+        }
+    }
+    let old_outputs: Vec<Rc<Output>> = all_outputs
+        .iter()
+        .zip(&mine)
+        .filter(|(_, m)| **m)
+        .map(|(o, _)| o.clone())
+        .collect();
+    shed_session_stashes(state, &old_renderer);
+    // drop the vk side of every scanout buffer now; the drm fb keeps the
+    // panel showing the last good frame until the new stack modesets
+    for out in &old_outputs {
+        for buf in &out.bufs {
+            unsafe {
+                old_core.device.destroy_image_view(buf.view, None);
+            }
+            buf.bo.destroy(&old_core);
+        }
+    }
+    if !lost {
+        // live device: free what fence proof already allows before the
+        // new stack allocates next to it
+        old_renderer.reap();
+    }
+    let (core, renderer) = init_render(&card.dev)?;
+    let epoch = card.health.epoch.get() + 1;
+    // the swap lands before the outputs are built, because init_output now
+    // reads the card's stack rather than taking it by argument. nothing
+    // between here and the outputs list swap reads either cell
+    *card.core.borrow_mut() = core.clone();
+    *card.renderer.borrow_mut() = renderer.clone();
+    // aligned with old_outputs; None where the head went away
+    let mut replacement: Vec<Option<Rc<Output>>> = Vec::new();
+    for old in &old_outputs {
+        if old.conn.pipe.borrow().is_none() {
+            replacement.push(None);
+            continue;
+        }
+        let out = init_output(&card, &card, old.conn.clone(), epoch)
+            .map_err(|e| format!("{}: {e}", old.conn.name))?;
+        let out = Rc::new(out);
+        // identity transplant: same slot, same global, same layout state;
+        // clients observe nothing
+        out.index.set(old.index.get());
+        out.global_name.set(old.global_name.get());
+        out.pos.set(old.pos.get());
+        out.ws.set(old.ws.get());
+        out.usable.set(old.usable.get());
+        out.paused.set(old.paused.get());
+        out.cursor_locked.set(old.cursor_locked.get());
+        out.cursor_client_hidden.set(old.cursor_client_hidden.get());
+        *out.theme_cursor.borrow_mut() = old.theme_cursor.borrow().clone();
+        *out.ws_switch.borrow_mut() = old.ws_switch.borrow().clone();
+        // hardware properties survive the reset; keep the learned cutoff
+        out.sched.cutoff.set(old.sched.cutoff.get());
+        out.sched.cutoff_settled.set(old.sched.cutoff_settled.get());
+        replacement.push(Some(out));
+    }
+    // commit the rest of the swap, rebuilding the global list in its
+    // original order so untouched cards keep their slots
+    let mut new_outputs: Vec<Rc<Output>> = Vec::new();
+    let mut final_outputs: Vec<Rc<Output>> = Vec::new();
+    let mut final_presents: Vec<SpawnedFuture<()>> = Vec::new();
+    let mut repl = replacement.into_iter();
+    for (i, out) in all_outputs.iter().enumerate() {
+        if mine[i] {
+            if let Some(new) = repl.next().flatten() {
+                let st = state.clone();
+                let o = new.clone();
+                final_presents.push(state.eng.spawn("present", async move {
+                    present_loop(&st, &o).await;
+                }));
+                new_outputs.push(new.clone());
+                final_outputs.push(new);
+            }
+        } else if let Some(present) = kept[i].take() {
+            final_outputs.push(out.clone());
+            final_presents.push(present);
+        }
+    }
+    *d.outputs.borrow_mut() = final_outputs;
+    *d._presents.borrow_mut() = final_presents;
+    card.health.epoch.set(epoch);
+    if !state.dpms_off.get() && !new_outputs.iter().all(|o| o.paused.get()) {
+        let heads: Vec<(Rc<Connector>, u32)> = new_outputs
+            .iter()
+            .map(|o| (o.conn.clone(), o.bufs[o.front.get()].fb))
+            .collect();
+        if let Err(e) = card.dev.modeset_heads(&heads) {
+            eprintln!("carrot: recovery modeset: {e}");
+        }
+    }
+    // the new stack scans out; the old framebuffers can let go of their
+    // kms-pinned pages now
+    for out in &old_outputs {
+        for buf in &out.bufs {
+            let _ = sys::rmfb(card.dev.fd.as_fd(), buf.fb);
+            if let Some(h) = buf.dumb {
+                let _ = sys::destroy_dumb(card.dev.fd.as_fd(), h);
+            }
+        }
+    }
+    state.host_import.set(
+        d.cards
+            .borrow()
+            .iter()
+            .all(|c| c.renderer.borrow().host_import_supported()),
+    );
+    for out in &new_outputs {
+        out.vk_fail_streak.set(0);
+    }
+    drop(dref);
+    state.damage.trigger();
+    eprintln!(
+        "carrot: gpu recovery: render stack rebuilt on {}",
+        core.device_name
+    );
+    Ok(())
+}
+
+/// quiesce an output's device-facing state: cancel its present stack,
+/// give queued cleanup jobs their proper end, and retire every cached
+/// texture into ITS renderer's yard. shared by hotplug removal (which
+/// also tears down globals and the pipe) and gpu recovery (which keeps
+/// the head logically alive and rebuilds on top)
+fn quiesce_output(state: &Rc<State>, out: &Rc<Output>, present: Option<SpawnedFuture<()>>) {
+    // the present loop dies first: dropping the task cancels it and its
+    // cleanup/pacer/flush children, outside any borrow teardown re-enters
+    drop(present);
+    out.rearm.take();
+    // the plane's buffer bookkeeping dies with the present loop: retire
+    // cur/prev now or their uids stay listed and every later replaced
+    // attachment with those uids parks in scanout_hold unreleased
+    scanout_reset(state, out);
+    // the dead head's unswept marks: serve them now, and clear the
+    // flags so a surviving output's compose can re-mark the survivors
+    fire_callback_sweep(state);
+    // pending feedbacks answer discarded instead of silently vanishing
+    for fb in out.present_fbs.borrow_mut().drain(..) {
+        fb.discarded();
+    }
+    for fb in out.inflight_fbs.borrow_mut().drain(..) {
+        fb.discarded();
+    }
+    // the cancelled cleanup task left jobs queued (and possibly one
+    // popped mid-await, which Frame::Drop already parked): give every
+    // survivor its proper end before the texture sweep
+    for job in out.gpu_done.take_all() {
+        let CleanupJob { frame, retired, flight, .. } = job;
+        out.renderer.retire_textures_at(frame.seq(), retired);
+        drop(flight);
+        out.renderer.retire_frame(frame);
+    }
+    // retire, never destroy: the last present frame and any parked
+    // capture batch may still sample these on the shared per-card
+    // renderer. the yard frees each once its fence proves out
+    for (_, e) in out.textures.borrow_mut().drain() {
+        out.renderer.retire_texture(e.tex);
+    }
+    for t in out.retired_tex.borrow_mut().drain(..) {
+        out.renderer.retire_texture(t);
+    }
+    if let Some(t) = out.cursor_tex.borrow_mut().take() {
+        out.renderer.retire_texture(t);
+    }
+    if let Some(b) = out.blur.borrow_mut().take() {
+        for t in b.levels {
+            out.renderer.retire_texture(t);
+        }
+    }
+    out.blur_dirty.set(true);
+    for cw in out.closing_layers.borrow_mut().drain(..) {
+        for t in cw.keep {
+            out.renderer.retire_texture(t);
+        }
+    }
+    out.renderer
+        .release_uploads(std::mem::take(&mut *out.preuploads.borrow_mut()));
+    out.prepasses.borrow_mut().clear();
+    out.pending_stamps.borrow_mut().clear();
+    out.cast_keep.borrow_mut().clear();
+}
+
+/// a removal parked work in the yard, and the survivors' cleanup loops
+/// may be idle (or gone entirely, when the last head left): poll until
+/// everything proves out. a fence that never signals holds its entries
+/// for the session - a bounded park, never a use-after-free
+fn reap_after_removal(state: &Rc<State>, card: &Rc<Card>) {
+    let renderer = card.renderer.borrow().clone();
+    if renderer.is_lost() {
+        // a lost device's yard drained at poison; a poller would spin on
+        // fences that error forever
+        return;
+    }
+    if renderer.yard_idle() {
+        return;
+    }
+    let st = state.clone();
+    let r = renderer.clone();
+    let task = state.eng.spawn("yard reaper", async move {
+        loop {
+            let deadline = Time::from_nsec(Time::now().nsec() + 100_000_000);
+            let _ = st.ring.timeout(deadline).await;
+            r.reap();
+            if r.yard_idle() {
+                return;
+            }
+        }
+    });
+    // replacing a still-running reaper is fine: the new one covers
+    // everything the old one was watching
+    *card.reaper.borrow_mut() = Some(task);
+}
+
 /// something changed on a card: re-probe its connectors, tear down what
 /// left, bring up what arrived, then rebuild the global layout.
 fn rescan(state: &Rc<State>) {
@@ -1914,14 +2417,8 @@ fn rescan(state: &Rc<State>) {
         .collect();
     for &i in gone.iter().rev() {
         let out = d.outputs.borrow_mut().remove(i);
-        // the present loop dies with its output: dropping the task cancels
-        // it, outside the borrow in case teardown lands back here
         let present = d._presents.borrow_mut().remove(i);
-        drop(present);
-        // the plane's buffer bookkeeping dies with the present loop: retire
-        // cur/prev now or their uids stay listed and every later replaced
-        // attachment with those uids parks in scanout_hold unreleased
-        scanout_reset(state, &out);
+        quiesce_output(state, &out, Some(present));
         state.globals.remove(out.global_name.get());
         crate::protocol::image_copy_capture::output_removed(state, &out.conn.name);
         crate::protocol::session_lock::output_removed(state, &out.conn.name);
@@ -1952,14 +2449,8 @@ fn rescan(state: &Rc<State>) {
             }
             out.conn.pipe_torn_down();
         }
-        for (_, e) in out.textures.borrow_mut().drain() {
-            out.renderer.retire_texture(e.tex);
-        }
-        for t in out.retired_tex.borrow_mut().drain(..) {
-            out.renderer.retire_texture(t);
-        }
-        out.pending_stamps.borrow_mut().clear();
         eprintln!("carrot: output {} disconnected", out.conn.name);
+        reap_after_removal(state, &out.render_card);
     }
 
     {
@@ -1993,7 +2484,7 @@ fn rescan(state: &Rc<State>) {
             continue;
         }
         let name = conn.name.clone();
-        match init_output(&card, &card, conn) {
+        match init_output(&card, &card, conn, card.health.epoch.get()) {
             Ok(out) => {
                 let out = Rc::new(out);
                 seed_cursor(state, &out);
@@ -2148,6 +2639,7 @@ fn init_output(
     scanout: &Rc<Card>,
     render: &Rc<Card>,
     conn: Rc<Connector>,
+    epoch: u64,
 ) -> Result<Output, String> {
     let dev = scanout.dev.clone();
     // buffers are allocated by whoever composites; with offload that is a
@@ -2326,6 +2818,9 @@ fn init_output(
         sched: Sched::default(),
         scanout: RefCell::new(ScanoutState::default()),
         inflight_zero_copy: Cell::new(false),
+        epoch,
+        vk_fail_streak: Cell::new(0),
+        fail_log: Default::default(),
     })
 }
 
@@ -3035,7 +3530,12 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             match out.renderer.copy_frame(src, &pool, offset, row_texels, &target, waits) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("carrot: fullscreen copy failed: {e}");
+                    match out.fail_log.pass(Time::now().nsec()) {
+                        Some(0) => eprintln!("carrot: fullscreen copy failed: {e}"),
+                        Some(n) => eprintln!("carrot: fullscreen copy failed: {e} ({n} suppressed)"),
+                        None => {}
+                    }
+                    vk_present_failure(state, out, &e).await;
                     continue;
                 }
             }
@@ -3068,11 +3568,19 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                     f
                 }
                 Err(e) => {
-                    eprintln!("carrot: render failed: {e}");
+                    match out.fail_log.pass(Time::now().nsec()) {
+                        Some(0) => eprintln!("carrot: render failed: {e}"),
+                        Some(n) => eprintln!("carrot: render failed: {e} ({n} suppressed)"),
+                        None => {}
+                    }
+                    // the batch died with its bakes: force the blur cache
+                    // to rebuild rather than trust a cleared dirty bit
+                    out.blur_dirty.set(true);
                     ops.clear();
                     live.clear();
                     out.ops_scratch.replace(ops);
                     out.live_scratch.replace(live);
+                    vk_present_failure(state, out, &e).await;
                     continue;
                 }
             };
@@ -3084,6 +3592,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             out.live_scratch.replace(live);
             f
         };
+        out.vk_fail_streak.set(0);
         let flight = FlightGuard::new(state);
         buf.undefined.set(false);
         let submit_ns = Time::now().nsec();
@@ -3455,6 +3964,7 @@ pub fn upload_on_commit(state: &Rc<State>, s: &crate::surface::WlSurface) -> boo
             Ok(false) => missed = true,
             Err(e) => {
                 crate::trace!("commit upload failed: {e}");
+                vk_side_failure(out, &e);
                 missed = true;
             }
         }
@@ -4167,7 +4677,8 @@ fn draw_buffer(
                         .insert(key, TexEntry { tex: t, generation: 0, used: out.tex_tick.get() });
                 }
                 Err(e) => {
-                    eprintln!("carrot: dmabuf import failed: {e}");
+                    vk_side_failure(&out, &e);
+            eprintln!("carrot: dmabuf import failed: {e}");
                     return;
                 }
             }
@@ -4199,7 +4710,8 @@ fn draw_buffer(
                     );
                 }
                 Err(e) => {
-                    eprintln!("carrot: texture alloc failed: {e}");
+                    vk_side_failure(&out, &e);
+            eprintln!("carrot: texture alloc failed: {e}");
                     return;
                 }
             }
@@ -4286,7 +4798,8 @@ fn draw_buffer(
             match res {
                 Ok(up) => out.preuploads.borrow_mut().push(up),
                 Err(e) => {
-                    eprintln!("carrot: upload failed: {e}");
+                    vk_side_failure(&out, &e);
+            eprintln!("carrot: upload failed: {e}");
                     return;
                 }
             }

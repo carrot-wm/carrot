@@ -202,6 +202,12 @@ impl<T> AsyncQueue<T> {
         self.items.borrow_mut().clear();
         self.waker.take();
     }
+
+    /// drain everything queued right now; teardown paths use this to
+    /// hand each item a proper end instead of dropping the queue whole
+    pub fn take_all(&self) -> Vec<T> {
+        self.items.borrow_mut().drain(..).collect()
+    }
 }
 
 /// once-per-second log gate: a failure that repeats per frame prints

@@ -536,6 +536,10 @@ pub struct Renderer {
     pending_sampled: RefCell<Vec<PendingTransition>>,
     /// host-import verdict, settled at construction (env + device quirks)
     host_import_ok: bool,
+    /// the device is lost: all execution stopped, fence proof is
+    /// unobtainable and unnecessary. submits fail fast, the yard drains
+    /// immediately, and recovery rebuilds the whole stack
+    lost: Cell<bool>,
 }
 
 impl Renderer {
@@ -720,6 +724,7 @@ impl Renderer {
             host_imports: RefCell::new(HashMap::new()),
             pending_sampled: RefCell::new(Vec::new()),
             host_import_ok: Self::decide_host_import(core),
+            lost: Cell::new(false),
         })
     }
 
@@ -1142,6 +1147,10 @@ impl Renderer {
         waits: &[vk::Semaphore],
         staging: &[PreUpload],
     ) -> Result<vk::CommandBuffer, RenderError> {
+        if self.lost.get() {
+            self.release_batch(waits, staging);
+            return Err(RenderError::Vk(vk::Result::ERROR_DEVICE_LOST));
+        }
         let cb = match self.take_cb() {
             Ok(cb) => cb,
             Err(e) => {
@@ -1671,8 +1680,11 @@ impl Renderer {
     /// cleanup loop's per-frame call is what keeps the yard draining
     pub fn retire_frame(&self, mut frame: Frame) {
         if let Some(inner) = frame.inner.take() {
-            let done =
-                unsafe { self.core.device.get_fence_status(inner.fence) }.unwrap_or(false);
+            // a lost device errors the status query forever; parking on
+            // that would hold every frame for the session. loss IS proof:
+            // execution stopped, recycle unconditionally
+            let done = self.lost.get()
+                || unsafe { self.core.device.get_fence_status(inner.fence) }.unwrap_or(false);
             if done {
                 self.recycle(inner);
             } else {
@@ -1758,9 +1770,17 @@ impl Renderer {
         }
     }
 
+    /// nothing parked anywhere: the removal reaper uses this to retire itself
+    pub fn yard_idle(&self) -> bool {
+        self.yard.frames.borrow().is_empty() && self.yard.textures.borrow().is_empty()
+    }
+
     // -- textures (shm upload path) --
 
     pub fn create_texture(&self, w: u32, h: u32, opaque: bool) -> Result<Texture, RenderError> {
+        if self.lost.get() {
+            return Err(RenderError::Vk(vk::Result::ERROR_DEVICE_LOST));
+        }
         let dev = &self.core.device;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1827,6 +1847,9 @@ impl Renderer {
 
     /// a texture the renderer can draw into and later sample
     pub fn create_render_texture(&self, w: u32, h: u32) -> Result<Texture, RenderError> {
+        if self.lost.get() {
+            return Err(RenderError::Vk(vk::Result::ERROR_DEVICE_LOST));
+        }
         let dev = &self.core.device;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1900,6 +1923,9 @@ impl Renderer {
         opaque: bool,
     ) -> Result<Texture, RenderError> {
         use std::os::fd::AsRawFd;
+        if self.lost.get() {
+            return Err(RenderError::Vk(vk::Result::ERROR_DEVICE_LOST));
+        }
         let dev = &self.core.device;
         let first = planes
             .first()
@@ -2183,8 +2209,10 @@ impl Renderer {
             let mut still = Vec::new();
             let mut resumed = false;
             for f in lot {
-                let done =
-                    unsafe { self.core.device.get_fence_status(f.fence) }.unwrap_or(false);
+                // loss counts as proof: the status query errors forever
+                // on a lost device, and nothing executes anymore
+                let done = self.lost.get()
+                    || unsafe { self.core.device.get_fence_status(f.fence) }.unwrap_or(false);
                 if done {
                     resumed |= f.slot.is_some();
                     self.recycle(f);
@@ -2193,11 +2221,67 @@ impl Renderer {
                 }
             }
             self.yard.frames.borrow_mut().extend(still);
-            if resumed {
+            if resumed && !self.lost.get() {
                 eprintln!("carrot: parked capture frame reclaimed; captures resume");
             }
         }
+        if self.lost.get() {
+            let done = self.yard.submit_seq.get();
+            self.yard.done_seq.set(done);
+        }
         self.drain_yard_textures();
+    }
+
+    /// the device is lost: mark it, fail future batches fast, and drain
+    /// the yard without proof - execution has stopped, nothing samples
+    /// anything anymore, so immediate destruction is the truthful move
+    pub fn poison(&self) {
+        if self.lost.replace(true) {
+            return;
+        }
+        self.reap();
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.lost.get()
+    }
+
+    /// a batch that owns staging but never reached a cb hands it back;
+    /// PreUpload has no Drop, a bare drop leaks the buffer and memory
+    pub fn release_uploads(&self, uploads: Vec<PreUpload>) {
+        self.release_batch(&[], &uploads);
+    }
+
+    /// oom rung 1, renderer side: free what proof allows right now.
+    /// upload-slot staging with signaled fences drops (recreated at need),
+    /// the capture target drops when no readback is in flight (recreated
+    /// lazily by ensure_capture), dead host imports prune, the yard reaps
+    pub fn shed(&self) {
+        let dev = &self.core.device;
+        for slot in self.upload_slots.borrow_mut().iter_mut() {
+            if slot.buf != vk::Buffer::null()
+                && unsafe { dev.get_fence_status(slot.fence) }.unwrap_or(false)
+            {
+                unsafe {
+                    dev.destroy_buffer(slot.buf, None);
+                    dev.free_memory(slot.mem, None);
+                }
+                slot.buf = vk::Buffer::null();
+                slot.mem = vk::DeviceMemory::null();
+                slot.cap = 0;
+                slot.ptr = std::ptr::null_mut();
+                slot.pool = None;
+            }
+        }
+        self.captures.borrow_mut().retain(|slot| {
+            if slot.busy.get() {
+                return true;
+            }
+            self.destroy_capture(slot);
+            false
+        });
+        self.prune_host_imports();
+        self.reap();
     }
 
     pub fn read_frame_submit(
@@ -2752,6 +2836,9 @@ impl Renderer {
         offset: u64,
         row_texels: u32,
     ) -> Result<u64, RenderError> {
+        if self.lost.get() {
+            return Err(RenderError::Vk(vk::Result::ERROR_DEVICE_LOST));
+        }
         let dev = &self.core.device;
         unsafe {
             dev.begin_command_buffer(

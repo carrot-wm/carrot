@@ -32,6 +32,26 @@ impl fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
+impl RenderError {
+    /// the device is gone; only a rebuild brings rendering back
+    pub fn device_lost(&self) -> bool {
+        matches!(self, RenderError::Vk(vk::Result::ERROR_DEVICE_LOST))
+    }
+
+    /// allocation-class failure: shedding reconstructible caches can
+    /// bring the device back without a rebuild
+    pub fn oom(&self) -> bool {
+        matches!(
+            self,
+            RenderError::Vk(
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                    | vk::Result::ERROR_FRAGMENTATION
+            )
+        )
+    }
+}
+
 impl From<vk::Result> for RenderError {
     fn from(r: vk::Result) -> Self {
         RenderError::Vk(r)
