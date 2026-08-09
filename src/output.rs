@@ -850,6 +850,12 @@ const OOM_FAIL_STREAK: u32 = 3;
 const OOM_SHED_HOLD_NS: u64 = 10_000_000_000;
 /// rebuild attempts before exiting loud; backoff 250ms, 1s, 4s
 const REBUILD_ATTEMPTS: u32 = 3;
+/// a queued flip outstanding this many refresh periods on a live-looking
+/// device is a wedge
+const FLIP_WEDGE_PERIODS: u64 = 4;
+/// watchdog floor: VRR can legitimately stretch a frame far past 4
+/// fixed-rate periods
+const FLIP_WEDGE_FLOOR_NS: u64 = 100_000_000;
 /// pace between failed-present retries so a fail loop never runs hot
 const RENDER_FAIL_BACKOFF_NS: u64 = 50_000_000;
 
@@ -1293,7 +1299,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                             o.rearm.take();
                             // an in-flight flip never completes when the
                             // vt left; unwedge the gate
-                            o.conn.flip_pending.set(false);
+                            o.conn.flip_gate_reset();
                             if let Some(p) = o.conn.pipe.borrow().as_ref() {
                                 if let Some(cur) = &p.cursor {
                                     // software mode keeps planes benched
@@ -2167,7 +2173,7 @@ fn rebuild_card(state: &Rc<State>, card: &Rc<Card>, why: &'static str) -> Result
             quiesce_output(state, &all_outputs[i], Some(present));
             // an in-flight flip never completes across a reset; unwedge the
             // gate exactly like a vt resume does
-            all_outputs[i].conn.flip_pending.set(false);
+            all_outputs[i].conn.flip_gate_reset();
             kept.push(None);
         } else {
             kept.push(Some(present));
@@ -2824,6 +2830,39 @@ fn init_output(
     })
 }
 
+/// a queued flip whose completion never comes wedges the present loop
+/// forever with no vulkan error to trip recovery (the fence rode the
+/// commit as IN_FENCE_FD; a fence that never signals stalls inside the
+/// kernel). watch each armed flip and treat a long overdue one on a
+/// live-looking device as a card wedge. the floor forgives VRR, where a
+/// frame legitimately stretches far past four fixed-rate periods
+async fn flip_watchdog(state: &Rc<State>, out: &Rc<Output>) {
+    loop {
+        out.conn.flip_armed.triggered().await;
+        loop {
+            let queued = out.conn.flip_queued_ns.get();
+            if queued == 0 {
+                break;
+            }
+            let bound = (FLIP_WEDGE_PERIODS * period_ns(out)).max(FLIP_WEDGE_FLOOR_NS);
+            let now = Time::now().nsec();
+            if now < queued + bound {
+                let _ = state.ring.timeout(Time::from_nsec(queued + bound)).await;
+                continue;
+            }
+            if out.conn.flip_pending.get() && !out.paused.get() && !state.dpms_off.get() {
+                eprintln!(
+                    "carrot: {}: flip stuck for {}ms on a live-looking device; treating the card as wedged",
+                    out.conn.name,
+                    bound / 1_000_000
+                );
+                out.health().trip(out.epoch, RUNG_REBUILD, "flip watchdog");
+            }
+            break;
+        }
+    }
+}
+
 /// one refresh period in nanoseconds; 0 when unknown or variable
 fn period_ns(out: &Output) -> u64 {
     out.conn
@@ -3341,6 +3380,13 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         state
             .eng
             .spawn("cursor flush", async move { cursor_flush_loop(&st, &o).await })
+    };
+    let _watchdog = {
+        let st = state.clone();
+        let o = out.clone();
+        state
+            .eng
+            .spawn("flip watchdog", async move { flip_watchdog(&st, &o).await })
     };
     let mut dirty = false;
     loop {

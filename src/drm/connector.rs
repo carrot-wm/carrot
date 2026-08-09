@@ -46,6 +46,11 @@ pub struct Connector {
     pub flip_pending: Cell<bool>,
     /// fires on every flip completion; the present loop hangs off this
     pub vblank: AsyncEvent,
+    /// when the in-flight flip's ioctl was accepted; 0 = none in flight.
+    /// the watchdog reads it to spot a completion that never comes
+    pub flip_queued_ns: Cell<u64>,
+    /// wakes the flip watchdog when a flip queues
+    pub flip_armed: AsyncEvent,
     pub sequence: Cell<u32>,
     /// last flip's kernel timestamp, (tv_sec, tv_usec)
     pub flip_time: Cell<(u32, u32)>,
@@ -112,6 +117,8 @@ impl Connector {
             flip_pending: Cell::new(false),
             async_announced: Cell::new(false),
             vblank: AsyncEvent::default(),
+            flip_queued_ns: Cell::new(0),
+            flip_armed: AsyncEvent::default(),
             sequence: Cell::new(0),
             flip_time: Cell::new((0, 0)),
             seq64: Cell::new(0),
@@ -251,7 +258,14 @@ impl Connector {
     /// being severed - it will never reach flip_done. reset here or the
     /// flag gates every present of the next output built on this connector
     pub fn pipe_torn_down(&self) {
+        self.flip_gate_reset();
+    }
+
+    /// an in-flight flip will never complete (vt left, pipe torn down,
+    /// device reset): unwedge the gate and stand the watchdog down
+    pub fn flip_gate_reset(&self) {
         self.flip_pending.set(false);
+        self.flip_queued_ns.set(0);
         self.vblank.trigger();
     }
 
@@ -457,6 +471,8 @@ impl Connector {
                     eprintln!("carrot: {}: vrr {}", self.name, if on { "on" } else { "off" });
                 }
                 self.flip_pending.set(true);
+                self.flip_queued_ns.set(crate::util::Time::now().nsec());
+                self.flip_armed.trigger();
                 Ok(FlipResult::Queued)
             }
             Err(Errno::BUSY) => Ok(FlipResult::NotPresented),
@@ -497,6 +513,8 @@ impl Connector {
                     eprintln!("carrot: tearing: async flips active");
                 }
                 self.flip_pending.set(true);
+                self.flip_queued_ns.set(crate::util::Time::now().nsec());
+                self.flip_armed.trigger();
                 Ok(FlipResult::Queued)
             }
             Err(Errno::BUSY) => Ok(FlipResult::NotPresented),
@@ -589,6 +607,7 @@ impl Connector {
         if !self.flip_pending.replace(false) {
             return;
         }
+        self.flip_queued_ns.set(0);
         self.sequence.set(ev.sequence);
         self.flip_time.set((ev.tv_sec, ev.tv_usec));
         let prev = self.seq64.get();
