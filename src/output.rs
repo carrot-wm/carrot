@@ -1943,6 +1943,13 @@ fn register_output_global(state: &Rc<State>, d: &Display, out: &Rc<Output>) {
     out.global_name.set(name);
 }
 
+/// what the input adder owes: a fresh node to bring up, or a bare sweep
+/// of /dev/input after the netlink queue overflowed and adds died unseen
+enum HotplugAdd {
+    Node(String),
+    Sweep,
+}
+
 /// arm the netlink watcher; called once the display is stored in state
 pub fn start_hotplug(state: &Rc<State>) {
     if state.display.borrow().is_none() {
@@ -1960,13 +1967,16 @@ pub fn start_hotplug(state: &Rc<State>) {
         // fresh event nodes lag their uevent: udev hasn't applied
         // permissions yet and logind can refuse the take. a worker delays
         // each add a beat and serializes them so duplicates can't race
-        let adds: Rc<crate::util::AsyncQueue<String>> = Rc::new(Default::default());
+        let adds: Rc<crate::util::AsyncQueue<HotplugAdd>> = Rc::new(Default::default());
         let aq = adds.clone();
         let ast = st.clone();
         let _adder = st.eng.spawn("input hotplug", async move {
             use crate::input::evdev::AddOutcome;
             loop {
-                let devname = aq.pop().await;
+                let req = aq.pop().await;
+                let HotplugAdd::Node(devname) = &req else {
+                    continue;
+                };
                 let deadline = Time::from_nsec(Time::now().nsec() + 250_000_000);
                 let _ = ast.ring.timeout(deadline).await;
                 let session = ast.session.borrow().clone();
@@ -1980,22 +1990,58 @@ pub fn start_hotplug(state: &Rc<State>) {
                 }
             }
         });
+        let mut fd = fd;
         let mut buf = vec![0u8; 4096];
         loop {
+            use crate::uring::RingError;
+            use rustix::io::Errno;
             let (b, n) = match st.ring.read(&fd, buf).await {
                 Ok(r) => r,
+                // the queue overflowed and datagrams died unseen. the errno
+                // is the kernel's resync signal, not a socket failure:
+                // re-probe the card, sweep /dev/input, and keep reading.
+                // removals heal on their own - logind's Gone fires per fd
+                Err(RingError::Os(Errno::NOBUFS)) => {
+                    eprintln!("carrot: hotplug: uevent storm overflowed the socket; resyncing");
+                    rescan(&st, None);
+                    adds.push(HotplugAdd::Sweep);
+                    buf = vec![0u8; 4096];
+                    continue;
+                }
+                Err(RingError::Os(Errno::INTR | Errno::AGAIN)) => {
+                    buf = vec![0u8; 4096];
+                    continue;
+                }
+                Err(RingError::Destroyed) => return,
+                // anything else means the socket itself went bad: stand up
+                // a fresh one and resync across the gap rather than leave
+                // the session deaf to every future plug
                 Err(e) => {
-                    eprintln!("carrot: hotplug read failed: {e:?}");
-                    return;
+                    eprintln!("carrot: hotplug read failed: {e:?}; reopening the socket");
+                    match crate::drm::uevent::open() {
+                        Ok(nfd) => {
+                            fd = Rc::new(nfd);
+                            rescan(&st, None);
+                            adds.push(HotplugAdd::Sweep);
+                            buf = vec![0u8; 4096];
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("carrot: hotplug dead, replugs need a restart: {e}");
+                            return;
+                        }
+                    }
                 }
             };
             buf = b;
             let msg = &buf[..n];
             if crate::drm::uevent::is_drm_change(msg) {
-                rescan(&st);
+                // route to the card that actually changed; a message with no
+                // MAJOR/MINOR falls back to probing everything
+                rescan(&st, crate::drm::uevent::devnum(msg));
             } else if let Some((added, devname)) = crate::drm::uevent::input_change(msg) {
                 if added {
-                    adds.push(devname);
+                    adds.push(HotplugAdd::Node(devname));
                 } else if let Some(devnum) = crate::drm::uevent::devnum(msg) {
                     let session = st.session.borrow().clone();
                     let mgr = st.input.borrow().as_ref().map(|i| i.mgr.clone());
@@ -2391,17 +2437,41 @@ fn reap_after_removal(state: &Rc<State>, card: &Rc<Card>) {
     *card.reaper.borrow_mut() = Some(task);
 }
 
+/// force only the card the event named. a forced probe re-detects the link,
+/// and on a runtime-suspended gpu that is a full PSP/SMU/GART resume, not a
+/// read: doing it to every card on every event woke a display-less gpu 71
+/// times and took usb, nvme, wifi and the other gpu down with it. cards the
+/// event did not name answer from cached state, which is all the resync path
+/// needs
+fn force_probe(only: Option<u64>, devnum: u64) -> bool {
+    only.is_none_or(|dev| dev == devnum)
+}
+
 /// something changed on a card: re-probe its connectors, tear down what
 /// left, bring up what arrived, then rebuild the global layout.
-fn rescan(state: &Rc<State>) {
+///
+/// `only` is the dev_t the uevent named. a force probe is a real dpcd and
+/// edid round trip per connector, and on a card with nothing plugged in it
+/// blocks on link-training timeouts: probing every card on every event cost
+/// ~60ms a pass here, which on a 480Hz head is 29 missed frames and a wedged
+/// verdict from the flip watchdog. None means probe everything, which is what
+/// a resync after a dropped uevent needs
+fn rescan(state: &Rc<State>, only: Option<u64>) {
     let dref = state.display.borrow();
     let Some(d) = dref.as_ref() else { return };
     let cards: Vec<Rc<Card>> = d.cards.borrow().clone();
     let old: Vec<Rc<Output>> = d.outputs.borrow().clone();
 
+    // a drm device we do not drive; nothing here can have changed
+    if let Some(dev) = only
+        && !cards.iter().any(|c| c.devnum() == dev)
+    {
+        return;
+    }
     for card in &cards {
+        let force = force_probe(only, card.devnum());
         for conn in card.dev.connectors.borrow().iter() {
-            let Ok(info) = sys::connector(card.dev.fd.as_fd(), conn.id.0, true) else {
+            let Ok(info) = sys::connector(card.dev.fd.as_fd(), conn.id.0, force) else {
                 continue;
             };
             let now = info.connection == 1;
@@ -2470,6 +2540,7 @@ fn rescan(state: &Rc<State>) {
             }
         }
     }
+    let mut arrived = false;
     let known: Vec<(Rc<Card>, Rc<Connector>)> = cards
         .iter()
         .flat_map(|c| {
@@ -2502,10 +2573,20 @@ fn rescan(state: &Rc<State>) {
                 }));
                 eprintln!("carrot: output {} connected ({}x{})", out.conn.name, out.width, out.height);
                 d.outputs.borrow_mut().push(out);
+                arrived = true;
             }
             Err(e) => eprintln!("carrot: {name}: {e} - connector skipped"),
         }
     }
+    // a rescan that finds nothing new must do nothing. re-modesetting on
+    // every event is what generates the uevent that triggers the next one,
+    // and that loop is what turned a single probe into a wedge storm: each
+    // pass stalled the loop long enough for the flip watchdog to declare the
+    // card dead and rebuild the whole render stack
+    if gone.is_empty() && !arrived {
+        return;
+    }
+
     // one commit per card over that card's head set: combined-bandwidth
     // validation is a property of one device, and a connector on card A
     // cannot ride card B's commit
@@ -6002,6 +6083,21 @@ fn push_borders(
             ],
             color,
         });
+    }
+}
+
+#[cfg(test)]
+mod probe_routing {
+    use super::force_probe;
+
+    #[test]
+    fn only_the_named_card_is_force_probed() {
+        // a uevent for card0 must not wake card1
+        assert!(force_probe(Some(0xe200), 0xe200));
+        assert!(!force_probe(Some(0xe200), 0xe201));
+        // the resync path names nothing and has to look at everything
+        assert!(force_probe(None, 0xe200));
+        assert!(force_probe(None, 0xe201));
     }
 }
 

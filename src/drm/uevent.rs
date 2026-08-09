@@ -14,6 +14,8 @@ pub fn open() -> Result<OwnedFd, String> {
         Some(netlink::KOBJECT_UEVENT),
     )
     .map_err(|e| format!("netlink socket: {e}"))?;
+    let _ = rustix::net::sockopt::set_socket_recv_buffer_size_force(&fd, 1 << 20)
+        .or_else(|_| rustix::net::sockopt::set_socket_recv_buffer_size(&fd, 1 << 20));
     bind(&fd, &SocketAddrNetlink::new(0, 1)).map_err(|e| format!("netlink bind: {e}"))?;
     Ok(fd)
 }
@@ -123,5 +125,31 @@ mod tests {
         assert_eq!(devnum(ev), Some(rustix::fs::makedev(13, 71)));
         let none = b"remove@/devices/usb1/input/input12\0ACTION=remove\0SUBSYSTEM=input\0";
         assert_eq!(devnum(none), None);
+    }
+
+    /// the routing rescan() depends on: a drm hotplug carries the card's
+    /// MAJOR/MINOR, so the probe can be aimed at the card that changed
+    /// instead of every card in the machine
+    #[test]
+    fn a_drm_hotplug_names_its_card() {
+        let ev = b"change@/devices/pci0000:00/0000:09:00.0/drm/card0\0\
+ACTION=change\0DEVPATH=/devices/pci0000:00/0000:09:00.0/drm/card0\0\
+SUBSYSTEM=drm\0HOTPLUG=1\0DEVNAME=dri/card0\0MAJOR=226\0MINOR=0\0";
+        assert!(is_drm_change(ev));
+        assert_eq!(devnum(ev), Some(rustix::fs::makedev(226, 0)));
+        // a second card is a different devnum, so probing can tell them apart
+        let ev1 = b"change@/devices/pci0000:00/0000:03:00.0/drm/card1\0\
+ACTION=change\0SUBSYSTEM=drm\0HOTPLUG=1\0DEVNAME=dri/card1\0MAJOR=226\0MINOR=1\0";
+        assert_eq!(devnum(ev1), Some(rustix::fs::makedev(226, 1)));
+        assert_ne!(devnum(ev), devnum(ev1));
+    }
+
+    /// a message without the pair must not resolve to a bogus card: rescan
+    /// falls back to probing everything, which is correct but slow
+    #[test]
+    fn a_hotplug_without_major_minor_has_no_devnum() {
+        let ev = b"change@/devices/pci0/drm/card0\0ACTION=change\0SUBSYSTEM=drm\0HOTPLUG=1\0";
+        assert!(is_drm_change(ev));
+        assert_eq!(devnum(ev), None);
     }
 }
