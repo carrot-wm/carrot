@@ -4529,7 +4529,11 @@ fn compose_scene(
     let fs = ws.fullscreen.borrow().clone();
     let screen = out.rect();
     let cfg = state.config.borrow().clone();
-    ensure_blur_cache(state, out, screen, &cfg);
+    // captures observe, they never bake: a capture compose consuming
+    // blur_dirty rebuilt the visible output's cache from the wrong scene
+    if mode == DrawMode::Present {
+        ensure_blur_cache(state, out, screen, &cfg);
+    }
 
     // paint order: background, bottom, tiled, fullscreen, floats, top,
     // overlay, layer popups; fullscreen hides everything below itself
