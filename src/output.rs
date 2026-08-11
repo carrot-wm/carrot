@@ -425,7 +425,14 @@ pub struct Output {
     pub damage: AsyncEvent,
     /// callback pacer: fire the sweep at this instant (0 = nothing owed)
     cb_at: Cell<u64>,
+    /// bumped on every arm and every cancel; a sleeping pacer that wakes
+    /// to a changed gen was superseded and stays silent
+    cb_gen: Cell<u64>,
     cb_kick: AsyncEvent,
+    /// surfaces this output drew since its last callback sweep; the sweep
+    /// drains only what it showed, so a fast head never fires a slow
+    /// head's clients early
+    shown: RefCell<Vec<Rc<WlSurface>>>,
     /// a gated standalone cursor commit was skipped while frames flowed;
     /// the flush task lands the staged state once the screen goes idle
     cursor_flush: AsyncEvent,
@@ -2399,7 +2406,7 @@ fn quiesce_output(state: &Rc<State>, out: &Rc<Output>, present: Option<SpawnedFu
     scanout_reset(state, out);
     // the dead head's unswept marks: serve them now, and clear the
     // flags so a surviving output's compose can re-mark the survivors
-    fire_callback_sweep(state);
+    fire_callback_sweep(state, out);
     // pending feedbacks answer discarded instead of silently vanishing
     for fb in out.present_fbs.borrow_mut().drain(..) {
         fb.discarded();
@@ -2908,7 +2915,9 @@ fn init_output(
         global_name: Cell::new(0),
         damage: AsyncEvent::default(),
         cb_at: Cell::new(0),
+        cb_gen: Cell::new(0),
         cb_kick: AsyncEvent::default(),
+        shown: RefCell::new(Vec::new()),
         cursor_flush: AsyncEvent::default(),
         pos: Cell::new((0, 0)),
         ws: Cell::new(0),
@@ -3624,7 +3633,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                             .borrow_mut()
                             .append(&mut surface.latched_feedbacks.borrow_mut());
                         if !surface.shown.replace(true) {
-                            state.shown_surfaces.borrow_mut().push(surface.clone());
+                            out.shown.borrow_mut().push(surface.clone());
                         }
                         {
                             let mut st = out.scanout.borrow_mut();
@@ -3692,7 +3701,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 .borrow_mut()
                 .append(&mut surface.latched_feedbacks.borrow_mut());
             if !surface.shown.replace(true) {
-                state.shown_surfaces.borrow_mut().push(surface.clone());
+                out.shown.borrow_mut().push(surface.clone());
             }
             match out.renderer.copy_frame(src, &pool, offset, row_texels, &target, waits) {
                 Ok(f) => f,
@@ -3903,8 +3912,10 @@ fn callback_lead(content: FsContent, budget: u64, grace: u64, period: u64) -> u6
 /// pick when the just-flipped frame's clients should wake: for the aimed
 /// policies, just before the coming latch (minus a grace for the client's
 /// own render), so their commits land fresh instead of going stale in the
-/// flip-done-to-latch gap. commit at V-lead, glass at V. vblank policy
-/// (and chains that can't fit the period) keep the flip-done sweep
+/// flip-done-to-latch gap. commit at V-lead, glass at V. vblank policy,
+/// vrr (the display follows the client's cadence, so there is no fixed
+/// vblank to lead), and chains that can't fit the period keep the
+/// flip-done sweep
 fn schedule_callbacks(state: &Rc<State>, out: &Rc<Output>) {
     let (policy, floor_us, grace_us) = {
         let cfg = state.config.borrow();
@@ -3917,8 +3928,17 @@ fn schedule_callbacks(state: &Rc<State>, out: &Rc<Output>) {
     let period = period_ns(out);
     let (sec, usec) = out.conn.flip_time.get();
     let flip_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1000;
-    if policy == crate::config::LatencyPolicy::Vblank || period == 0 || flip_ns == 0 {
-        fire_callback_sweep(state);
+    if policy == crate::config::LatencyPolicy::Vblank
+        || period == 0
+        || flip_ns == 0
+        || vrr_wanted(state, out)
+    {
+        // no fixed vblank to lead: the sweep fires at flip-done, and any
+        // armed fixed-mode wake is disowned (gen bump) so a pacer already
+        // sleeping on it stays silent instead of firing a stale sweep
+        out.cb_gen.set(out.cb_gen.get().wrapping_add(1));
+        out.cb_at.set(0);
+        fire_callback_sweep(state, out);
         return;
     }
     let mut content = state
@@ -3957,12 +3977,14 @@ fn schedule_callbacks(state: &Rc<State>, out: &Rc<Output>) {
         lead / 1000,
         (period.saturating_sub(lead)) / 1000
     );
+    out.cb_gen.set(out.cb_gen.get().wrapping_add(1));
     out.cb_at.set(flip_ns + period - lead);
     out.cb_kick.trigger();
 }
 
 /// waits out each scheduled wake and runs the sweep; one per output,
-/// coalescing kicks (the sweep drains a shared list, so overlap is cheap)
+/// coalescing kicks (the sweep drains this output's list, so overlap is
+/// cheap)
 async fn callback_pacer(state: &Rc<State>, out: &Rc<Output>) {
     loop {
         out.cb_kick.triggered().await;
@@ -3970,37 +3992,41 @@ async fn callback_pacer(state: &Rc<State>, out: &Rc<Output>) {
         if at == 0 {
             continue;
         }
+        let wake_gen = out.cb_gen.get();
         if at > Time::now().nsec() {
             let _ = state.ring.timeout(Time::from_nsec(at)).await;
         }
-        // a newer wake got armed while this one slept (the sweep slipped
-        // past the next flip-done): yield to it instead of firing twice
-        // back-to-back - a client paced off both commits a frame that
-        // supersedes before any latch and lands as discarded feedback.
-        // nothing is lost: the sweep drains an accumulating list
-        if out.cb_at.get() != 0 {
+        // the gen moved while this wake slept: either a newer wake got
+        // armed (the sweep slipped past the next flip-done; yield to it
+        // instead of firing twice back-to-back - a client paced off both
+        // commits a frame that supersedes before any latch and lands as
+        // discarded feedback) or vrr engaged mid-sleep and disowned the
+        // fixed-mode wake. nothing is lost: the sweep drains an
+        // accumulating list
+        if out.cb_gen.get() != wake_gen {
             continue;
         }
-        fire_callback_sweep(state);
+        fire_callback_sweep(state, out);
     }
 }
 
-/// frame callbacks for everything some compose (or scanout) marked shown
-/// since the last sweep; clients nobody can see stop rendering into the
-/// void. fired at flip-done, so a frame's callbacks land at its glass
-fn fire_callback_sweep(state: &Rc<State>) {
+/// frame callbacks for everything this output's compose (or scanout)
+/// marked shown since its last sweep; clients nobody can see stop
+/// rendering into the void, and a fast head never drains a slow head's
+/// marks. fired at flip-done, so a frame's callbacks land at its glass
+fn fire_callback_sweep(state: &Rc<State>, out: &Rc<Output>) {
     // the cursor surface never rides a scene walk but its client still
     // paces animated cursors off frame callbacks
     if let Some(seat) = state.seat.borrow().clone() {
         if let crate::input::seat::CursorState::Surface(s) = &*seat.cursor.borrow() {
             if !s.shown.replace(true) {
-                state.shown_surfaces.borrow_mut().push(s.clone());
+                out.shown.borrow_mut().push(s.clone());
             }
         }
     }
-    // only surfaces some compose (or scanout) marked since the last sweep;
-    // nobody walks every client every vblank
-    let mut list = state.shown_surfaces.take();
+    // only surfaces this output marked since its last sweep; nobody walks
+    // every client every vblank
+    let mut list = out.shown.take();
     if list.is_empty() {
         return;
     }
@@ -4011,7 +4037,7 @@ fn fire_callback_sweep(state: &Rc<State>) {
         }
     }
     // hand the capacity back unless a callback handler raced a new mark in
-    let mut slot = state.shown_surfaces.borrow_mut();
+    let mut slot = out.shown.borrow_mut();
     if slot.is_empty() {
         *slot = list;
     }
@@ -4624,7 +4650,7 @@ fn draw_surface_tree(
         return;
     }
     if !surface.shown.replace(true) {
-        surface.client.state.shown_surfaces.borrow_mut().push(surface.clone());
+        out.shown.borrow_mut().push(surface.clone());
     }
     if out.collect_fbs.get() {
         let mut latched = surface.latched_feedbacks.borrow_mut();
