@@ -290,11 +290,11 @@ fn resolve(state: &Rc<State>, pick: Pick) -> Result<(Source, u32, u32, u32, (i32
             window_source(state, win)
         }
         Pick::Restored(RestoreData::Window { ident, app_id, title }) => {
-            // a stale token falls back to the focused window rather than
-            // failing the whole cast; the picker will own this choice
+            // a stale token must NOT fall back to whatever is focused:
+            // that streams content nobody consented to. fail instead;
+            // the portal falls back to a fresh consent flow
             let win = find_window(state, ident, &app_id, &title)
-                .or_else(|| crate::tree::focused_window(state))
-                .ok_or(PwError::Env("no window to cast"))?;
+                .ok_or(PwError::Env("the restored window is gone"))?;
             window_source(state, win)
         }
     }

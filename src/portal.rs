@@ -35,7 +35,9 @@ struct Session {
     /// the frontend connection that created us; when its bus name dies,
     /// this session is a corpse
     owner: String,
-    cursor_mode: Cell<u32>,
+    /// None until SelectSources names one; Start resolves the config
+    /// default then
+    cursor_mode: Cell<Option<u32>>,
     types: Cell<u32>,
     /// requested persist_mode, granted as asked (clamped to the spec's
     /// max of 2): tokens carry durable identity, so until-revoked
@@ -61,7 +63,7 @@ impl Default for Session {
         Session {
             owner: String::new(),
             // the spec defaults: no pointer in the frames, monitors only
-            cursor_mode: Cell::new(CURSOR_HIDDEN),
+            cursor_mode: Cell::new(None),
             types: Cell::new(SOURCE_MONITOR),
             persist: Cell::new(0),
             restore: RefCell::new(None),
@@ -260,6 +262,27 @@ fn put_streams_entry(b: &mut MsgBuilder, cast: &cast::Cast) {
     });
 }
 
+/// the consent flow: the configured picker, else click-to-select
+async fn interactive_pick(
+    state: &Rc<State>,
+    picker_cmd: Option<&str>,
+    types: u32,
+) -> Option<cast::Pick> {
+    if let Some(cmd) = picker_cmd {
+        match picker::pick(state, cmd, types).await? {
+            picker::Choice::Output(name) => {
+                Some(cast::Pick::Restored(cast::RestoreData::Output { name }))
+            }
+            picker::Choice::Window(ident) => Some(cast::Pick::Ident(ident)),
+            picker::Choice::Workspace(index) => {
+                Some(cast::Pick::Restored(cast::RestoreData::Workspace { index }))
+            }
+        }
+    } else {
+        seat_pick(state, types).await.map(cast::Pick::Restored)
+    }
+}
+
 fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests, state: Rc<State>) {
     use crate::dbus::wire::SvVal;
     let me = conn.clone();
@@ -304,7 +327,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests,
                 };
                 for (k, v) in &opts {
                     match (k.as_str(), v) {
-                        ("cursor_mode", SvVal::U(m)) => s.cursor_mode.set(*m),
+                        ("cursor_mode", SvVal::U(m)) => s.cursor_mode.set(Some(*m)),
                         ("types", SvVal::U(t)) => s.types.set(*t),
                         ("persist_mode", SvVal::U(p)) => s.persist.set(*p),
                         // the frontend owns tokens; what we get back is our
@@ -334,7 +357,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests,
                         return;
                     };
                     (
-                        s.cursor_mode.get() == CURSOR_EMBEDDED,
+                        s.cursor_mode.get().unwrap_or(CURSOR_HIDDEN) == CURSOR_EMBEDDED,
                         s.persist.get(),
                         s.types.get(),
                         s.restore.borrow().clone(),
@@ -358,34 +381,27 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests,
                             requests.borrow_mut().remove(&request);
                         }
                     });
-                    let pick = if let Some(r) = restore {
-                        // a token is prior consent; it skips the picker
-                        cast::Pick::Restored(r)
-                    } else if let Some(cmd) = &picker_cmd {
-                        match picker::pick(&st, cmd, types).await {
-                            Some(picker::Choice::Output(name)) => {
-                                cast::Pick::Restored(cast::RestoreData::Output { name })
-                            }
-                            Some(picker::Choice::Window(ident)) => cast::Pick::Ident(ident),
-                            Some(picker::Choice::Workspace(index)) => {
-                                cast::Pick::Restored(cast::RestoreData::Workspace { index })
-                            }
-                            None => {
-                                response_to(&me, serial, &dest, R_CANCELLED);
-                                return;
-                            }
-                        }
-                    } else {
-                        // no picker configured: the next click is the consent
-                        match seat_pick(&st, types).await {
-                            Some(r) => cast::Pick::Restored(r),
-                            None => {
-                                response_to(&me, serial, &dest, R_CANCELLED);
-                                return;
+                    // a token is prior consent and skips the picker;
+                    // allow-restore off voids that consent class. a stale
+                    // token falls back to fresh consent, NEVER to whatever
+                    // happens to be focused
+                    let mut restored = true;
+                    let mut pick = restore.map(cast::Pick::Restored);
+                    loop {
+                    let p = match pick.take() {
+                        Some(p) => p,
+                        None => {
+                            restored = false;
+                            match interactive_pick(&st, picker_cmd.as_deref(), types).await {
+                                Some(p) => p,
+                                None => {
+                                    response_to(&me, serial, &dest, R_CANCELLED);
+                                    return;
+                                }
                             }
                         }
                     };
-                    match cast::start(&st, sess, cursor, pick).await {
+                    match cast::start(&st, sess.clone(), cursor, p).await {
                         Ok(cast) => {
                             // restore_data rides the frontend's permission
                             // store; it mints the app-facing token itself
@@ -411,11 +427,20 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests,
                                     }
                                 });
                             });
+                            return;
+                        }
+                        Err(e) if restored => {
+                            eprintln!(
+                                "carrot: portal: restore failed ({e}); asking for fresh consent"
+                            );
+                            continue;
                         }
                         Err(e) => {
                             eprintln!("carrot: portal: cast failed: {e}");
                             response_to(&me, serial, &dest, R_ENDED);
+                            return;
                         }
+                    }
                     }
                 }});
                 requests.borrow_mut().insert(request, session.clone());

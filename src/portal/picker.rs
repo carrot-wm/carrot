@@ -46,6 +46,19 @@ pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
     let out: Rc<OwnedFd> = Rc::new(child.stdout.take()?.into());
     let pid = child.id();
     let child = Rc::new(RefCell::new(child));
+    // however this pick ends - answer, watchdog, or the whole task
+    // dropped mid-await by a cancelled Start - the picker group dies and
+    // the zombie is queued for the reaper. without this a cancel left
+    // the menu on screen and a zombie per attempt
+    let _cleanup = crate::util::OnDrop({
+        let state = state.clone();
+        move || {
+            if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                state.reap_pids.borrow_mut().push(pid);
+            }
+        }
+    });
     // armed before the list goes out: a picker that never reads its
     // stdin must not pin the session on a full pipe
     let watchdog = state.eng.spawn("picker watchdog", {
@@ -93,12 +106,7 @@ pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
         }
     }
     drop(watchdog);
-    if child.borrow_mut().try_wait().ok().flatten().is_none() {
-        // still running (or already stolen): the scoped reaper collects it
-        if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-            state.reap_pids.borrow_mut().push(pid);
-        }
-    }
+    drop(child);
     let end = acc.iter().position(|&c| c == b'\n').unwrap_or(acc.len());
     parse_choice(String::from_utf8_lossy(&acc[..end]).trim())
 }
