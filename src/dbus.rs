@@ -19,6 +19,10 @@ use std::rc::Rc;
 pub(crate) use wire::MsgBuilder;
 use wire::Rd;
 
+/// a local bus answers in microseconds; anything past this is a wedge,
+/// and the caller can recover (skip a device, try the next card)
+const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug)]
 pub enum DbusError {
     Env(&'static str),
@@ -31,6 +35,8 @@ pub enum DbusError {
     TooFewFds,
     Call { name: String, text: String },
     BadReply(&'static str),
+    /// the deadline fired first; the reply may never have been sent
+    NoReply,
 }
 
 impl fmt::Display for DbusError {
@@ -46,6 +52,7 @@ impl fmt::Display for DbusError {
             DbusError::TooFewFds => write!(f, "message claims more fds than arrived"),
             DbusError::Call { name, text } => write!(f, "call failed: {name}: {text}"),
             DbusError::BadReply(e) => write!(f, "unexpected reply shape: {e}"),
+            DbusError::NoReply => write!(f, "no reply within the deadline"),
         }
     }
 }
@@ -120,6 +127,7 @@ impl MethodCall {
 
 pub struct DbusConn {
     ring: Rc<Ring>,
+    eng: Rc<Engine>,
     fd: Rc<OwnedFd>,
     serial: NumCell<u64>,
     closed: Cell<bool>,
@@ -201,6 +209,7 @@ impl DbusConn {
 
         let conn = Rc::new(DbusConn {
             ring: ring.clone(),
+            eng: eng.clone(),
             fd,
             serial: NumCell::new(1),
             closed: Cell::new(false),
@@ -222,7 +231,12 @@ impl DbusConn {
         });
         let c = conn.clone();
         let outgoing = eng.spawn("dbus out", async move {
-            let _ = c.outgoing_loop().await;
+            // a dead writer strands every queued call just as surely as a
+            // dead reader; both exits fail the pendings out loud
+            if let Err(e) = c.outgoing_loop().await {
+                eprintln!("carrot: dbus writer lost: {e}");
+            }
+            c.fail_all(DbusError::Closed);
         });
         conn.tasks.set(Some((incoming, outgoing)));
 
@@ -300,7 +314,7 @@ impl DbusConn {
     }
 
     /// claim a well-known name; 4 = DBUS_NAME_FLAG_DO_NOT_QUEUE
-    pub async fn request_name(&self, name: &str) -> Result<(), DbusError> {
+    pub async fn request_name(self: &Rc<Self>, name: &str) -> Result<(), DbusError> {
         let r = self
             .call(
                 "org.freedesktop.DBus",
@@ -308,11 +322,14 @@ impl DbusConn {
                 "org.freedesktop.DBus",
                 "RequestName",
                 "su",
-                &[Arg::Str(name), Arg::U32(4)],
+                // 4|2|1: DO_NOT_QUEUE, REPLACE_EXISTING, ALLOW_REPLACEMENT.
+                // a lingering previous instance loses the name to us
+                // instead of blocking screen sharing until a reboot
+                &[Arg::Str(name), Arg::U32(7)],
             )
             .await?;
-        // 1 = primary owner
-        if r.sig == "u" && r.rd().u32()? == 1 {
+        // 1 = became primary owner, 4 = already were
+        if r.sig == "u" && matches!(r.rd().u32()?, 1 | 4) {
             Ok(())
         } else {
             Err(DbusError::Env("could not become the portal name owner"))
@@ -356,7 +373,7 @@ impl DbusConn {
     }
 
     pub async fn call(
-        &self,
+        self: &Rc<Self>,
         dest: &str,
         path: &str,
         iface: &str,
@@ -375,6 +392,20 @@ impl DbusConn {
         self.replies.borrow_mut().insert(serial, pending.clone());
         self.out
             .push((self.build(serial, 0, dest, path, iface, member, sig, args), Vec::new()));
+        // a reply that never comes must fail the call, not park it forever:
+        // the whole compositor once sat headless on a TakeDevice whose
+        // answer went missing. the bus is local, so the deadline is beyond
+        // any honest round trip. the guard drops with the call, and the
+        // ring cancels a dropped timeout, so the settled path costs nothing
+        let conn = self.clone();
+        let _deadline = self.eng.spawn("dbus deadline", async move {
+            if conn.ring.timeout(crate::util::Time::now() + CALL_DEADLINE).await.is_ok()
+                && let Some(p) = conn.replies.borrow_mut().remove(&serial)
+            {
+                p.result.set(Some(Err(DbusError::NoReply)));
+                p.done.trigger();
+            }
+        });
         pending.done.triggered().await;
         pending.result.take().unwrap_or(Err(DbusError::Closed))
     }
@@ -409,7 +440,7 @@ impl DbusConn {
 
     // handler first, then the bus-side match, so nothing slips between
     pub async fn subscribe(
-        &self,
+        self: &Rc<Self>,
         iface: &'static str,
         member: &'static str,
         sender: &str,
@@ -487,7 +518,16 @@ impl DbusConn {
                 break;
             }
             let msg: Vec<u8> = pending.drain(..len).collect();
-            let h = wire::parse(&msg)?;
+            // the length framing already isolated this message: one
+            // malformed body skips, it must not kill the connection
+            // (and with it every portal session)
+            let h = match wire::parse(&msg) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.dump_line(&format!("SKIP malformed message: {e}"));
+                    continue;
+                }
+            };
             self.dump_line(&format!(
                 "MSG type={} serial={} reply_to={:?} sig={:?} fds={} err={:?} member={:?}",
                 h.mtype, h.serial, h.reply_serial, h.signature, h.unix_fds, h.error_name, h.member
@@ -511,6 +551,9 @@ impl DbusConn {
                                 p.done.trigger();
                             }
                             None => {
+                                // late (post-deadline) or misrouted; either
+                                // way someone waited on this and gave up
+                                eprintln!("carrot: dbus: return for unknown serial {serial} dropped");
                                 self.dump_line(&format!("RETURN for unknown serial {serial}"))
                             }
                         }
@@ -529,6 +572,11 @@ impl DbusConn {
                                 text,
                             })));
                             p.done.trigger();
+                        } else {
+                            eprintln!(
+                                "carrot: dbus: error {} for unknown serial {serial} dropped",
+                                h.error_name.as_deref().unwrap_or("?")
+                            );
                         }
                     }
                 }
