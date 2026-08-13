@@ -217,6 +217,16 @@ pub struct SourceNode {
     seq: u64,
 }
 
+/// fd pods carry an index as a little-endian i64; a short or foreign
+/// payload is a daemon bug and must fail the cast, never abort the
+/// compositor (a panic in a task is process::abort here)
+fn pod_fd_index(d: &[u8]) -> Result<i64, PwError> {
+    match d.get(..8) {
+        Some(b) => Ok(i64::from_le_bytes(b.try_into().unwrap())),
+        None => Err(PwError::Env("short fd pod")),
+    }
+}
+
 impl SourceNode {
     pub async fn create(con: Rc<PwConn>, proxy_id: u32, width: u32, height: u32, fps: u32) -> Result<SourceNode, PwError> {
         let mut b = PodBuilder::default();
@@ -323,7 +333,7 @@ impl SourceNode {
                 let _ty = s.id()?;
                 // fd pods carry indices; the fd itself rides SCM_RIGHTS
                 let (_, d) = s.value()?;
-                let fd_idx = i64::from_le_bytes(d[..8].try_into().unwrap());
+                let fd_idx = pod_fd_index(d)?;
                 let flags = s.int()?;
                 let fd = f
                     .fds
@@ -398,9 +408,9 @@ impl SourceNode {
                 let mut p = PodParser::new(&f.body);
                 let mut s = p.struct_()?;
                 let (_, r) = s.value()?;
-                let read_idx = i64::from_le_bytes(r[..8].try_into().unwrap());
+                let read_idx = pod_fd_index(r)?;
                 let (_, w) = s.value()?;
-                let _write_idx = i64::from_le_bytes(w[..8].try_into().unwrap());
+                let _write_idx = pod_fd_index(w)?;
                 let mem_id = s.uint()?;
                 let offset = s.uint()?;
                 let size = s.uint()?;
@@ -418,7 +428,7 @@ impl SourceNode {
                 let mut s = p.struct_()?;
                 let node = s.uint()?;
                 let (_, d) = s.value()?;
-                let fd_idx = i64::from_le_bytes(d[..8].try_into().unwrap());
+                let fd_idx = pod_fd_index(d)?;
                 if fd_idx < 0 {
                     self.peers.remove(&node);
                     return Ok(true);
@@ -499,6 +509,15 @@ impl SourceNode {
             }
             out.push(Buffer { _mem: mem, _data_mem: data_mem, header, chunk, data, data_len });
         }
+        // a renegotiation race can deliver a round sized for the PREVIOUS
+        // dims (resize B sent while round A was in flight). new-stride
+        // pixels into old-size buffers scramble the stream: drop the
+        // stale round, the daemon re-sends one for the new dims
+        let need = (self.width as usize) * (self.height as usize) * 4;
+        if out.iter().any(|b| b.data_len < need) {
+            self.buffers.clear();
+            return Ok(());
+        }
         self.buffers = out;
         Ok(())
     }
@@ -535,6 +554,9 @@ impl SourceNode {
     pub fn produce(&mut self, fill: impl FnOnce(&mut [u8], usize)) {
         use std::sync::atomic::{AtomicU32, Ordering};
         let Some((_, io)) = &self.io else { return };
+        if self.buffers.is_empty() {
+            return;
+        }
         let io = *io;
         let cur = unsafe { (*(io.add(4) as *const AtomicU32)).load(Ordering::Relaxed) };
         let idx = ((cur.wrapping_add(1)) as usize) % self.buffers.len();

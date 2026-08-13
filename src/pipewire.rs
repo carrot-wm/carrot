@@ -89,11 +89,29 @@ pub(crate) fn open_socket() -> Result<OwnedFd, PwError> {
     let fd = socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,
-        SocketFlags::CLOEXEC,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
         None,
     )?;
     let addr = SocketAddrUnix::new(&*path)?;
-    rustix::net::connect(&fd, &addr)?;
+    // nonblocking connect, bounded: a wedged daemon (full accept
+    // backlog) used to park the whole loop thread in connect(2)
+    match rustix::net::connect(&fd, &addr) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::INPROGRESS | rustix::io::Errno::AGAIN) => {
+            let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::OUT)];
+            let t = rustix::time::Timespec { tv_sec: 1, tv_nsec: 0 };
+            if rustix::event::poll(&mut fds, Some(&t))? == 0 {
+                return Err(PwError::Env("the pipewire socket did not accept within 1s"));
+            }
+            match rustix::net::sockopt::socket_error(&fd)? {
+                Ok(()) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    // back to blocking; the ring drives all later io
+    rustix::io::ioctl_fionbio(&fd, false)?;
     Ok(fd)
 }
 
@@ -273,16 +291,26 @@ pub(crate) async fn pump_node(
     node: &Rc<RefCell<SourceNode>>,
 ) -> Result<(), PwError> {
     loop {
-        let mut f = con.recv().await?;
-        if node.borrow_mut().handle(&mut f)? {
-            continue;
-        }
-        match (f.id, f.opcode) {
-            (0, EV_CORE_PING) => answer_ping(con, &f.body).await?,
-            (0, EV_CORE_ERROR) => return Err(remote_error(&f.body)),
-            _ => {}
-        }
+        pump_step(con, node).await?;
     }
+}
+
+/// one pump turn: receive a frame and dispatch it. the cast pump loops
+/// this itself so it can watch the node's ready edge between turns
+pub(crate) async fn pump_step(
+    con: &PwConn,
+    node: &Rc<RefCell<SourceNode>>,
+) -> Result<(), PwError> {
+    let mut f = con.recv().await?;
+    if node.borrow_mut().handle(&mut f)? {
+        return Ok(());
+    }
+    match (f.id, f.opcode) {
+        (0, EV_CORE_PING) => answer_ping(con, &f.body).await?,
+        (0, EV_CORE_ERROR) => return Err(remote_error(&f.body)),
+        _ => {}
+    }
+    Ok(())
 }
 
 /// `carrot pw-pattern [secs]`: a Video/Source client-node pushing a moving
