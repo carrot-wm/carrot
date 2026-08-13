@@ -59,6 +59,9 @@
             # the filename, so it still sorts before 70-uaccess.rules (the
             # applier). extraRules would land in 99-local.rules - too late
             services.udev.packages = [ package ];
+            # carrot ships carrot-session.target; systemd only sees units in
+            # packages it is told about
+            systemd.packages = [ package ];
             # carrot is its own screencast backend; the package ships the
             # portal registration and the preference file
             xdg.portal = {
@@ -1041,6 +1044,22 @@
               [preferred]
               default=*
               org.freedesktop.impl.portal.ScreenCast=carrot
+              EOF
+
+              # graphical-session.target refuses a manual start, so carrot
+              # raises this instead and systemd pulls the target in behind it.
+              # without it xdg-desktop-portal 1.22+ never activates: its unit
+              # has Requisite=graphical-session.target, which fails the job
+              # outright when the target is down
+              mkdir -p $out/share/systemd/user
+              cat > $out/share/systemd/user/carrot-session.target << EOF
+              [Unit]
+              Description=carrot compositor session
+              BindsTo=graphical-session.target
+              Before=graphical-session.target
+              Wants=graphical-session-pre.target
+              After=graphical-session-pre.target
+              StopWhenUnneeded=true
               EOF
 
               # the zero-copy shm bridge opens /dev/udmabuf; uaccess hands it

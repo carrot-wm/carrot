@@ -738,7 +738,55 @@ pub async fn export_session_env(
         }
         (Err(e), _) => eprintln!("carrot: dbus: session env export failed: {e}"),
     }
+    // only after the env lands: a unit started before it would inherit a
+    // session with no WAYLAND_DISPLAY and connect to nothing
+    if r2.is_ok() {
+        start_session_target(&conn).await;
+    }
     conn.clear();
+}
+
+
+/// units bound to graphical-session.target, tried in order. graphical-session
+/// itself refuses a manual start: it is only ever pulled in by a unit that
+/// BindsTo it, so a compositor has to raise one of these instead.
+///
+/// this matters because xdg-desktop-portal 1.22+ declares
+/// `Requisite=graphical-session.target`. Requisite is the strict form: if the
+/// target is not already active the activation job fails outright rather than
+/// starting it, so a session that never raises the target has no portal at
+/// all, and the only symptom is "Dependency failed for Portal service" in the
+/// user journal.
+const SESSION_TARGETS: [&str; 2] = ["carrot-session.target", "nixos-fake-graphical-session.target"];
+
+/// raise the session target so portals and anything else bound to
+/// graphical-session.target can start. best effort: a session without a
+/// systemd user manager is a supported way to run, it just has no portal
+async fn start_session_target(conn: &Rc<DbusConn>) {
+    for unit in SESSION_TARGETS {
+        let r = conn
+            .call(
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartUnit",
+                "ss",
+                &[Arg::Str(unit), Arg::Str("replace")],
+            )
+            .await;
+        match r {
+            Ok(_) => {
+                eprintln!("carrot: dbus: session target up ({unit})");
+                return;
+            }
+            // not installed: try the next name rather than giving up
+            Err(e) => crate::trace!("dbus: {unit}: {e}"),
+        }
+    }
+    eprintln!(
+        "carrot: dbus: no session target could be started; units bound to \
+graphical-session.target (xdg-desktop-portal among them) will stay down"
+    );
 }
 
 pub fn probe() -> i32 {
