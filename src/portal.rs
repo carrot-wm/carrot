@@ -32,6 +32,9 @@ const R_CANCELLED: u32 = 1;
 const R_ENDED: u32 = 2;
 
 struct Session {
+    /// the frontend connection that created us; when its bus name dies,
+    /// this session is a corpse
+    owner: String,
     cursor_mode: Cell<u32>,
     types: Cell<u32>,
     /// requested persist_mode, granted as asked (clamped to the spec's
@@ -41,12 +44,22 @@ struct Session {
     /// what presented restore_data decoded to
     restore: RefCell<Option<cast::RestoreData>>,
     /// the in-flight Start; dropping it cancels the cast setup
-    starting: Cell<Option<SpawnedFuture<()>>>,
+    starting: Cell<Option<StartTask>>,
+}
+
+/// an in-flight Start: dropping the task cancels the pick (the armed
+/// click-eater included) and the cast setup; the serial answers the
+/// caller when someone else ends it first
+struct StartTask {
+    serial: u32,
+    dest: String,
+    _task: SpawnedFuture<()>,
 }
 
 impl Default for Session {
     fn default() -> Session {
         Session {
+            owner: String::new(),
             // the spec defaults: no pointer in the frames, monitors only
             cursor_mode: Cell::new(CURSOR_HIDDEN),
             types: Cell::new(SOURCE_MONITOR),
@@ -58,6 +71,9 @@ impl Default for Session {
 }
 
 type Sessions = Rc<RefCell<HashMap<String, Session>>>;
+/// request handle -> the session whose Start it carries; Request.Close
+/// cancels through it
+type Requests = Rc<RefCell<HashMap<String, String>>>;
 
 /// a click-to-select in flight; the seat answers it from the next click
 pub struct PendingPick {
@@ -244,23 +260,29 @@ fn put_streams_entry(b: &mut MsgBuilder, cast: &cast::Cast) {
     });
 }
 
-fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
+fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests, state: Rc<State>) {
     use crate::dbus::wire::SvVal;
     let me = conn.clone();
+    let session_seq = Cell::new(0u64);
     conn.serve(IF_SCREENCAST, Box::new(move |c, call| {
         match call.member.as_str() {
             "CreateSession" => {
                 let mut rd = call.rd();
                 let _request = rd.str().unwrap_or_default();
                 let session = rd.str().unwrap_or_default();
-                sessions.borrow_mut().insert(session, Session::default());
+                sessions.borrow_mut().insert(
+                    session,
+                    Session { owner: call.sender.clone(), ..Default::default() },
+                );
+                let n = session_seq.get() + 1;
+                session_seq.set(n);
                 c.reply(call, "ua{sv}", |b| {
                     b.put_u32(0);
                     b.put_array(8, |b| {
                         // the session id result key is required by the spec
                         b.align(8);
                         b.put_str("session_id");
-                        b.put_variant("s", |b| b.put_str("carrot"));
+                        b.put_variant("s", |b| b.put_str(&format!("carrot-{n}")));
                     });
                 });
             }
@@ -298,7 +320,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
             }
             "Start" => {
                 let mut rd = call.rd();
-                let _request = rd.str().unwrap_or_default();
+                let request = rd.str().unwrap_or_default();
                 let session = rd.str().unwrap_or_default();
                 let (cursor, persist, types, restore) = {
                     let map = sessions.borrow();
@@ -324,7 +346,18 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
                 let me = me.clone();
                 let st = state.clone();
                 let sess = session.clone();
-                let task = state.eng.spawn("cast start", async move {
+                let task = state.eng.spawn("cast start", {
+                    let requests = requests.clone();
+                    let request = request.clone();
+                    async move {
+                    // however this Start ends, its request handle stops
+                    // resolving to this session
+                    let _unreg = crate::util::OnDrop({
+                        let requests = requests.clone();
+                        move || {
+                            requests.borrow_mut().remove(&request);
+                        }
+                    });
                     let pick = if let Some(r) = restore {
                         // a token is prior consent; it skips the picker
                         cast::Pick::Restored(r)
@@ -384,9 +417,19 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
                             response_to(&me, serial, &dest, R_ENDED);
                         }
                     }
-                });
+                }});
+                requests.borrow_mut().insert(request, session.clone());
                 if let Some(s) = sessions.borrow().get(&session) {
-                    s.starting.set(Some(task));
+                    // a second Start on the same session replaces the
+                    // first; the first caller hears cancelled, not silence
+                    if let Some(old) = s.starting.take() {
+                        response_to(c, old.serial, &old.dest, R_CANCELLED);
+                    }
+                    s.starting.set(Some(StartTask {
+                        serial,
+                        dest: call.sender.clone(),
+                        _task: task,
+                    }));
                 }
             }
             "OpenPipeWireRemote" => {
@@ -411,9 +454,11 @@ async fn run_inner(
     state: Rc<State>,
 ) -> Result<(), DbusError> {
     let conn = DbusConn::connect_session(eng, ring).await?;
+    *state.portal.borrow_mut() = Some(conn.clone());
     let sessions: Sessions = Rc::new(RefCell::new(HashMap::new()));
+    let requests: Requests = Rc::new(RefCell::new(HashMap::new()));
     serve_properties(&conn);
-    serve_screencast(&conn, sessions.clone(), state.clone());
+    serve_screencast(&conn, sessions.clone(), requests.clone(), state.clone());
     conn.serve(IF_SESSION, Box::new({
         let sessions = sessions.clone();
         let state = state.clone();
@@ -421,15 +466,68 @@ async fn run_inner(
             "Close" => {
                 sessions.borrow_mut().remove(&call.path);
                 state.casts.borrow_mut().retain(|x| x.session != call.path);
+                // a window pinned visible only for this session re-hides
+                crate::tree::sync_x_visibility(&state);
                 c.reply(call, "", |_| {});
             }
             _ => c.reply_err(call, "org.freedesktop.DBus.Error.UnknownMethod", "no such method"),
         }
     }));
-    conn.serve(IF_REQUEST, Box::new(|c, call| match call.member.as_str() {
-        "Close" => c.reply(call, "", |_| {}),
-        _ => c.reply_err(call, "org.freedesktop.DBus.Error.UnknownMethod", "no such method"),
+    conn.serve(IF_REQUEST, Box::new({
+        let sessions = sessions.clone();
+        let requests = requests.clone();
+        move |c, call| match call.member.as_str() {
+            "Close" => {
+                // closing the request cancels its in-flight Start: the
+                // dropped task disarms the pick (armed click-eater
+                // included) and abandons the cast setup
+                if let Some(sess) = requests.borrow_mut().remove(&call.path)
+                    && let Some(s) = sessions.borrow().get(&sess)
+                    && let Some(old) = s.starting.take()
+                {
+                    response_to(c, old.serial, &old.dest, R_CANCELLED);
+                }
+                c.reply(call, "", |_| {});
+            }
+            _ => c.reply_err(call, "org.freedesktop.DBus.Error.UnknownMethod", "no such method"),
+        }
     }));
+    // the frontend crashing or restarting must not orphan its sessions:
+    // carrot would keep streaming (and pinning x windows) into corpses
+    conn.subscribe(
+        "org.freedesktop.DBus",
+        "NameOwnerChanged",
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        Box::new({
+            let sessions = sessions.clone();
+            let state = state.clone();
+            move |sig| {
+                let mut rd = sig.rd();
+                let (Ok(name), Ok(_old), Ok(new)) = (rd.str(), rd.str(), rd.str()) else {
+                    return;
+                };
+                if !new.is_empty() {
+                    return;
+                }
+                let dead: Vec<String> = sessions
+                    .borrow()
+                    .iter()
+                    .filter(|(_, s)| s.owner == name)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                if dead.is_empty() {
+                    return;
+                }
+                for k in &dead {
+                    sessions.borrow_mut().remove(k);
+                    state.casts.borrow_mut().retain(|c| &c.session != k);
+                }
+                crate::tree::sync_x_visibility(&state);
+            }
+        }),
+    )
+    .await?;
     conn.request_name(PORTAL_NAME).await?;
     eprintln!("carrot: portal: serving {PORTAL_NAME}");
     std::future::pending::<()>().await;
@@ -437,8 +535,24 @@ async fn run_inner(
 }
 
 pub async fn run(eng: Rc<Engine>, ring: Rc<Ring>, state: Rc<State>) {
-    if let Err(e) = run_inner(&eng, &ring, state).await {
-        eprintln!("carrot: portal: {e}");
+    // the connection is screen sharing's lifeline: a bus hiccup, a
+    // daemon restart, a lost name - reconnect with backoff, forever.
+    // one exit used to mean no sharing until the compositor restarted
+    let mut wait = 1u64;
+    loop {
+        let started = crate::util::Time::now().nsec();
+        if let Err(e) = run_inner(&eng, &ring, state.clone()).await {
+            eprintln!("carrot: portal: {e}; reconnecting in {wait}s");
+        }
+        *state.portal.borrow_mut() = None;
+        let deadline = crate::util::Time::from_nsec(crate::util::Time::now().nsec() + wait * 1_000_000_000);
+        let _ = ring.timeout(deadline).await;
+        // a connection that held for a minute earns a fresh backoff
+        if crate::util::Time::now().nsec().saturating_sub(started) > 60_000_000_000 {
+            wait = 1;
+        } else {
+            wait = (wait * 2).min(30);
+        }
     }
 }
 

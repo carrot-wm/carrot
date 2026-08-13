@@ -57,6 +57,9 @@ pub struct State {
     pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
     /// live portal screencasts, fed from the present tail
     pub casts: RefCell<Vec<Rc<crate::portal::cast::Cast>>>,
+    /// the portal's session-bus connection; cast death announces
+    /// Session.Closed through it so the frontend never nurses a corpse
+    pub portal: RefCell<Option<Rc<crate::dbus::DbusConn>>>,
     /// the last config-loaded ipc event, replayed to new subscribers
     pub last_config_event: RefCell<Option<String>>,
     /// a hidden-cast source committed; the cast tick task drains it
@@ -146,6 +149,7 @@ impl State {
             ext_workspace_managers: RefCell::new(Vec::new()),
             icc_sessions: RefCell::new(Vec::new()),
             casts: RefCell::new(Vec::new()),
+            portal: RefCell::new(None),
             last_config_event: RefCell::new(None),
             cast_kick: AsyncEvent::default(),
             cast_tick: std::cell::Cell::new(None),
