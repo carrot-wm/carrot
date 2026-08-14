@@ -203,6 +203,13 @@ impl Display {
                 let (hx, hy) = cur.hotspot.get();
                 cur.set_enabled(true);
                 cur.set_position(x - ox - hx, y - oy - hy);
+                // an embedded-cursor cast composites the pointer from the
+                // frame; plane moves make no damage, so nudge one or the
+                // streamed cursor freezes between app redraws. presents
+                // coalesce and the cast rate gate caps the actual serves
+                if crate::portal::cast::any_embedded_cursor(state) {
+                    state.damage.trigger();
+                }
             } else {
                 cur.set_enabled(false);
             }

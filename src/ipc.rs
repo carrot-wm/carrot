@@ -579,6 +579,8 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
     crate::tree::relayout(state, &ws);
     crate::shell::layer::arrange(state);
     state.damage.trigger();
+    // hidden-refresh/fps policy changes bite on the next tick pass
+    state.cast_kick.trigger();
     config_event(state, false, &[], &cold);
     Ok(())
 }

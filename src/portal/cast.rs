@@ -102,12 +102,31 @@ pub async fn start(
         let node = node.clone();
         let dead = dead.clone();
         let failed = failed.clone();
+        let st = state.clone();
         async move {
-            if let Err(e) = crate::pipewire::pump_node(&con, &node).await {
+            let res: Result<(), crate::pipewire::PwError> = async {
+                loop {
+                    let was_ready = node.borrow().ready();
+                    crate::pipewire::pump_step(&con, &node).await?;
+                    if !was_ready && node.borrow().ready() {
+                        // negotiation just completed: nothing else kicks
+                        // an on-glass cast's first frame, and without this
+                        // the app shows black until unrelated damage lands
+                        st.damage.trigger();
+                        st.cast_kick.trigger();
+                    }
+                }
+            }
+            .await;
+            if let Err(e) = res {
                 eprintln!("carrot: cast: {e}");
                 *failed.borrow_mut() = Some(e);
             }
             dead.set(true);
+            // the tick sweeps and announces the death; kick it now rather
+            // than waiting for the next present or hidden commit. sweeping
+            // from here would drop this very task mid-poll
+            st.cast_kick.trigger();
         }
     });
     // BoundId lands whenever the export completes, not inside our sync
@@ -130,6 +149,8 @@ pub async fn start(
     let resizer = state.eng.spawn("cast resize", {
         let node = node.clone();
         let q = resize_req.clone();
+        let dead = dead.clone();
+        let st = state.clone();
         async move {
             loop {
                 // coalesce a burst to its last size: replaying every
@@ -139,7 +160,15 @@ pub async fn start(
                 while let Some(next) = q.try_pop() {
                     (w, h) = next;
                 }
-                let _ = SourceNode::resize(&node, w, h).await;
+                if let Err(e) = SourceNode::resize(&node, w, h).await {
+                    // the daemon connection failed under us; end the
+                    // cast cleanly instead of leaving format_set false
+                    // forever with the stream half-negotiated
+                    eprintln!("carrot: cast resize: {e}");
+                    dead.set(true);
+                    st.cast_kick.trigger();
+                    return;
+                }
             }
         }
     });
@@ -164,6 +193,11 @@ pub async fn start(
         _resizer: resizer,
     });
     state.casts.borrow_mut().push(cast.clone());
+    // a hidden x source must leave iconified state to paint for us
+    crate::tree::sync_x_visibility(state);
+    // first frame now: an on-glass cast of a static screen otherwise
+    // waits for unrelated damage while the app shows black
+    state.damage.trigger();
     // a source born off-glass owes the tick its first frames: no glass
     // change or visible commit will ever come to mark it dirty
     if !cast.on_glass(state) {
@@ -258,13 +292,21 @@ async fn tick_loop(state: Rc<State>) {
         loop {
             let casts: Vec<Rc<Cast>> = state.casts.borrow().clone();
             let mut earliest: Option<u64> = None;
-            let mut sweep = false;
+            // any dead cast sweeps, dirty or not: a clean corpse used to
+            // linger holding its x-visibility pin until unrelated traffic
+            let sweep = casts.iter().any(|c| c.dead.get());
             for c in casts.iter().filter(|c| c.dirty.get()) {
                 if c.dead.get() {
-                    sweep = true;
                     continue;
                 }
                 if c.on_glass(&state) {
+                    c.dirty.set(false);
+                    continue;
+                }
+                if !state.config.borrow().screencast.hidden_refresh {
+                    // policy: hidden sources freeze at their last frame.
+                    // clear rather than hold, or the flag flipping back
+                    // on would replay a stale backlog at once
                     c.dirty.set(false);
                     continue;
                 }
@@ -296,7 +338,7 @@ async fn tick_loop(state: Rc<State>) {
                 }
             }
             if sweep {
-                state.casts.borrow_mut().retain(|c| !c.dead.get());
+                reap_dead(&state);
             }
             match earliest {
                 Some(t) => {
@@ -508,8 +550,59 @@ pub fn output_presented(state: &Rc<State>, name: &str) {
         })));
     }
     if sweep {
-        state.casts.borrow_mut().retain(|c| !c.dead.get());
+        reap_dead(state);
     }
+}
+
+/// sweep dead casts, release their x-visibility pins, and tell the
+/// frontend each session is over: without Session.Closed the app keeps
+/// a live-looking share over a corpse until a human notices
+fn reap_dead(state: &Rc<State>) {
+    let dead: Vec<Rc<Cast>> = state
+        .casts
+        .borrow()
+        .iter()
+        .filter(|c| c.dead.get())
+        .cloned()
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    state.casts.borrow_mut().retain(|c| !c.dead.get());
+    crate::tree::sync_x_visibility(state);
+    if let Some(conn) = state.portal.borrow().as_ref() {
+        for c in &dead {
+            conn.emit_signal(&c.session, "org.freedesktop.impl.portal.Session", "Closed");
+        }
+    }
+}
+
+/// any live cast embeds the pointer in its frames. hardware-plane cursor
+/// motion bypasses rendering entirely, so without a damage nudge the
+/// streamed cursor freezes between app redraws and teleports on the next
+pub fn any_embedded_cursor(state: &Rc<State>) -> bool {
+    state
+        .casts
+        .borrow()
+        .iter()
+        .any(|c| !c.dead.get() && c.cursor)
+}
+
+/// a live cast streams this window, or the whole workspace it sits on;
+/// the visibility policy keeps such windows painting while hidden
+pub fn captures_window(state: &Rc<State>, win: &Rc<crate::tree::Window>, ws_index: usize) -> bool {
+    state.casts.borrow().iter().any(|c| {
+        if c.dead.get() {
+            return false;
+        }
+        match &c.source {
+            Source::Window { win: weak, .. } => {
+                weak.upgrade().is_some_and(|w| Rc::ptr_eq(&w, win))
+            }
+            Source::Workspace(i) => *i == ws_index,
+            _ => false,
+        }
+    })
 }
 
 /// exclusive right to run one serve for a cast; dropping it on any path,
@@ -571,6 +664,11 @@ impl Cast {
                     return;
                 }
                 let Some((idx, w, h)) = crate::output::output_geometry(state, name) else {
+                    // the shared monitor is gone. ending the session is
+                    // the honest outcome: retargeting silently would
+                    // stream content nobody consented to
+                    self.dead.set(true);
+                    state.cast_kick.trigger();
                     return;
                 };
                 (Cap::Out(idx), w, h)
@@ -578,6 +676,8 @@ impl Cast {
             Source::Window { win, .. } => {
                 let Some(win) = win.upgrade() else {
                     self.dead.set(true);
+                    // the tick sweeps and announces; kick it now
+                    state.cast_kick.trigger();
                     return;
                 };
                 if !win.surface().mapped.get() {
@@ -603,6 +703,8 @@ impl Cast {
             Source::Workspace(index) => {
                 let Some(ws) = state.workspaces.borrow().get(*index).cloned() else {
                     self.dead.set(true);
+                    // the tick sweeps and announces; kick it now
+                    state.cast_kick.trigger();
                     return;
                 };
                 let Some(shown) = shown_workspace(state, presented) else {
@@ -713,7 +815,18 @@ impl Cast {
             Source::Output(_) => true,
             Source::Window { win, .. } => match win.upgrade() {
                 Some(win) => match crate::tree::workspace_of(state, &win) {
-                    Some(ws) => ws_shown(state, &ws),
+                    Some(ws) => {
+                        // a fullscreen sibling hides this window even on
+                        // the shown workspace: the present composes only
+                        // the fullscreen slot, so the tick must own the
+                        // feed and the heartbeat or the stream freezes
+                        let obscured = ws
+                            .fullscreen
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|f| !Rc::ptr_eq(f, &win));
+                        ws_shown(state, &ws) && !obscured
+                    }
                     None => true,
                 },
                 None => true,
@@ -788,6 +901,21 @@ fn ws_shown(state: &Rc<State>, ws: &Rc<Workspace>) -> bool {
 
 /// frame callbacks for a whole surface tree: the tick is the only
 /// heartbeat a fully hidden client has
+/// the window's workspace is the one on glass on its output
+pub(crate) fn window_on_shown_ws(state: &Rc<State>, win: &Rc<Window>) -> bool {
+    match crate::tree::workspace_of(state, win) {
+        Some(ws) => ws_shown(state, &ws),
+        None => true,
+    }
+}
+
+/// heartbeat for a hidden captured window: fire its tree's callbacks so
+/// callback-paced clients keep committing for the capture's benefit
+pub(crate) fn fire_win_tree(win: &Rc<Window>) {
+    let ms = (Time::now().nsec() / 1_000_000) as u32;
+    fire_tree(&win.surface(), ms);
+}
+
 fn fire_tree(s: &Rc<crate::surface::WlSurface>, ms: u32) {
     s.fire_frame_callbacks(ms);
     let children = s.children.borrow();

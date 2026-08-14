@@ -304,6 +304,14 @@ impl DbusConn {
         self.out.push((b.finish(), fds));
     }
 
+    /// broadcast a bodyless signal; the portal's Session.Closed rides this
+    pub fn emit_signal(&self, path: &str, iface: &str, member: &str) {
+        let serial = self.next_serial();
+        let mut b = wire::MsgBuilder::signal(serial, path, iface, member);
+        b.finish_header();
+        self.out.push((b.finish(), Vec::new()));
+    }
+
     pub fn reply_err(&self, call: &MethodCall, name: &str, text: &str) {
         let serial = self.next_serial();
         let mut b = wire::MsgBuilder::error_msg(serial, call.serial, &call.sender, name);

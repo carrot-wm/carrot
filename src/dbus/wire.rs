@@ -48,6 +48,15 @@ impl MsgBuilder {
         Self::msg(METHOD_CALL, serial, flags)
     }
 
+    /// broadcast signal on `path`; listeners match interface + member
+    pub fn signal(serial: u32, path: &str, iface: &str, member: &str) -> MsgBuilder {
+        let mut b = Self::msg(SIGNAL, serial, NO_REPLY_EXPECTED);
+        b.path(path);
+        b.interface(iface);
+        b.member(member);
+        b
+    }
+
     pub fn method_return(serial: u32, reply_to: u32, dest: &str) -> MsgBuilder {
         let mut b = Self::msg(METHOD_RETURN, serial, 1);
         b.field_u32(F_REPLY_SERIAL, reply_to);
