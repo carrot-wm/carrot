@@ -198,6 +198,11 @@ impl<T> AsyncQueue<T> {
         Pop(self)
     }
 
+    /// non-blocking pop; burst consumers coalesce with it
+    pub fn try_pop(&self) -> Option<T> {
+        self.items.borrow_mut().pop_front()
+    }
+
     pub fn clear(&self) {
         self.items.borrow_mut().clear();
         self.waker.take();

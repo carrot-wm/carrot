@@ -1719,7 +1719,9 @@ pub fn switching(state: &Rc<State>, name: &str) -> bool {
 /// output-local full rect + size lookup for the screencopy protocol
 pub fn output_geometry(state: &Rc<State>, name: &str) -> Option<(usize, u32, u32)> {
     let d = state.display.borrow();
-    let outs = d.as_ref()?.outputs.borrow().clone();
+    let d = d.as_ref()?;
+    let outs = d.outputs.borrow();
+    // no clone: this runs per cast serve and used to copy the vec
     outs.iter()
         .find(|o| o.conn.name == name)
         .map(|o| (o.index.get(), o.width, o.height))
@@ -3646,7 +3648,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                         // scanout frame still owes them the new-frame kick
                         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
                         crate::protocol::session_lock::output_presented(state, &out.conn.name);
-                        crate::portal::cast::output_presented(state, &out.conn.name).await;
+                        crate::portal::cast::output_presented(state, &out.conn.name);
                         continue;
                     }
                     Ok(FlipResult::NotPresented) => {
@@ -4192,7 +4194,7 @@ async fn gpu_cleanup_loop(state: &Rc<State>, out: &Rc<Output>) {
         // pending output captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
         crate::protocol::session_lock::output_presented(state, &out.conn.name);
-        crate::portal::cast::output_presented(state, &out.conn.name).await;
+        crate::portal::cast::output_presented(state, &out.conn.name);
     }
 }
 

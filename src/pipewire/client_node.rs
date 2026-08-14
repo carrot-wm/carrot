@@ -550,12 +550,14 @@ impl SourceNode {
     }
 
     /// hand the next buffer to the graph: `fill` paints the pixels, then
-    /// chunk, header, io status, and every peer's activation eventfd
-    pub fn produce(&mut self, fill: impl FnOnce(&mut [u8], usize)) {
+    /// chunk, header, io status, and every peer's activation eventfd.
+    /// false = the node has nothing to deliver into (mid-renegotiation,
+    /// buffers revoked); the frame is the caller's to retry or drop
+    pub fn produce(&mut self, fill: impl FnOnce(&mut [u8], usize)) -> bool {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let Some((_, io)) = &self.io else { return };
+        let Some((_, io)) = &self.io else { return false };
         if self.buffers.is_empty() {
-            return;
+            return false;
         }
         let io = *io;
         let cur = unsafe { (*(io.add(4) as *const AtomicU32)).load(Ordering::Relaxed) };
@@ -603,6 +605,7 @@ impl SourceNode {
                 }
             }
         }
+        true
     }
 }
 

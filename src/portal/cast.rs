@@ -17,6 +17,7 @@ const PROXY_ID: u32 = 2;
 /// this is how long a cast waits for its BoundId
 const BIND_WAIT_NS: u64 = 5_000_000_000;
 
+
 /// what a session's token restores; windows match by ident in-session and
 /// by app id + title across restarts (idents reset with the compositor).
 /// the tag shape is the on-disk token format - change it and old tokens die
@@ -60,8 +61,10 @@ pub struct Cast {
     /// paint the pointer into the frames (portal cursor mode EMBEDDED)
     cursor: bool,
     node: Rc<RefCell<SourceNode>>,
-    /// presents can outpace the negotiated rate; feed() gates on this
-    frame_ns: u64,
+    /// the source's own rate (its output's vrefresh); pacing derives
+    /// from this and the config ceiling at each use, so a reload lands
+    /// on running casts
+    source_fps: u32,
     last: Cell<u64>,
     /// the size the resizer was last asked for; feed() pushes once per change
     resize_target: Cell<(u32, u32)>,
@@ -70,6 +73,10 @@ pub struct Cast {
     dead: Rc<Cell<bool>>,
     /// a hidden-source commit landed; the tick owes a frame
     dirty: Cell<bool>,
+    /// a present-tail serve is in flight; later presents coalesce
+    serving: Cell<bool>,
+    /// the detached serve task; held so it survives, dies with the cast
+    serve_task: Cell<Option<SpawnedFuture<()>>>,
     _pump: SpawnedFuture<()>,
     _resizer: SpawnedFuture<()>,
 }
@@ -125,7 +132,13 @@ pub async fn start(
         let q = resize_req.clone();
         async move {
             loop {
-                let (w, h) = q.pop().await;
+                // coalesce a burst to its last size: replaying every
+                // intermediate step renegotiates the stream per step
+                // and stalls it for the whole tail of the drag
+                let (mut w, mut h) = q.pop().await;
+                while let Some(next) = q.try_pop() {
+                    (w, h) = next;
+                }
                 let _ = SourceNode::resize(&node, w, h).await;
             }
         }
@@ -139,12 +152,14 @@ pub async fn start(
         source,
         cursor,
         node,
-        frame_ns: 1_000_000_000 / fps as u64,
+        source_fps: fps,
         last: Cell::new(0),
         resize_target: Cell::new((width, height)),
         resize_req,
         dead,
         dirty: Cell::new(false),
+        serving: Cell::new(false),
+        serve_task: Cell::new(None),
         _pump: pump,
         _resizer: resizer,
     });
@@ -253,16 +268,29 @@ async fn tick_loop(state: Rc<State>) {
                     c.dirty.set(false);
                     continue;
                 }
-                let due = c.last.get() + c.frame_ns - c.frame_ns / 10;
+                let ns = c.hidden_frame_ns(&state);
+                let due = c.last.get() + ns - ns / 10;
                 if Time::now().nsec() < due {
                     earliest = Some(earliest.map_or(due, |e: u64| e.min(due)));
                     continue;
                 }
-                if c.feed_hidden(&state).await {
-                    c.dirty.set(false);
-                } else {
-                    // stream blocked (negotiation, mid-resize): stay dirty
-                    // and poll again shortly, or the wakeup is lost
+                // a present-tail serve can still be mid-flight from before
+                // the source left the glass; feeding over it would race
+                // the node's buffers under that serve's capture await
+                let Some(_guard) = c.begin_serve() else {
+                    let retry = Time::now().nsec() + 50_000_000;
+                    earliest = Some(earliest.map_or(retry, |e: u64| e.min(retry)));
+                    continue;
+                };
+                // clear before the serve: a commit landing during the
+                // capture await re-marks and earns its own pass, where
+                // clearing after would swallow it with the frame it missed
+                c.dirty.set(false);
+                if !c.feed_hidden(&state).await {
+                    // stream blocked (negotiation, mid-resize, consumer
+                    // holding every buffer): stay dirty and poll again
+                    // shortly, or the wakeup is lost
+                    c.dirty.set(true);
                     let retry = Time::now().nsec() + 50_000_000;
                     earliest = Some(earliest.map_or(retry, |e: u64| e.min(retry)));
                 }
@@ -440,25 +468,89 @@ fn shown_workspace(state: &Rc<State>, name: &str) -> Option<Rc<Workspace>> {
 }
 
 /// present tail: the frame just shown is what casts of this output stream
-pub async fn output_presented(state: &Rc<State>, name: &str) {
+pub fn output_presented(state: &Rc<State>, name: &str) {
     if state.casts.borrow().is_empty() {
         return;
     }
     let casts: Vec<Rc<Cast>> = state.casts.borrow().clone();
     let mut sweep = false;
+    let now = Time::now().nsec();
     for c in &casts {
         if c.dead.get() {
             sweep = true;
             continue;
         }
-        c.feed(state, name).await;
+        // the cheap gates run before any task spawns: at 480Hz presents
+        // the spawn itself (plus its string and vec clones) was real
+        // churn, and most presents have nothing for a cast to do
+        let ns = c.frame_ns(state);
+        if now.saturating_sub(c.last.get()) < ns - ns / 10 {
+            continue;
+        }
+        {
+            let n = c.node.borrow();
+            if !n.ready() || !n.wants_frame() {
+                continue;
+            }
+        }
+        // the serve runs as its own task: the fence await inside must
+        // never hold up the present tail or the input reader. one serve
+        // per cast at a time; presents during it coalesce into the next
+        let Some(guard) = c.begin_serve() else {
+            continue;
+        };
+        let st = state.clone();
+        let cc = c.clone();
+        let n = name.to_string();
+        c.serve_task.set(Some(state.eng.spawn("cast serve", async move {
+            let _guard = guard;
+            cc.feed(&st, &n).await;
+        })));
     }
     if sweep {
         state.casts.borrow_mut().retain(|c| !c.dead.get());
     }
 }
 
+/// exclusive right to run one serve for a cast; dropping it on any path,
+/// including task cancellation, reopens the slot
+struct ServeGuard(Rc<Cast>);
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        self.0.serving.set(false);
+    }
+}
+
 impl Cast {
+    /// stream pacing: the source rate under the config ceiling. panel
+    /// refresh is not a stream rate - unset caps at 60, and a prompt
+    /// consumer must never pull captures at present rate
+    fn frame_ns(&self, state: &Rc<State>) -> u64 {
+        let cap = state.config.borrow().screencast.max_fps.unwrap_or(60).max(1);
+        1_000_000_000 / u64::from(self.source_fps.clamp(1, cap))
+    }
+
+    /// hidden feeds may pace slower still, per config
+    fn hidden_frame_ns(&self, state: &Rc<State>) -> u64 {
+        let ns = self.frame_ns(state);
+        match state.config.borrow().screencast.hidden_max_fps {
+            Some(f) => ns.max(1_000_000_000 / u64::from(f.max(1))),
+            None => ns,
+        }
+    }
+
+    /// claim the single serve slot, or None while another serve is mid-
+    /// flight. every path that can reach push_frame must hold this: two
+    /// concurrent serves race the node's buffers under the capture await
+    fn begin_serve(self: &Rc<Self>) -> Option<ServeGuard> {
+        if self.serving.get() {
+            return None;
+        }
+        self.serving.set(true);
+        Some(ServeGuard(self.clone()))
+    }
+
     /// what a fresh token for this cast should restore
     pub fn restore_data(&self) -> RestoreData {
         match &self.source {
@@ -551,22 +643,28 @@ impl Cast {
                 crate::trace!("cast: node not ready");
                 return false;
             }
-            // the consumer still holds the last frame: a render now is
-            // work nobody dequeues, and at present cadence that work is
-            // the whole-session stall. its dequeue rate paces us
-            if !n.wants_frame() {
-                return true;
-            }
         }
+        // the rate gate comes first: a consumer that dequeues promptly
+        // must never bypass it, or the feed runs at present rate
         let now = Time::now().nsec();
-        if now.saturating_sub(self.last.get()) < self.frame_ns - self.frame_ns / 10 {
+        let ns = self.frame_ns(state);
+        if now.saturating_sub(self.last.get()) < ns - ns / 10 {
             // fresh enough counts as fed
             return true;
         }
-        // the sink runs over the capture's mapped readback; the pixels
-        // are copied out once, into a frame-sized Vec for produce below
-        let sink = |px: &[u8], _cw: u32, _ch: u32| px.to_vec();
-        let px = match cap {
+        // the consumer still holds the last frame: a render now is
+        // work nobody dequeues, and at present cadence that work is
+        // the whole-session stall. its dequeue rate paces us - but the
+        // content was NOT delivered, so this reports blocked and the
+        // tick keeps the cast dirty: counting it as fed used to eat the
+        // final frame of every burst
+        if !self.node.borrow().wants_frame() {
+            return false;
+        }
+        // the sink runs over the capture's mapped readback: one copy,
+        // straight into the pipewire buffer, no frame-sized Vec between
+        let sink = |px: &[u8], cw: u32, ch: u32| self.deliver(cw, ch, px);
+        let delivered = match cap {
             Cap::Out(idx) => {
                 let Some(region) = crate::rect::Rect::new_sized(0, 0, w as i32, h as i32) else {
                     return false;
@@ -576,14 +674,37 @@ impl Cast {
             Cap::Ws(index) => crate::output::workspace_copy(state, index, sink).await,
             Cap::Win(win) => crate::output::window_capture(state, &win, sink).await,
         };
-        crate::trace!("cast: frame {} t={}", px.is_some(), Time::now().nsec());
-        let Some(px) = px else { return false };
-        self.node.borrow_mut().produce(|dst, _| {
-            let n = px.len().min(dst.len());
-            dst[..n].copy_from_slice(&px[..n]);
-        });
+        crate::trace!("cast: frame {:?} t={}", delivered, Time::now().nsec());
+        if !matches!(delivered, Some(true)) {
+            return false;
+        }
         self.last.set(now);
         true
+    }
+
+    /// revalidate the node against the geometry the pixels were rendered
+    /// for (the pump and the resizer were free to renegotiate during the
+    /// capture await), then deliver. a changed node keeps the frame dirty
+    /// and the next serve captures at the new size
+    fn deliver(&self, w: u32, h: u32, px: &[u8]) -> bool {
+        let mut n = self.node.borrow_mut();
+        if w != n.width || h != n.height || !n.ready() {
+            if crate::output::cap_diag() {
+                eprintln!(
+                    "carrot: cast: frame dropped, captured {}x{} vs node {}x{} ready={}",
+                    w,
+                    h,
+                    n.width,
+                    n.height,
+                    n.ready()
+                );
+            }
+            return false;
+        }
+        n.produce(|dst, _| {
+            let m = px.len().min(dst.len());
+            dst[..m].copy_from_slice(&px[..m]);
+        })
     }
 
     /// the present tail composes this source right now; the tick stays out
