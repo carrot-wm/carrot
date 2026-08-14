@@ -305,6 +305,8 @@ impl manager_v1::Handler for IccManager {
             Some((w, h)) => {
                 send_constraints(&sess, w, h);
                 state.icc_sessions.borrow_mut().push(sess);
+                // a hidden x source must leave iconified state to paint
+                crate::tree::sync_x_visibility(state);
             }
             None => {
                 // dead source: stopped instead of constraints
@@ -526,6 +528,8 @@ pub(crate) fn stop_session(state: &Rc<State>, sess: &Rc<IccSession>) {
         .icc_sessions
         .borrow_mut()
         .retain(|s| !Rc::ptr_eq(s, sess));
+    // a window pinned visible only for this session re-hides
+    crate::tree::sync_x_visibility(state);
 }
 
 fn send_ready(sess: &IccSession, frame_id: ObjectId, bw: u32, bh: u32) {
@@ -652,6 +656,15 @@ async fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
             sess.force.set(false);
             sess.served.set(crate::util::Time::now().nsec());
             send_ready(sess, frame.id, bw, bh);
+            // a hidden toplevel's only heartbeat is us: without frame
+            // callbacks after the serve, a callback-paced client commits
+            // once and the session stalls at that frame forever
+            if let SourceKind::Toplevel(weak) = &sess.source
+                && let Some(win) = weak.borrow().upgrade()
+                && !crate::portal::cast::window_on_shown_ws(state, &win)
+            {
+                crate::portal::cast::fire_win_tree(&win);
+            }
         }
         Some(Wrote::Stale) => {}
         Some(Wrote::Failed) | None => {
@@ -699,6 +712,7 @@ impl session_v1::Handler for IccSession {
             .icc_sessions
             .borrow_mut()
             .retain(|s| !(s.id == self.id && s.client.id == self.client.id));
+        crate::tree::sync_x_visibility(state);
         self.client.remove_obj(self.id)?;
         Ok(())
     }
@@ -905,6 +919,22 @@ impl Object for IccCursorSession {
 }
 
 // -- fan-out from the present/commit/hotplug paths --
+
+/// a live session captures this toplevel; the visibility policy keeps
+/// it painting while its workspace is hidden
+pub fn captures_window(state: &Rc<State>, win: &Rc<Window>) -> bool {
+    state.icc_sessions.borrow().iter().any(|s| {
+        if s.stopped.get() {
+            return false;
+        }
+        match &s.source {
+            SourceKind::Toplevel(weak) => {
+                weak.borrow().upgrade().is_some_and(|w| Rc::ptr_eq(&w, win))
+            }
+            _ => false,
+        }
+    })
+}
 
 /// end of a present: the output's content changed, pending captures complete
 pub fn output_presented(state: &Rc<State>, name: &str) {

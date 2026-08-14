@@ -2774,6 +2774,9 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
     // re-homed workspaces, and pagers learn it all as one atomic burst
     crate::protocol::ext_workspace::changed(state);
     crate::tree::sync_x_visibility(state);
+    // hotplug reshuffled which workspaces sit on glass; hidden casts
+    // must learn it or their clients freeze holding frame callbacks
+    crate::portal::cast::glass_changed(state);
     state.damage.trigger();
 }
 

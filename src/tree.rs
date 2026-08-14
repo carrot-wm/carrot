@@ -668,6 +668,9 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     crate::ipc::emit(state, &serde_json::json!({ "workspace": idx + 1 }));
     crate::protocol::ext_workspace::changed(state);
     sync_x_visibility(state);
+    // the reshuffled workspace may now be hidden; casts of it must fall
+    // to the tick or their clients freeze holding frame callbacks
+    crate::portal::cast::glass_changed(state);
     state.damage.trigger();
 }
 
@@ -786,6 +789,9 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
     crate::protocol::dmabuf::output_changed(state, &win);
     // the sent window may have landed on a hidden workspace
     sync_x_visibility(state);
+    // a cast of that workspace (or of the window itself) owes a frame,
+    // and a callback-holding client there would otherwise freeze
+    crate::portal::cast::glass_changed(state);
 }
 
 /// x windows follow the glass: a hidden workspace's windows unmap for
@@ -801,10 +807,23 @@ pub fn sync_x_visibility(state: &Rc<State>) {
         let shown = outs.get(ws.output.get()).is_some_and(|o| o.ws.get() == i);
         ws.for_each(|w| {
             if let Some(xw) = w.x11_opt() {
-                xw.set_wm_visible(shown);
+                // a hidden x window normally iconifies (that is what
+                // releases its pointer grabs), but an iconified client
+                // stops painting - a window feeding a live capture, or
+                // sitting on a workspace one streams, must stay Normal
+                // or the stream loses it
+                let pinned = !shown && x_capture_pinned(state, w, i);
+                xw.set_wm_visible(shown || pinned);
             }
         });
     }
+}
+
+/// a live capture consumer wants this window painting even while its
+/// workspace is hidden
+fn x_capture_pinned(state: &Rc<State>, win: &Rc<Window>, ws_index: usize) -> bool {
+    crate::portal::cast::captures_window(state, win, ws_index)
+        || crate::protocol::image_copy_capture::captures_window(state, win)
 }
 
 /// re-homes a workspace onto another output. assign is not activate: the
@@ -884,6 +903,9 @@ pub fn move_workspace_to_output(state: &Rc<State>, ws_idx: usize, dst: usize) {
     );
     crate::protocol::ext_workspace::changed(state);
     sync_x_visibility(state);
+    // the reshuffled workspace may now be hidden; casts of it must fall
+    // to the tick or their clients freeze holding frame callbacks
+    crate::portal::cast::glass_changed(state);
     state.damage.trigger();
 }
 
@@ -1268,6 +1290,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     );
     // an open-on-workspace rule may have pinned it to a hidden one
     sync_x_visibility(state);
+    crate::portal::cast::glass_changed(state);
     state.damage.trigger();
 }
 
