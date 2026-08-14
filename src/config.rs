@@ -283,10 +283,43 @@ pub struct CursorCfg {
     pub software: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+/// pointer treatment when the app leaves cursor_mode unset
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CursorDefault {
+    #[default]
+    Hidden,
+    Embedded,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScreencastCfg {
     /// the consent picker command; unset means click-to-select
     pub picker: Option<String>,
+    /// pointer in the frames when the app leaves the choice open
+    pub default_cursor: CursorDefault,
+    /// feed ceiling; unset caps at 60 - a 480Hz vrefresh is a panel
+    /// property, not a stream rate, and feeding at it starves the loop
+    pub max_fps: Option<u32>,
+    /// keep streaming workspaces and windows that are off glass;
+    /// off freezes a hidden source at its last frame
+    pub hidden_refresh: bool,
+    /// pace hidden feeds below the cast rate; unset means the cast rate
+    pub hidden_max_fps: Option<u32>,
+    /// hand out restore tokens; off makes every session re-consent
+    pub allow_restore: bool,
+}
+
+impl Default for ScreencastCfg {
+    fn default() -> Self {
+        ScreencastCfg {
+            picker: None,
+            default_cursor: CursorDefault::Hidden,
+            max_fps: None,
+            hidden_refresh: true,
+            hidden_max_fps: None,
+            allow_restore: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

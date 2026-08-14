@@ -185,10 +185,22 @@ prefer-no-csd
 //     DISPLAY #null
 // }
 
-// The screenshare picker is any dmenu-ish list command:
-// docs: https://carrotwm.org/docs/screensharing/
+// Screensharing. The picker is any dmenu-ish list command; the rest
+// shapes how casts feed: docs: https://carrotwm.org/docs/screensharing/
 // screencast {
 //     picker "fuzzel-pick"
+//     // pointer in the frames when the app leaves the choice open:
+//     // "hidden" (the portal default) or "embedded"
+//     default-cursor "hidden"
+//     // feed ceiling; unset caps at 60 - panel refresh is not a stream rate
+//     max-fps 60
+//     // keep streaming workspaces and windows that are off glass;
+//     // #false freezes a hidden source at its last frame
+//     hidden-refresh
+//     // pace hidden feeds below the cast rate
+//     hidden-max-fps 30
+//     // hand out restore tokens; #false makes every session re-consent
+//     allow-restore
 // }
 
 // -- rules --

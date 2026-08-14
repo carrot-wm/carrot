@@ -356,14 +356,19 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests,
                         );
                         return;
                     };
+                    let default_cursor = match state.config.borrow().screencast.default_cursor {
+                        crate::config::CursorDefault::Embedded => CURSOR_EMBEDDED,
+                        crate::config::CursorDefault::Hidden => CURSOR_HIDDEN,
+                    };
                     (
-                        s.cursor_mode.get().unwrap_or(CURSOR_HIDDEN) == CURSOR_EMBEDDED,
+                        s.cursor_mode.get().unwrap_or(default_cursor) == CURSOR_EMBEDDED,
                         s.persist.get(),
                         s.types.get(),
                         s.restore.borrow().clone(),
                     )
                 };
                 let picker_cmd = state.config.borrow().screencast.picker.clone();
+                let allow_restore = state.config.borrow().screencast.allow_restore;
                 // the node id comes from the daemon; the cast task replies
                 let (serial, dest) = (call.serial, call.sender.clone());
                 let me = me.clone();
@@ -386,7 +391,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests,
                     // token falls back to fresh consent, NEVER to whatever
                     // happens to be focused
                     let mut restored = true;
-                    let mut pick = restore.map(cast::Pick::Restored);
+                    let mut pick = restore.filter(|_| allow_restore).map(cast::Pick::Restored);
                     loop {
                     let p = match pick.take() {
                         Some(p) => p,
@@ -405,7 +410,7 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, requests: Requests,
                         Ok(cast) => {
                             // restore_data rides the frontend's permission
                             // store; it mints the app-facing token itself
-                            let restore = (persist > 0)
+                            let restore = (persist > 0 && allow_restore)
                                 .then(|| serde_json::to_string(&cast.restore_data()).ok())
                                 .flatten();
                             me.reply_to(serial, &dest, "ua{sv}", |b| {

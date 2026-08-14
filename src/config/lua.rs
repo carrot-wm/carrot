@@ -14,7 +14,7 @@
 // }
 
 use super::{
-    Action, Bind, BlurCfg, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
+    Action, Bind, BlurCfg, CenterFocus, ColWidthCfg, Config, CursorDefault, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
     LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch,
     SetLayoutArg, ShadowCfg, SpawnCfg, Vrr, WindowRule, WsAxis,
 };
@@ -877,6 +877,23 @@ fn screencast(v: &Value, cfg: &mut Config) -> Result<(), String> {
         let key = vstr(&k).ok_or("screencast keys must be strings")?;
         match key.as_str() {
             "picker" => cfg.screencast.picker = Some(need_str(&v, &key)?),
+            "default_cursor" => {
+                cfg.screencast.default_cursor = match need_str(&v, &key)?.as_str() {
+                    "hidden" => CursorDefault::Hidden,
+                    "embedded" => CursorDefault::Embedded,
+                    other => return Err(format!("unknown default_cursor `{other}`")),
+                }
+            }
+            "max_fps" => {
+                cfg.screencast.max_fps =
+                    Some(super::int_in(need_int(&v, &key)?, "max_fps", 1, 1000)? as u32);
+            }
+            "hidden_refresh" => cfg.screencast.hidden_refresh = need_bool(&v, &key)?,
+            "hidden_max_fps" => {
+                cfg.screencast.hidden_max_fps =
+                    Some(super::int_in(need_int(&v, &key)?, "hidden_max_fps", 1, 1000)? as u32);
+            }
+            "allow_restore" => cfg.screencast.allow_restore = need_bool(&v, &key)?,
             other => return Err(format!("unknown screencast key `{other}`")),
         }
     }
@@ -1302,7 +1319,14 @@ mod tests {
                 window-move { off }
             }
             output "DP-3" { mode "2560x1440@480"; variable-refresh-rate }
-            screencast { picker "fuzzel-pick" }
+            screencast {
+                picker "fuzzel-pick"
+                default-cursor "embedded"
+                max-fps 30
+                hidden-refresh #false
+                hidden-max-fps 10
+                allow-restore #false
+            }
             binds {
                 Mod+Return { spawn "foot"; }
                 Mod+1 { focus-workspace 1; }
@@ -1346,7 +1370,14 @@ mod tests {
                     window_move = { off = true },
                 },
                 outputs = { ["DP-3"] = { mode = "2560x1440@480", vrr = "always" } },
-                screencast = { picker = "fuzzel-pick" },
+                screencast = {
+                    picker = "fuzzel-pick",
+                    default_cursor = "embedded",
+                    max_fps = 30,
+                    hidden_refresh = false,
+                    hidden_max_fps = 10,
+                    allow_restore = false,
+                },
                 binds = {
                     { chord = "Mod+Return", action = "spawn", args = { "foot" } },
                     { chord = "Mod+1", action = "focus-workspace", args = { 1 } },

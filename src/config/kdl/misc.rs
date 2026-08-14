@@ -37,6 +37,42 @@ pub(super) fn parse(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
             for c in children(node) {
                 match c.name().value() {
                     "picker" => cfg.screencast.picker = cx.str_(c),
+                    "default-cursor" => match cx.str_(c).as_deref() {
+                        Some("hidden") => cfg.screencast.default_cursor = CursorDefault::Hidden,
+                        Some("embedded") => {
+                            cfg.screencast.default_cursor = CursorDefault::Embedded;
+                        }
+                        Some(other) => {
+                            cx.at(c, &format!("unknown default-cursor \"{other}\""));
+                        }
+                        None => {}
+                    },
+                    "max-fps" => {
+                        if let Some(v) = cx.int(c) {
+                            match int_in(v, "max-fps", 1, 1000) {
+                                Ok(v) => cfg.screencast.max_fps = Some(v as u32),
+                                Err(e) => cx.at(c, &e),
+                            }
+                        }
+                    }
+                    "hidden-refresh" => {
+                        if let Some(b) = cx.flag(c) {
+                            cfg.screencast.hidden_refresh = b;
+                        }
+                    }
+                    "hidden-max-fps" => {
+                        if let Some(v) = cx.int(c) {
+                            match int_in(v, "hidden-max-fps", 1, 1000) {
+                                Ok(v) => cfg.screencast.hidden_max_fps = Some(v as u32),
+                                Err(e) => cx.at(c, &e),
+                            }
+                        }
+                    }
+                    "allow-restore" => {
+                        if let Some(b) = cx.flag(c) {
+                            cfg.screencast.allow_restore = b;
+                        }
+                    }
                     other => cx.at(c, &format!("unknown screencast key \"{other}\"")),
                 }
             }
