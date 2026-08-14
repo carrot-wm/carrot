@@ -1017,10 +1017,13 @@ impl Xwm {
                 }
                 self.client_list_add(xwin.xid);
             }
-        } else if !mapped && in_tree && !(xwin.wm_iconic.get() && xwin.x_mapped.get()) {
-            // a wm-iconified window keeps its tree slot: its surface died
-            // with the unmap, but the client never withdrew, and the
-            // remap re-pairs a fresh surface into the same window
+        } else if !mapped && in_tree && !xwin.x_mapped.get() {
+            // eviction only follows a real client withdraw. while the x
+            // side stays mapped, a dead surface is a map-cycle transit:
+            // a wm-iconified window keeps its tree slot, and so does a
+            // reviving one whose fresh surface hasn't committed yet -
+            // evicting there re-inserts the window at a default position
+            // and the layout forgets everything it knew
             let win = xwin.window.borrow_mut().take().unwrap();
             // unmap_window finds the workspace that really holds it; the
             // active one may have changed since map (workspace switches,
