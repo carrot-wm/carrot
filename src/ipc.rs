@@ -1119,6 +1119,58 @@ fn binds_json(state: &Rc<State>) -> Value {
 }
 
 #[cfg(test)]
+mod burrow_contract {
+    use crate::config::{Action, Dir};
+
+    /// exactly what src/bin/burrow.rs puts on the wire. burrow is a separate
+    /// binary with no lib to share, so this is the pin: rename an Action
+    /// variant and the verb that sends it fails here instead of silently
+    /// becoming a no-op at runtime, which is how five of them died before
+    #[test]
+    fn every_burrow_verb_parses_as_an_action() {
+        let cases: &[(&str, Action)] = &[
+            (r#"{"focus-workspace":2}"#, Action::FocusWorkspace(2)),
+            (r#"{"focus-workspace-rel":1}"#, Action::FocusWorkspaceRel(1)),
+            (r#"{"focus-workspace-rel":-1}"#, Action::FocusWorkspaceRel(-1)),
+            (r#"{"send-to-workspace":2}"#, Action::SendToWorkspace(2)),
+            (r#"{"move-to-workspace":2}"#, Action::MoveToWorkspace(2)),
+            (r#"{"adjust-split-ratio":0.05}"#, Action::AdjustSplitRatio(0.05)),
+            (
+                r#"{"spawn":["foot","-e","bash"]}"#,
+                Action::Spawn(vec!["foot".into(), "-e".into(), "bash".into()]),
+            ),
+            (r#"{"focus-dir":"left"}"#, Action::FocusDir(Dir::Left)),
+            (r#"{"swap-dir":"right"}"#, Action::SwapDir(Dir::Right)),
+            (r#""toggle-fullscreen""#, Action::ToggleFullscreen),
+            (r#""toggle-floating""#, Action::ToggleFloating),
+            (r#""close-window""#, Action::CloseWindow),
+            (r#""focus-next""#, Action::FocusNext),
+            (r#""focus-prev""#, Action::FocusPrev),
+            (r#""quit""#, Action::Quit),
+        ];
+        for (wire, want) in cases {
+            let got: Action = serde_json::from_str(wire)
+                .unwrap_or_else(|e| panic!("burrow sends {wire}, which no longer parses: {e}"));
+            assert_eq!(&got, want, "{wire}");
+        }
+    }
+
+    /// every query burrow can send must be answered. driving handle()
+    /// directly means the list cannot drift away from the real dispatch
+    #[test]
+    fn every_burrow_query_is_answered() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        for q in [
+            "monitors", "outputs", "workspaces", "windows", "clients", "errors", "binds",
+        ] {
+            let line = format!("\"{q}\"");
+            let r = super::handle(&state, &line);
+            assert!(r.is_ok(), "burrow offers \"{q}\" but handle() rejects it: {r:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod v2_shapes {
     use super::*;
 
