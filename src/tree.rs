@@ -1274,6 +1274,9 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     }
     crate::protocol::foreign_toplevel::window_mapped(state, win);
     crate::ipc::window_event(state, "window-opened", win);
+    if let Some(ws) = workspace_of(state, win) {
+        crate::ipc::columns_event(state, &ws);
+    }
     // an open-on-workspace rule may have pinned it to a hidden one
     sync_x_visibility(state);
     crate::portal::cast::glass_changed(state);
@@ -1319,9 +1322,9 @@ pub(crate) fn workspace_of(state: &Rc<State>, win: &Rc<Window>) -> Option<Rc<Wor
 
 pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
     let ws = workspace_of(state, win).unwrap_or_else(|| active(state));
-    // column ids arrive with the strip topology work; until then the close
-    // event carries no column
-    let closed_col: Option<(u32, usize)> = None;
+    // captured before the tiling drops it: the close event still names the
+    // column the window was living in
+    let closed_col = ws.tiling.column_of(win);
     let closed_ws = state
         .workspaces
         .borrow()
@@ -1408,6 +1411,7 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
     }
     crate::protocol::foreign_toplevel::window_unmapped(state, &win);
     crate::ipc::window_closed_event(state, win, closed_ws, closed_col);
+    crate::ipc::columns_event(state, &ws);
     state.damage.trigger();
 }
 

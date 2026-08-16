@@ -23,6 +23,24 @@ impl Layout {
         self.mode.set(m);
     }
 
+    /// stable column id and strip position for a window, when the mode has
+    /// columns at all. dwindle is a bsp tree with no column concept, so it
+    /// reports None and the wire carries null
+    pub fn column_of(&self, win: &Window) -> Option<(u32, usize)> {
+        match self.mode.get() {
+            LayoutMode::Dwindle => None,
+            LayoutMode::Scrolling => self.strip.column_of(win),
+        }
+    }
+
+    /// strip topology as (column id, window ids), empty for dwindle
+    pub fn columns(&self) -> Vec<(u32, Vec<u64>)> {
+        match self.mode.get() {
+            LayoutMode::Dwindle => Vec::new(),
+            LayoutMode::Scrolling => self.strip.columns(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         match self.mode.get() {
             LayoutMode::Dwindle => self.dwindle.is_empty(),

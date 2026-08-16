@@ -181,7 +181,32 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
     }
 }
 
+/// verbs that reshape the strip: the shell redraws column topology off
+/// one event instead of re-querying every window
+fn reshapes_columns(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::MoveColumnLeft
+            | Action::MoveColumnRight
+            | Action::MoveColumnToFirst
+            | Action::MoveColumnToLast
+            | Action::ConsumeOrExpelLeft
+            | Action::ConsumeOrExpelRight
+            | Action::ConsumeIntoColumn
+            | Action::ExpelFromColumn
+            | Action::SwapDir(_)
+            | Action::SetLayout(_)
+    )
+}
+
 pub fn dispatch_action(state: &Rc<State>, action: &Action) {
+    dispatch_inner(state, action);
+    if reshapes_columns(action) {
+        crate::ipc::columns_event(state, &crate::tree::active(state));
+    }
+}
+
+fn dispatch_inner(state: &Rc<State>, action: &Action) {
     match action {
         Action::FocusWorkspace(n) => crate::tree::switch_workspace(state, *n),
         Action::FocusWorkspaceRel(d) => crate::tree::switch_workspace_rel(state, *d),
@@ -745,6 +770,11 @@ fn window_json(
     // tile it will return to
     let r = win.draw_rect(state);
     let s = win.surface();
+    let (col, col_idx) = match ws.tiling.column_of(win) {
+        Some((id, i)) => (json!(id), json!(i)),
+        // dwindle is a bsp tree with no columns; null, not zero
+        None => (Value::Null, Value::Null),
+    };
     let focused = focus.is_some_and(|f| Rc::ptr_eq(f, &s));
     let mut v = json!({
         "id": s.uid,
@@ -753,6 +783,8 @@ fn window_json(
         "pid": s.client.pid,
         "workspace": ws_idx + 1,
         "output": output,
+        "column": col,
+        "column-index": col_idx,
         "geometry": { "x": r.x1, "y": r.y1, "w": r.width(), "h": r.height() },
         "state": {
             "focused": focused,
@@ -973,6 +1005,26 @@ pub fn workspace_event(state: &Rc<State>, event: &str, idx: usize) {
     });
 }
 
+/// strip topology after anything that moves windows between columns or
+/// reorders the strip
+pub fn columns_event(state: &Rc<State>, ws: &Ws) {
+    emit_cat(state, Cat::Columns, || {
+        let idx = ws_index(state, ws);
+        let cols: Vec<Value> = ws
+            .tiling
+            .columns()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, wins))| json!({ "column": id, "column-index": i, "windows": wins }))
+            .collect();
+        json!({
+            "event": "column-layout-changed",
+            "workspace": idx + 1,
+            "columns": cols,
+        })
+    });
+}
+
 pub fn outputs_event(state: &Rc<State>) {
     emit_cat(state, Cat::Outputs, || {
         json!({ "event": "outputs-changed", "outputs": outputs_json(state) })
@@ -1101,7 +1153,8 @@ mod v2_shapes {
 
         let v = window_json(&state, &ws, 0, Some("DP-1"), &win, None, false);
         for key in [
-            "id", "title", "app-id", "pid", "workspace", "output", "geometry", "state",
+            "id", "title", "app-id", "pid", "workspace", "output", "column",
+            "column-index", "geometry", "state",
         ] {
             assert!(v.get(key).is_some(), "window record is missing {key}");
         }
@@ -1114,6 +1167,9 @@ mod v2_shapes {
         for key in ["x", "y", "w", "h"] {
             assert!(v["geometry"].get(key).is_some(), "geometry is missing {key}");
         }
+        // a scrolling workspace puts it in a real column
+        assert!(v["column"].is_u64(), "scrolling window has a column id");
+        assert_eq!(v["column-index"], serde_json::json!(0));
         assert_eq!(v["workspace"], serde_json::json!(1), "1-based on the wire");
 
         // the query form keeps the deprecated flat keys
@@ -1121,6 +1177,20 @@ mod v2_shapes {
         for key in ["x", "y", "w", "h", "floating", "fullscreen", "focused"] {
             assert!(legacy.get(key).is_some(), "-j clients lost {key}");
         }
+    }
+
+    #[test]
+    fn a_dwindle_window_reports_no_column() {
+        let (state, client) = crate::client::test_utils::test_client();
+        let base = crate::shell::xdg::tests::mk_base(&client, 500);
+        let (_s, _x, tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 501, 502, 503);
+        let win = Rc::new(crate::tree::Window::new(&state, crate::tree::WindowKind::Xdg(tl)));
+        let ws = crate::tree::active(&state);
+        ws.tiling.insert(&win, 0, 0, &state.config.borrow().layout.scrolling);
+        let v = window_json(&state, &ws, 0, None, &win, None, false);
+        // null, not 0: a shell must not render a phantom column
+        assert!(v["column"].is_null(), "dwindle has no columns");
+        assert!(v["column-index"].is_null());
     }
 
     #[test]

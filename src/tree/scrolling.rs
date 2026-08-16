@@ -14,6 +14,9 @@ pub enum ColWidth {
 }
 
 pub struct Column {
+    /// stable across reorders and across the strip's Vec churn; wire ids
+    /// and array positions both move, this does not
+    pub id: u32,
     pub tiles: Vec<Rc<Window>>,
     pub active_tile: usize,
     pub width: ColWidth,
@@ -36,6 +39,21 @@ pub struct Strip {
     last_area: Cell<Rect>,
 }
 
+/// monotone column ids, never reused within a session. same reasoning as
+/// the surface uids: a consumer caching by id must never collide with a
+/// recycled one
+fn next_column_id() -> u32 {
+    use std::cell::Cell;
+    thread_local! {
+        static NEXT: Cell<u32> = const { Cell::new(1) };
+    }
+    NEXT.with(|n| {
+        let id = n.get();
+        n.set(id.wrapping_add(1).max(1));
+        id
+    })
+}
+
 fn default_width(cfg: &ScrollCfg) -> (ColWidth, Option<usize>) {
     match cfg.default_width {
         ColWidthCfg::Prop(p) => {
@@ -47,6 +65,28 @@ fn default_width(cfg: &ScrollCfg) -> (ColWidth, Option<usize>) {
 }
 
 impl Strip {
+    /// stable id and current strip position of the column holding `win`.
+    /// the id survives reorders; the index does not, which is what lets a
+    /// shell tell "this column moved" from "the window changed column"
+    pub fn column_of(&self, win: &Window) -> Option<(u32, usize)> {
+        self.cols
+            .borrow()
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.tiles.iter().any(|t| std::ptr::eq(Rc::as_ptr(t), win)))
+            .map(|(i, c)| (c.id, i))
+    }
+
+    /// the whole strip as (column id, window ids) in strip order, for the
+    /// column-layout-changed event
+    pub fn columns(&self) -> Vec<(u32, Vec<u64>)> {
+        self.cols
+            .borrow()
+            .iter()
+            .map(|c| (c.id, c.tiles.iter().map(|t| t.surface().uid).collect()))
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.cols.borrow().is_empty()
     }
@@ -105,6 +145,7 @@ impl Strip {
         let mut cols = self.cols.borrow_mut();
         let (width, preset_idx) = default_width(cfg);
         let col = Column {
+            id: next_column_id(),
             tiles: vec![win.clone()],
             active_tile: 0,
             width,
@@ -131,6 +172,7 @@ impl Strip {
         let mut cols = self.cols.borrow_mut();
         let (width, preset_idx) = default_width(cfg);
         cols.push(Column {
+            id: next_column_id(),
             tiles: vec![win.clone()],
             active_tile: 0,
             width,
@@ -522,6 +564,7 @@ impl Strip {
             cols.insert(
                 at,
                 Column {
+                    id: next_column_id(),
                     tiles: vec![tile],
                     active_tile: 0,
                     width,
@@ -651,6 +694,7 @@ impl Strip {
         cols.insert(
             ci + 1,
             Column {
+                id: next_column_id(),
                 tiles: vec![tile],
                 active_tile: 0,
                 width,
@@ -1298,5 +1342,27 @@ mod tests {
         let r0 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[0])).unwrap().1;
         let r2 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[2])).unwrap().1;
         assert!(r2.x1 < r0.x1, "columns exchanged");
+    }
+
+    #[test]
+    fn column_ids_survive_a_reorder() {
+        let (_st, w) = setup(3);
+        let s = Strip::default();
+        for win in &w {
+            s.insert(win, &cfg());
+        }
+        s.layout(area(), &cfg());
+        let before: Vec<(u32, usize)> = w.iter().map(|x| s.column_of(x).unwrap()).collect();
+        // three windows, three columns, distinct ids in strip order
+        assert_eq!(before.iter().map(|c| c.1).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let ids: Vec<u32> = before.iter().map(|c| c.0).collect();
+        assert!(ids[0] != ids[1] && ids[1] != ids[2], "ids are distinct");
+
+        // carry the last column to the front: indices shift, ids do not
+        assert!(s.move_column_to_edge(&w[2], false));
+        let after: Vec<(u32, usize)> = w.iter().map(|x| s.column_of(x).unwrap()).collect();
+        assert_eq!(after.iter().map(|c| c.0).collect::<Vec<_>>(), ids, "ids are stable");
+        assert_eq!(after[2].1, 0, "the moved column is now first");
+        assert_eq!(after[0].1, 1, "the others shifted right");
     }
 }
