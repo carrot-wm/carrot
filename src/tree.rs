@@ -665,7 +665,7 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     // casts sourcing the workspace that just left the glass switch to
     // tick feeding; without the nudge a client mid-callback never wakes
     crate::portal::cast::glass_changed(state);
-    crate::ipc::emit(state, &serde_json::json!({ "workspace": idx + 1 }));
+    crate::ipc::workspace_event(state, "workspace-activated", idx);
     crate::protocol::ext_workspace::changed(state);
     sync_x_visibility(state);
     // the reshuffled workspace may now be hidden; casts of it must fall
@@ -891,16 +891,8 @@ pub fn move_workspace_to_output(state: &Rc<State>, ws_idx: usize, dst: usize) {
     if let Some(seat) = state.seat.borrow().clone() {
         seat.repick(state);
     }
-    let dst_name = state
-        .display
-        .borrow()
-        .as_ref()
-        .and_then(|d| d.outputs.borrow().get(dst).map(|o| o.conn.name.clone()))
-        .unwrap_or_default();
-    crate::ipc::emit(
-        state,
-        &serde_json::json!({ "workspace-moved": { "workspace": ws_idx + 1, "output": dst_name } }),
-    );
+    // the workspace record carries its own output name now
+    crate::ipc::workspace_event(state, "workspace-moved", ws_idx);
     crate::protocol::ext_workspace::changed(state);
     sync_x_visibility(state);
     // the reshuffled workspace may now be hidden; casts of it must fall
@@ -1281,13 +1273,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
         focus_window(state, Some(win));
     }
     crate::protocol::foreign_toplevel::window_mapped(state, win);
-    crate::ipc::emit(
-        state,
-        &serde_json::json!({ "window-opened": {
-            "title": win.title(),
-            "app-id": win.app_id(),
-        }}),
-    );
+    crate::ipc::window_event(state, "window-opened", win);
     // an open-on-workspace rule may have pinned it to a hidden one
     sync_x_visibility(state);
     crate::portal::cast::glass_changed(state);
@@ -1333,6 +1319,15 @@ pub(crate) fn workspace_of(state: &Rc<State>, win: &Rc<Window>) -> Option<Rc<Wor
 
 pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
     let ws = workspace_of(state, win).unwrap_or_else(|| active(state));
+    // column ids arrive with the strip topology work; until then the close
+    // event carries no column
+    let closed_col: Option<(u32, usize)> = None;
+    let closed_ws = state
+        .workspaces
+        .borrow()
+        .iter()
+        .position(|w| Rc::ptr_eq(w, &ws))
+        .unwrap_or(0);
     // remembered past the clear below: the close-anim skip and the rules
     // judge the window as it stood, not as the teardown left it
     let was_fullscreen = win.fullscreen.get();
@@ -1412,12 +1407,7 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
         focus_window(state, next.as_ref());
     }
     crate::protocol::foreign_toplevel::window_unmapped(state, &win);
-    crate::ipc::emit(
-        state,
-        &serde_json::json!({ "window-closed": {
-            "title": win.title(),
-        }}),
-    );
+    crate::ipc::window_closed_event(state, win, closed_ws, closed_col);
     state.damage.trigger();
 }
 
@@ -1468,7 +1458,7 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
     if let Some(seat) = state.seat.borrow().clone() {
         seat.repick(state);
     }
-    crate::ipc::emit(state, &serde_json::json!({ "fullscreen": on }));
+    crate::ipc::window_event(state, "window-fullscreen", win);
     crate::protocol::foreign_toplevel::state_changed(state, win);
     state.damage.trigger();
 }

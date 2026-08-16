@@ -830,6 +830,9 @@ pub fn arrange(state: &Rc<State>) {
         for ws in crate::tree::visible_workspaces(state) {
             crate::tree::relayout(state, &ws);
         }
+        // reserved edges moved, so a shell doing exclusive-zone math needs
+        // the new insets
+        crate::ipc::outputs_event(state);
         state.damage.trigger();
     }
     // surfaces moved under a stationary cursor

@@ -139,6 +139,7 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
     }
     match serde_json::from_str::<String>(line).as_deref() {
         Ok("monitors") => Ok(monitors_json(state)),
+        Ok("outputs") => Ok(outputs_json(state)),
         Ok("workspaces") => Ok(workspaces_json(state)),
         Ok("windows") => Ok(windows_json(state)),
         Ok("clients") => Ok(clients_json(state)),
@@ -517,7 +518,7 @@ pub fn config_event(state: &Rc<State>, failed: bool, errors: &[String], cold: &[
     let ev = json!({ "event": "config-loaded", "failed": failed,
                      "errors": errors, "cold-keys-pending": cold });
     *state.last_config_event.borrow_mut() = Some(ev.to_string());
-    emit(state, &ev);
+    emit_all(state, || ev.clone());
 }
 
 // a failed reload keeps the running config, never a default
@@ -641,89 +642,270 @@ fn monitors_json(state: &Rc<State>) -> Value {
 }
 
 fn workspaces_json(state: &Rc<State>) -> Value {
-    let list = state.workspaces.borrow();
+    let list = state.workspaces.borrow().clone();
     let ws: Vec<Value> = list
         .iter()
         .enumerate()
-        .map(|(i, w)| {
-            let mut count = 0;
-            w.for_each(|_| count += 1);
-            let output = state.display.borrow().as_ref().and_then(|d| {
-                d.outputs
-                    .borrow()
-                    .get(w.output.get())
-                    .map(|o| o.conn.name.clone())
-            });
-            json!({
-                "index": i + 1,
-                "windows": count,
-                "active": i == state.active_ws.get(),
-                "output": output,
-                "layout": match w.tiling.mode() {
-                    crate::config::LayoutMode::Dwindle => "dwindle",
-                    crate::config::LayoutMode::Scrolling => "scrolling",
-                },
-            })
-        })
+        .map(|(i, w)| workspace_json(state, i, w))
         .collect();
     json!(ws)
 }
 
 fn windows_json(state: &Rc<State>) -> Value {
-    let seat = state.seat.borrow().clone();
-    let focus = seat.and_then(|s| s.kb_focus.borrow().clone());
+    let focus = focused_surface(state);
     let ws = crate::tree::active(state);
-    let mut out = Vec::new();
+    let idx = state.active_ws.get();
+    let out = ws_output(state, &ws);
+    let mut list = Vec::new();
     ws.for_each(|w| {
-        // painted rect, matching the clients query: fullscreen reports
-        // where it draws, not the tile it will return to
-        let r = w.draw_rect(state);
-        out.push(json!({
-            "title": w.title(),
-            "app-id": w.app_id(),
-            "x": r.x1, "y": r.y1, "w": r.width(), "h": r.height(),
-            "floating": w.floating.get(),
-            "fullscreen": w.fullscreen.get(),
-            "focused": focus.as_ref().is_some_and(|f| Rc::ptr_eq(f, &w.surface())),
-        }));
+        list.push(window_json(state, &ws, idx, out.as_deref(), w, focus.as_ref(), true));
     });
-    json!(out)
+    json!(list)
 }
 
 /// every window on every workspace, with owner and placement detail;
 /// `windows` stays the light active-workspace view
 fn clients_json(state: &Rc<State>) -> Value {
-    let seat = state.seat.borrow().clone();
-    let focus = seat.and_then(|s| s.kb_focus.borrow().clone());
+    let focus = focused_surface(state);
     let list = state.workspaces.borrow().clone();
     let mut out = Vec::new();
     for (i, ws) in list.iter().enumerate() {
-        let output = state.display.borrow().as_ref().and_then(|d| {
-            d.outputs
-                .borrow()
-                .get(ws.output.get())
-                .map(|o| o.conn.name.clone())
-        });
+        let name = ws_output(state, ws);
         ws.for_each(|w| {
-            let r = w.draw_rect(state);
-            let s = w.surface();
-            out.push(json!({
-                "id": s.uid,
-                "title": w.title(),
-                "app-id": w.app_id(),
-                "pid": s.client.pid,
-                "workspace": i + 1,
-                "output": output,
-                "x": r.x1, "y": r.y1, "w": r.width(), "h": r.height(),
-                "floating": w.floating.get(),
-                "fullscreen": w.fullscreen.get(),
-                "xwayland": w.x11_opt().is_some(),
-                "mapped": s.mapped.get(),
-                "focused": focus.as_ref().is_some_and(|f| Rc::ptr_eq(f, &s)),
-            }));
+            out.push(window_json(state, ws, i, name.as_deref(), w, focus.as_ref(), true));
         });
     }
     json!(out)
+}
+
+// -- v2 record builders --
+//
+// one shape per thing, built once and fanned to every subscriber. events
+// carry whole records so a shell never re-queries; that is the entire
+// point of v2. `legacy` adds the flat pre-v2 keys that -j clients still
+// promises, so query consumers keep working while events stay lean.
+
+pub type Ws = Rc<crate::tree::workspace::Workspace>;
+
+fn ws_index(state: &Rc<State>, ws: &Ws) -> usize {
+    state
+        .workspaces
+        .borrow()
+        .iter()
+        .position(|w| Rc::ptr_eq(w, ws))
+        .unwrap_or(0)
+}
+
+fn ws_output(state: &Rc<State>, ws: &Ws) -> Option<String> {
+    state.display.borrow().as_ref().and_then(|d| {
+        d.outputs
+            .borrow()
+            .get(ws.output.get())
+            .map(|o| o.conn.name.clone())
+    })
+}
+
+fn focused_surface(state: &Rc<State>) -> Option<Rc<crate::surface::WlSurface>> {
+    let seat = state.seat.borrow().clone();
+    seat.and_then(|s| s.kb_focus.borrow().clone())
+}
+
+/// the canonical window record
+fn window_json(
+    state: &Rc<State>,
+    ws: &Ws,
+    ws_idx: usize,
+    output: Option<&str>,
+    win: &Rc<crate::tree::Window>,
+    focus: Option<&Rc<crate::surface::WlSurface>>,
+    legacy: bool,
+) -> Value {
+    // painted rect: a fullscreen window reports where it draws, not the
+    // tile it will return to
+    let r = win.draw_rect(state);
+    let s = win.surface();
+    let focused = focus.is_some_and(|f| Rc::ptr_eq(f, &s));
+    let mut v = json!({
+        "id": s.uid,
+        "title": win.title(),
+        "app-id": win.app_id(),
+        "pid": s.client.pid,
+        "workspace": ws_idx + 1,
+        "output": output,
+        "geometry": { "x": r.x1, "y": r.y1, "w": r.width(), "h": r.height() },
+        "state": {
+            "focused": focused,
+            "fullscreen": win.fullscreen.get(),
+            "floating": win.floating.get(),
+            "xwayland": win.x11_opt().is_some(),
+            "mapped": s.mapped.get(),
+        },
+    });
+    if legacy {
+        // pre-v2 flat keys. deprecated: read geometry{} and state{} instead
+        let m = v.as_object_mut().expect("object");
+        m.insert("x".into(), json!(r.x1));
+        m.insert("y".into(), json!(r.y1));
+        m.insert("w".into(), json!(r.width()));
+        m.insert("h".into(), json!(r.height()));
+        m.insert("floating".into(), json!(win.floating.get()));
+        m.insert("fullscreen".into(), json!(win.fullscreen.get()));
+        m.insert("xwayland".into(), json!(win.x11_opt().is_some()));
+        m.insert("mapped".into(), json!(s.mapped.get()));
+        m.insert("focused".into(), json!(focused));
+    }
+    v
+}
+
+/// the canonical workspace record
+fn workspace_json(state: &Rc<State>, i: usize, ws: &Ws) -> Value {
+    let mut count = 0;
+    ws.for_each(|_| count += 1);
+    json!({
+        "id": i + 1,
+        "index": i + 1,
+        "output": ws_output(state, ws),
+        "active": i == state.active_ws.get(),
+        "window-count": count,
+        // pre-v2 name for the same number; deprecated
+        "windows": count,
+        "layout": match ws.tiling.mode() {
+            crate::config::LayoutMode::Dwindle => "dwindle",
+            crate::config::LayoutMode::Scrolling => "scrolling",
+        },
+    })
+}
+
+/// name, geometry and the edges layer-shell reserved. transform and scale
+/// are reported for forward compatibility and are constant today: carrot
+/// implements neither output rotation nor fractional scale, so claiming
+/// anything else would be a lie a shell would act on
+fn output_json(out: &Rc<crate::output::Output>, focused: bool) -> Value {
+    let r = out.rect();
+    let u = out.usable.get();
+    let refresh = out
+        .conn
+        .pipe
+        .borrow()
+        .as_ref()
+        .map(|p| p.mode.vrefresh)
+        .unwrap_or(0);
+    json!({
+        "name": out.conn.name,
+        "x": r.x1,
+        "y": r.y1,
+        "width": out.width,
+        "height": out.height,
+        "scale": 1.0,
+        "transform": 0,
+        "refresh": refresh,
+        "workspace": out.ws.get() + 1,
+        "focused": focused,
+        // exclusive zones, as edge insets from the output rect
+        "reserved": {
+            "top": u.y1 - r.y1,
+            "bottom": r.y2 - u.y2,
+            "left": u.x1 - r.x1,
+            "right": r.x2 - u.x2,
+        },
+    })
+}
+
+fn outputs_json(state: &Rc<State>) -> Value {
+    let focused = state.focused_output.get();
+    let d = state.display.borrow();
+    let outs: Vec<Value> = d
+        .as_ref()
+        .map(|d| {
+            d.outputs
+                .borrow()
+                .iter()
+                .map(|o| output_json(o, o.index.get() == focused))
+                .collect()
+        })
+        .unwrap_or_default();
+    json!(outs)
+}
+
+// -- v2 event emitters --
+
+/// build once, fan to everyone. the closure never runs when nobody is
+/// listening, so an unsubscribed event costs a borrow
+fn emit_all(state: &Rc<State>, make: impl FnOnce() -> Value) {
+    let subs: Vec<Rc<Subscriber>> = state
+        .ipc_subs
+        .borrow()
+        .iter()
+        .filter(|s| !s.dead.get())
+        .cloned()
+        .collect();
+    if subs.is_empty() {
+        return;
+    }
+    let v = make();
+    for sub in subs {
+        sub.push(&v);
+    }
+}
+
+/// a whole-window event: opened, focused, fullscreen, moved
+pub fn window_event(state: &Rc<State>, event: &str, win: &Rc<crate::tree::Window>) {
+    emit_all(state, || {
+        let ws = crate::tree::workspace_of(state, win);
+        let (ws, idx) = match ws {
+            Some(w) => {
+                let i = ws_index(state, &w);
+                (w, i)
+            }
+            None => (crate::tree::active(state), state.active_ws.get()),
+        };
+        let out = ws_output(state, &ws);
+        let focus = focused_surface(state);
+        json!({
+            "event": event,
+            "window": window_json(state, &ws, idx, out.as_deref(), win, focus.as_ref(), false),
+        })
+    });
+}
+
+/// close carries only what still exists: the tree already forgot the
+/// window, so the caller hands us the column it was in
+pub fn window_closed_event(
+    state: &Rc<State>,
+    win: &Rc<crate::tree::Window>,
+    ws_idx: usize,
+    col: Option<(u32, usize)>,
+) {
+    emit_all(state, || {
+        json!({
+            "event": "window-closed",
+            "window": {
+                "id": win.surface().uid,
+                "title": win.title(),
+                "app-id": win.app_id(),
+                "workspace": ws_idx + 1,
+                "column": col.map(|c| c.0),
+                "column-index": col.map(|c| c.1),
+            },
+        })
+    });
+}
+
+pub fn workspace_event(state: &Rc<State>, event: &str, idx: usize) {
+    emit_all(state, || {
+        let ws = state.workspaces.borrow().get(idx).cloned();
+        let record = match ws {
+            Some(w) => workspace_json(state, idx, &w),
+            None => json!({ "index": idx + 1 }),
+        };
+        json!({ "event": event, "workspace": record })
+    });
+}
+
+pub fn outputs_event(state: &Rc<State>) {
+    emit_all(state, || {
+        json!({ "event": "outputs-changed", "outputs": outputs_json(state) })
+    });
 }
 
 // -- the event stream --
@@ -742,14 +924,19 @@ async fn subscribe(state: &Rc<State>, fd: &Rc<OwnedFd>) {
         kick: AsyncEvent::default(),
         dead: Cell::new(false),
     });
-    // snapshot first, deltas after
-    sub.push(&json!({ "workspaces": workspaces_json(state) }));
-    sub.push(&json!({ "windows": windows_json(state) }));
+    // one snapshot, then deltas. everything the shell needs to paint is in
+    // this single event, so a fresh subscriber costs one serialize
+    let mut snap = serde_json::Map::new();
+    snap.insert("event".into(), json!("state"));
+    snap.insert("workspaces".into(), workspaces_json(state));
+    snap.insert("windows".into(), clients_json(state));
+    snap.insert("outputs".into(), outputs_json(state));
+    sub.push(&Value::Object(snap));
     // the config status is stateful: late subscribers get the last one
-    if let Some(ev) = state.last_config_event.borrow().as_deref() {
-        if let Ok(v) = serde_json::from_str::<Value>(ev) {
-            sub.push(&v);
-        }
+    if let Some(ev) = state.last_config_event.borrow().as_deref()
+        && let Ok(v) = serde_json::from_str::<Value>(ev)
+    {
+        sub.push(&v);
     }
     state.ipc_subs.borrow_mut().push(sub.clone());
     loop {
@@ -777,22 +964,6 @@ impl Subscriber {
     }
 }
 
-// fan an event to every subscriber; senders never block on slow readers
-pub fn emit<T: Serialize>(state: &Rc<State>, event: &T) {
-    let subs = state.ipc_subs.borrow().clone();
-    if subs.is_empty() {
-        return;
-    }
-    let v = match serde_json::to_value(event) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    for sub in subs {
-        if !sub.dead.get() {
-            sub.push(&v);
-        }
-    }
-}
 
 /// every bind with its wire-twin action; shells render hotkey overlays
 /// from this instead of a compositor-drawn one
@@ -812,4 +983,57 @@ fn binds_json(state: &Rc<State>) -> Value {
         })
         .collect();
     json!(list)
+}
+
+#[cfg(test)]
+mod v2_shapes {
+    use super::*;
+
+    #[test]
+    fn a_window_record_carries_everything_a_shell_needs() {
+        let (state, client) = crate::client::test_utils::test_client();
+        let mut c = crate::config::Config::default();
+        c.layout.mode = crate::config::LayoutMode::Scrolling;
+        *state.config.borrow_mut() = Rc::new(c);
+        let base = crate::shell::xdg::tests::mk_base(&client, 400);
+        let (_s, _x, tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 401, 402, 403);
+        let win = Rc::new(crate::tree::Window::new(&state, crate::tree::WindowKind::Xdg(tl)));
+        let ws = crate::tree::active(&state);
+        ws.tiling.insert(&win, 0, 0, &state.config.borrow().layout.scrolling);
+
+        let v = window_json(&state, &ws, 0, Some("DP-1"), &win, None, false);
+        for key in [
+            "id", "title", "app-id", "pid", "workspace", "output", "geometry", "state",
+        ] {
+            assert!(v.get(key).is_some(), "window record is missing {key}");
+        }
+        for key in ["x", "y", "w", "h"] {
+            assert!(v.get(key).is_none(), "{key} is a legacy key, not for events");
+        }
+        for key in ["focused", "fullscreen", "floating", "xwayland", "mapped"] {
+            assert!(v["state"].get(key).is_some(), "state is missing {key}");
+        }
+        for key in ["x", "y", "w", "h"] {
+            assert!(v["geometry"].get(key).is_some(), "geometry is missing {key}");
+        }
+        assert_eq!(v["workspace"], serde_json::json!(1), "1-based on the wire");
+
+        // the query form keeps the deprecated flat keys
+        let legacy = window_json(&state, &ws, 0, Some("DP-1"), &win, None, true);
+        for key in ["x", "y", "w", "h", "floating", "fullscreen", "focused"] {
+            assert!(legacy.get(key).is_some(), "-j clients lost {key}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_record_counts_its_windows() {
+        let (state, _client) = crate::client::test_utils::test_client();
+        let ws = crate::tree::active(&state);
+        let v = workspace_json(&state, 0, &ws);
+        assert_eq!(v["window-count"], serde_json::json!(0));
+        // the pre-v2 alias stays until consumers move off it
+        assert_eq!(v["windows"], serde_json::json!(0));
+        assert_eq!(v["index"], serde_json::json!(1));
+        assert_eq!(v["active"], serde_json::json!(true));
+    }
 }

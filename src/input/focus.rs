@@ -71,13 +71,7 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
             if let Some(xw) = win.x11_opt() {
                 xw.take_focus();
             }
-            crate::ipc::emit(
-                state,
-                &serde_json::json!({ "window-focused": {
-                    "title": win.title(),
-                    "app-id": win.app_id(),
-                }}),
-            );
+            crate::ipc::window_event(state, "window-focused", &win);
         }
     }
 }

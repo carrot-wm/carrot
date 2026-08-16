@@ -2778,6 +2778,8 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
     // must learn it or their clients freeze holding frame callbacks
     crate::portal::cast::glass_changed(state);
     state.damage.trigger();
+    // hotplug settled: names, positions and the set itself may all differ
+    crate::ipc::outputs_event(state);
 }
 
 /// scanout buffers + modeset for one connector
