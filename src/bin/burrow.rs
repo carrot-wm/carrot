@@ -44,7 +44,7 @@ fn usage() -> ! {
                    focus-left|right|up|down | swap-left|right|up|down |\n\
                    split-ratio +-D | spawn CMD.. | quit\n\
          queries:  monitors | workspaces | windows | clients | errors\n\
-         control:  reload | subscribe"
+         control:  reload | subscribe [--events=windows,workspaces,outputs,columns,config]"
     );
     std::process::exit(2)
 }
@@ -188,6 +188,17 @@ fn main() {
             let d: f64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or_else(|| usage());
             serde_json::json!({ "split-ratio": d }).to_string()
         }
+        // subscribe --events=windows,columns filters server side
+        "subscribe" => {
+            let spec = args
+                .iter()
+                .skip(1)
+                .find_map(|a| a.strip_prefix("--events="));
+            match spec {
+                Some(spec) => serde_json::json!({ "subscribe": spec }).to_string(),
+                None => serde_json::json!("subscribe").to_string(),
+            }
+        }
         cmd @ ("focus-left" | "focus-right" | "focus-up" | "focus-down") => {
             format!("{{\"focus-dir\":\"{}\"}}", &cmd["focus-".len()..])
         }
@@ -196,7 +207,7 @@ fn main() {
         }
         cmd @ ("toggle-fullscreen" | "toggle-floating" | "close-window" | "focus-next"
         | "focus-prev" | "quit" | "monitors" | "workspaces" | "windows" | "clients" | "errors"
-        | "reload" | "subscribe" | "dump-shadow" | "dpms-on" | "dpms-off") => {
+        | "reload" | "dump-shadow" | "dpms-on" | "dpms-off") => {
             serde_json::json!(cmd).to_string()
         }
         _ => usage(),

@@ -101,9 +101,30 @@ async fn conn(state: Rc<State>, fd: Rc<OwnedFd>) {
             if line.trim().is_empty() {
                 continue;
             }
-            if line.trim() == "\"subscribe\"" {
-                subscribe(&state, &fd).await;
-                return;
+            // "subscribe" takes everything; {"subscribe":"windows,columns"}
+            // filters server-side so an unwanted event is never serialized
+            let sub_cats = match serde_json::from_str::<Value>(line.trim()) {
+                Ok(Value::String(c)) if c == "subscribe" => Some(Ok(CATS_ALL)),
+                Ok(Value::Object(m)) if m.len() == 1 => match m.get("subscribe") {
+                    Some(Value::String(spec)) => Some(parse_cats(spec)),
+                    Some(Value::Null) => Some(Ok(CATS_ALL)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(cats) = sub_cats {
+                match cats {
+                    Ok(cats) => {
+                        subscribe(&state, &fd, cats).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let mut out = json!({ "error": e }).to_string().into_bytes();
+                        out.push(b'\n');
+                        let _ = write_all(&state, &fd, out).await;
+                        return;
+                    }
+                }
             }
             let reply = match handle(&state, line.trim()) {
                 Ok(v) => json!({ "ok": v }),
@@ -518,7 +539,7 @@ pub fn config_event(state: &Rc<State>, failed: bool, errors: &[String], cold: &[
     let ev = json!({ "event": "config-loaded", "failed": failed,
                      "errors": errors, "cold-keys-pending": cold });
     *state.last_config_event.borrow_mut() = Some(ev.to_string());
-    emit_all(state, || ev.clone());
+    emit_cat(state, Cat::Config, || ev.clone());
 }
 
 // a failed reload keeps the running config, never a default
@@ -827,16 +848,66 @@ fn outputs_json(state: &Rc<State>) -> Value {
     json!(outs)
 }
 
+// -- event categories --
+
+#[derive(Copy, Clone, PartialEq)]
+pub enum Cat {
+    Windows,
+    Workspaces,
+    Outputs,
+    Columns,
+    Config,
+}
+
+impl Cat {
+    fn bit(self) -> u8 {
+        match self {
+            Cat::Windows => 1,
+            Cat::Workspaces => 2,
+            Cat::Outputs => 4,
+            Cat::Columns => 8,
+            Cat::Config => 16,
+        }
+    }
+
+    fn parse(s: &str) -> Option<Cat> {
+        Some(match s {
+            "windows" => Cat::Windows,
+            "workspaces" => Cat::Workspaces,
+            "outputs" => Cat::Outputs,
+            "columns" => Cat::Columns,
+            "config" => Cat::Config,
+            _ => return None,
+        })
+    }
+}
+
+const CATS_ALL: u8 = 31;
+
+/// "windows,columns" -> mask. an unknown name is an error, not a silent
+/// subscribe-to-nothing
+fn parse_cats(spec: &str) -> Result<u8, String> {
+    let mut mask = 0;
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match Cat::parse(part) {
+            Some(c) => mask |= c.bit(),
+            None => return Err(format!("unknown event category \"{part}\"")),
+        }
+    }
+    if mask == 0 { Ok(CATS_ALL) } else { Ok(mask) }
+}
+
 // -- v2 event emitters --
 
-/// build once, fan to everyone. the closure never runs when nobody is
-/// listening, so an unsubscribed event costs a borrow
-fn emit_all(state: &Rc<State>, make: impl FnOnce() -> Value) {
+/// build once, fan to everyone who asked for that category. the closure
+/// never runs when nobody is listening, so an unsubscribed event costs a
+/// borrow and a bitmask test
+fn emit_cat(state: &Rc<State>, cat: Cat, make: impl FnOnce() -> Value) {
     let subs: Vec<Rc<Subscriber>> = state
         .ipc_subs
         .borrow()
         .iter()
-        .filter(|s| !s.dead.get())
+        .filter(|s| !s.dead.get() && s.cats.get() & cat.bit() != 0)
         .cloned()
         .collect();
     if subs.is_empty() {
@@ -850,7 +921,7 @@ fn emit_all(state: &Rc<State>, make: impl FnOnce() -> Value) {
 
 /// a whole-window event: opened, focused, fullscreen, moved
 pub fn window_event(state: &Rc<State>, event: &str, win: &Rc<crate::tree::Window>) {
-    emit_all(state, || {
+    emit_cat(state, Cat::Windows, || {
         let ws = crate::tree::workspace_of(state, win);
         let (ws, idx) = match ws {
             Some(w) => {
@@ -876,7 +947,7 @@ pub fn window_closed_event(
     ws_idx: usize,
     col: Option<(u32, usize)>,
 ) {
-    emit_all(state, || {
+    emit_cat(state, Cat::Windows, || {
         json!({
             "event": "window-closed",
             "window": {
@@ -892,7 +963,7 @@ pub fn window_closed_event(
 }
 
 pub fn workspace_event(state: &Rc<State>, event: &str, idx: usize) {
-    emit_all(state, || {
+    emit_cat(state, Cat::Workspaces, || {
         let ws = state.workspaces.borrow().get(idx).cloned();
         let record = match ws {
             Some(w) => workspace_json(state, idx, &w),
@@ -903,7 +974,7 @@ pub fn workspace_event(state: &Rc<State>, event: &str, idx: usize) {
 }
 
 pub fn outputs_event(state: &Rc<State>) {
-    emit_all(state, || {
+    emit_cat(state, Cat::Outputs, || {
         json!({ "event": "outputs-changed", "outputs": outputs_json(state) })
     });
 }
@@ -915,25 +986,35 @@ pub struct Subscriber {
     out: RefCell<Vec<u8>>,
     kick: AsyncEvent,
     dead: Cell<bool>,
+    /// which event categories this subscriber asked for
+    cats: Cell<u8>,
 }
 
-async fn subscribe(state: &Rc<State>, fd: &Rc<OwnedFd>) {
+async fn subscribe(state: &Rc<State>, fd: &Rc<OwnedFd>, cats: u8) {
     let sub = Rc::new(Subscriber {
         fd: fd.clone(),
         out: RefCell::new(Vec::new()),
         kick: AsyncEvent::default(),
         dead: Cell::new(false),
+        cats: Cell::new(cats),
     });
     // one snapshot, then deltas. everything the shell needs to paint is in
     // this single event, so a fresh subscriber costs one serialize
     let mut snap = serde_json::Map::new();
     snap.insert("event".into(), json!("state"));
-    snap.insert("workspaces".into(), workspaces_json(state));
-    snap.insert("windows".into(), clients_json(state));
-    snap.insert("outputs".into(), outputs_json(state));
+    if cats & Cat::Workspaces.bit() != 0 {
+        snap.insert("workspaces".into(), workspaces_json(state));
+    }
+    if cats & Cat::Windows.bit() != 0 {
+        snap.insert("windows".into(), clients_json(state));
+    }
+    if cats & Cat::Outputs.bit() != 0 {
+        snap.insert("outputs".into(), outputs_json(state));
+    }
     sub.push(&Value::Object(snap));
     // the config status is stateful: late subscribers get the last one
-    if let Some(ev) = state.last_config_event.borrow().as_deref()
+    if cats & Cat::Config.bit() != 0
+        && let Some(ev) = state.last_config_event.borrow().as_deref()
         && let Ok(v) = serde_json::from_str::<Value>(ev)
     {
         sub.push(&v);
@@ -988,6 +1069,23 @@ fn binds_json(state: &Rc<State>) -> Value {
 #[cfg(test)]
 mod v2_shapes {
     use super::*;
+
+    #[test]
+    fn event_categories_parse_and_default_to_everything() {
+        assert_eq!(parse_cats("windows").unwrap(), Cat::Windows.bit());
+        assert_eq!(
+            parse_cats("windows,columns").unwrap(),
+            Cat::Windows.bit() | Cat::Columns.bit()
+        );
+        // whitespace and empties are tolerated, not an error
+        assert_eq!(parse_cats(" windows , outputs ").unwrap(),
+                   Cat::Windows.bit() | Cat::Outputs.bit());
+        // no categories at all means everything, matching a bare subscribe
+        assert_eq!(parse_cats("").unwrap(), CATS_ALL);
+        // a typo must be loud: silently subscribing to nothing would look
+        // like a dead compositor to a shell
+        assert!(parse_cats("windwos").is_err());
+    }
 
     #[test]
     fn a_window_record_carries_everything_a_shell_needs() {
