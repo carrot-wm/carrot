@@ -13,7 +13,7 @@ use crate::protocol::globals::Global;
 use crate::state::State;
 use crate::surface::WlSurface;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 const CAP_POINTER: u32 = 1;
@@ -59,6 +59,11 @@ pub struct SeatGlobal {
     /// remap translations held down: from -> to, so a release always
     /// pairs its press even if focus moved mid-hold
     remap_held: RefCell<HashMap<u32, u32>>,
+    /// raw keycodes down at the seat, across every device. xkb's counts
+    /// are not idempotent: a second down for a held keycode (a
+    /// passthrough node echoing the physical keyboard) plus one release
+    /// strands the modifier until restart, so only real edges pass
+    raw_held: RefCell<HashSet<u32>>,
     /// a matched release-kind bind waits here; any other press disarms
     armed_release: RefCell<Option<(u32, crate::config::Action)>>,
     /// the key that started a pointer grab; its release ends the grab
@@ -133,6 +138,7 @@ impl SeatGlobal {
             pick_swallow: RefCell::new(Vec::new()),
             last_press_serial: Cell::new(0),
             remap_held: RefCell::new(HashMap::new()),
+            raw_held: RefCell::new(HashSet::new()),
             armed_release: RefCell::new(None),
             grab_key: Cell::new(None),
             bind_cooldowns: RefCell::new(std::collections::HashMap::new()),
@@ -1004,6 +1010,17 @@ impl SeatGlobal {
     }
 
     pub fn key(&self, state: &Rc<State>, time_usec: u64, key: u32, pressed: bool) -> KeyAction {
+        // one seat, one keyboard: the first device to move a keycode owns
+        // the edge, its twin from another node stops here. this runs
+        // before the remap so an echoed press cannot re-book the remap
+        // slot under a different focus either
+        {
+            let mut raw = self.raw_held.borrow_mut();
+            let real_edge = if pressed { raw.insert(key) } else { raw.remove(&key) };
+            if !real_edge {
+                return KeyAction::Handled;
+            }
+        }
         crate::protocol::idle::note_activity(state);
         let key = self.remap(state, key, pressed);
         let map = self.keymap.borrow().clone();
@@ -1885,6 +1902,37 @@ mod tests {
             region: ObjectId(0),
             lifetime,
         })
+    }
+
+    #[test]
+    fn a_second_device_echoing_super_cannot_strand_xkb() {
+        let (state, _client, seat, s) = setup();
+        *seat.kb_focus.borrow_mut() = Some(s.clone());
+        const KEY_LEFTMETA: u32 = 125;
+        // the physical keyboard and a passthrough node both press super,
+        // then only the physical release arrives (the echoing process
+        // died fullscreen). xkb must see one edge each way
+        seat.key(&state, 0, KEY_LEFTMETA, true);
+        seat.key(&state, 1, KEY_LEFTMETA, true);
+        assert_eq!(*seat.pressed.borrow(), vec![KEY_LEFTMETA]);
+        seat.key(&state, 2, KEY_LEFTMETA, false);
+        assert_eq!(seat.mods.get().depressed, 0, "super released once, is up");
+        assert!(seat.pressed.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_release_without_a_press_stops_at_the_seat() {
+        let (state, _client, seat, s) = setup();
+        *seat.kb_focus.borrow_mut() = Some(s.clone());
+        // a device seeded from the kernel bitmask routes a release for a
+        // key the seat never saw pressed; clients never saw it either
+        const KEY_A: u32 = 30;
+        assert!(matches!(
+            seat.key(&state, 0, KEY_A, false),
+            KeyAction::Handled
+        ));
+        assert!(seat.pressed.borrow().is_empty());
+        assert_eq!(seat.mods.get().depressed, 0);
     }
 
     #[test]
