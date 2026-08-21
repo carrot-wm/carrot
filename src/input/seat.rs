@@ -292,6 +292,46 @@ impl SeatGlobal {
         }
     }
 
+    /// the device layer's pressed sets are ground truth: they resync
+    /// against the kernel bitmask on queue drops, pause and resume. any
+    /// key the seat still holds that no device accounts for, raw or
+    /// through the remap it was delivered under, is a stranded press
+    /// whose release was swallowed somewhere below - and a stranded
+    /// modifier arms every bind until restart. release it through the
+    /// normal path so xkb, the pressed list, clients and the
+    /// armed-release machinery all heal together
+    pub fn reconcile_held(
+        &self,
+        state: &Rc<State>,
+        time_usec: u64,
+        held_raw: &std::collections::HashSet<u32>,
+    ) {
+        // a remap whose source key is up is itself stranded bookkeeping;
+        // dropping it first lets the stale key release under its own name
+        self.remap_held.borrow_mut().retain(|from, _| held_raw.contains(from));
+        for key in self.stale_keys(held_raw) {
+            eprintln!(
+                "carrot: input: key {key} is down with no device holding it; \
+                 a release was swallowed below the seat, releasing it now"
+            );
+            if let KeyAction::Act(action) = self.key(state, time_usec, key, false) {
+                crate::ipc::dispatch_action(state, &action);
+            }
+        }
+    }
+
+    /// seat-held keys no device accounts for, raw or as a live remap's target
+    fn stale_keys(&self, held_raw: &std::collections::HashSet<u32>) -> Vec<u32> {
+        let remap = self.remap_held.borrow();
+        self.pressed
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|k| !held_raw.contains(k))
+            .filter(|k| !held_raw.iter().any(|r| remap.get(r) == Some(k)))
+            .collect()
+    }
+
     pub fn keys_bytes(&self) -> Vec<u8> {
         let pressed = self.pressed.borrow();
         let mut bytes = Vec::with_capacity(pressed.len() * 4);
@@ -1885,6 +1925,47 @@ mod tests {
             region: ObjectId(0),
             lifetime,
         })
+    }
+
+    #[test]
+    fn a_stranded_super_releases_on_reconcile() {
+        let (state, _client, seat, s) = setup();
+        *seat.kb_focus.borrow_mut() = Some(s.clone());
+        const KEY_LEFTMETA: u32 = 125;
+        seat.key(&state, 0, KEY_LEFTMETA, true);
+        assert_ne!(seat.mods.get().depressed, 0, "super is down");
+        // the release was swallowed below the seat: no device holds a thing
+        seat.reconcile_held(&state, 1, &std::collections::HashSet::new());
+        assert_eq!(seat.mods.get().depressed, 0, "stranded super came back up");
+        assert!(seat.pressed.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_physically_held_key_survives_reconcile() {
+        let (state, _client, seat, s) = setup();
+        *seat.kb_focus.borrow_mut() = Some(s.clone());
+        const KEY_LEFTMETA: u32 = 125;
+        seat.key(&state, 0, KEY_LEFTMETA, true);
+        let held: std::collections::HashSet<u32> = [KEY_LEFTMETA].into_iter().collect();
+        seat.reconcile_held(&state, 1, &held);
+        assert_ne!(seat.mods.get().depressed, 0, "held super stays down");
+        assert_eq!(*seat.pressed.borrow(), vec![KEY_LEFTMETA]);
+    }
+
+    #[test]
+    fn a_key_delivered_through_a_live_remap_is_accounted() {
+        let (state, _client, seat, s) = setup();
+        *seat.kb_focus.borrow_mut() = Some(s.clone());
+        // raw 100 was delivered as 106 through a remap; the device holds 100
+        seat.remap_held.borrow_mut().insert(100, 106);
+        seat.pressed.borrow_mut().push(106);
+        let held: std::collections::HashSet<u32> = [100].into_iter().collect();
+        assert!(seat.stale_keys(&held).is_empty(), "live remap accounts for its key");
+        // the source came up and its release got swallowed: both the
+        // remap entry and the delivered key are stranded now
+        seat.reconcile_held(&state, 1, &std::collections::HashSet::new());
+        assert!(seat.remap_held.borrow().is_empty());
+        assert!(seat.pressed.borrow().is_empty());
     }
 
     #[test]

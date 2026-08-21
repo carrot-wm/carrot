@@ -204,6 +204,20 @@ async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<Log
                     }
                     seat::KeyAction::Handled => {}
                 }
+                // every key edge re-proves the seat's held set against the
+                // devices. a release swallowed anywhere below (an
+                // overwritten remap, a second node sending the same
+                // keycode, a dropped batch) strands its press in xkb and
+                // arms every bind until restart; the device sets are
+                // kernel-truth, so anything they cannot account for
+                // releases here, one edge late at worst
+                let held_raw: std::collections::HashSet<u32> = mgr
+                    .devices
+                    .borrow()
+                    .iter()
+                    .flat_map(|d| d.pressed.borrow().clone().into_iter())
+                    .collect();
+                seat.reconcile_held(&state, time_usec, &held_raw);
             }
             InputEvent::Motion { time_usec, dx, dy } => {
                 let (speed, scale, _, adaptive) = device_factors(&state, &mgr, devnum);
