@@ -274,6 +274,6 @@ Carrot is built from scratch, with no framework or compositor library dependency
 
 GPL-3.0 - see [LICENSE](LICENSE) for details.
 
-## Communtity, Dev Discussions, and Support
+## Community, Dev Discussions, and Support
 
 [Discord Server](https://discord.gg/fQyxq4JHpR) :3
